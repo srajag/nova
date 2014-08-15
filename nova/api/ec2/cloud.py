@@ -1289,6 +1289,10 @@ class CloudController(vpc, object):
             if vpc_id:
                 i['vpcId'] = vpc_id
 
+            vpc_id = vpc._get_vpcid_from_tenantid(self, instance['project_id'], context)
+            if vpc_id:
+                i['vpcId'] = vpc_id
+
             if context.is_admin:
                 i['keyName'] = '%s (%s, %s)' % (i['keyName'],
                     instance.project_id,
@@ -1536,6 +1540,48 @@ class CloudController(vpc, object):
 
         flavor = objects.Flavor.get_by_name(context,
                                             kwargs.get('instance_type', None))
+        #vpcapi - get network uuid if subnet requested
+        networks = []
+        if kwargs.get('subnet_id'):
+            neutron = neutronv2.get_client(context)
+            try:
+                nw_list = neutron.list_networks()
+            except Exception as e:
+                raise exception.EC2APIError(e)
+
+            for nw in nw_list['networks']:
+                if nw['name'] == kwargs['subnet_id']:
+                    networks.append((nw['id'], None, None))
+                    passed_subnet = nw['id']
+
+        #vpcapi - nat instance requested hence create service only
+        name = str(image.get('name'))
+        if 'nat' in name:
+            neutron = neutronv2.get_client(context)
+            try:
+                nw_list = neutron.list_networks()
+            except Exception as e:
+                raise exception.EC2APIError(e)
+
+            public_subnet = None
+            for network in nw_list['networks']:
+                if network['contrail:fq_name'][1] == context.project_name and \
+                   network['name'].startswith('public'):
+                    public_subnet = network['id']
+
+            if public_subnet is None:
+                raise exception.EC2APIError("public network not provisioned")
+
+            req = {'name': "%s-nat" % context.project_name,
+                   'internal_net': None,
+                   'external_net': public_subnet,
+                   'tenant_id': context.project_id}
+            try:
+                subnet_rsp = neutron.create_nat_instance({'nat_instance': req})
+                return {}
+            except Exception as e:
+                raise exception.EC2APIError(e)
+
         #vpcapi - get network uuid if subnet requested
         networks = []
         if kwargs.get('subnet_id'):
