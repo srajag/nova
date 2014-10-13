@@ -142,3 +142,18 @@ def set_vif_bandwidth_config(conf, inst_type):
         if len(scope) > 1 and scope[0] == 'quota':
             if scope[1] in bandwidth_items:
                 setattr(conf, scope[1], value)
+
+
+def set_vif_queues_config(conf, queues):
+    """Populate a LibvirtConfigGuestInterface instance with driver queues
+    config
+
+    :param queues: Number of queues to be used
+    """
+
+    # Workaround for libvirt-1.2.7, which requires explicit driver name to be
+    # specified in order to correctly populate qemu queues option
+    if not conf.driver_name:
+        conf.driver_name = 'vhost'
+
+    conf.queues = str(queues)
