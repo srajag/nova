@@ -39,6 +39,9 @@ libvirt_vif_opts = [
                 help='Use virtio for bridge interfaces with KVM/QEMU',
                 deprecated_group='DEFAULT',
                 deprecated_name='libvirt_use_virtio_for_bridges'),
+    cfg.IntOpt('number_of_virtio_queues',
+               default=1,
+               help='Number of virtio queues used for guest interfaces'),
 ]
 
 CONF = cfg.CONF
@@ -127,6 +130,15 @@ class LibvirtBaseVIFDriver(object):
 
         designer.set_vif_guest_frontend_config(
             conf, vif['address'], model, driver)
+
+        # Add queues config only if number is greater than 1
+        if CONF.libvirt.number_of_virtio_queues > 1:
+            if model is "virtio" and driver in ['vhost', None]:
+                designer.set_vif_queues_config(conf,
+                        CONF.libvirt.number_of_virtio_queues)
+            else:
+                LOG.warn('Multiqueue is not supported if model is %s ' % model +
+                         'driver is %s. Skipping option.' % driver)
 
         return conf
 

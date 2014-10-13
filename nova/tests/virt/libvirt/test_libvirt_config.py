@@ -968,6 +968,63 @@ class LibvirtConfigGuestInterfaceTest(LibvirtConfigBaseTest):
               <source type="unix" path="/tmp/vhostuser.sock" mode="server"/>
             </interface>""")
 
+    def test_config_queues(self):
+        obj = config.LibvirtConfigGuestInterface()
+        obj.net_type = "vhostuser"
+        obj.vhostuser_type = "unix"
+        obj.vhostuser_path = "/tmp/vhostuser.sock"
+        obj.vhostuser_mode = "server"
+        obj.mac_addr = "DE:AD:BE:EF:CA:FE"
+        obj.model = "virtio"
+        obj.queues = "2"
+
+        xml = obj.to_xml()
+        self.assertXmlEqual(xml, """
+            <interface type="vhostuser">
+              <mac address="DE:AD:BE:EF:CA:FE"/>
+              <model type="virtio"/>
+              <driver queues="2"/>
+              <source type="unix" path="/tmp/vhostuser.sock" mode="server"/>
+            </interface>""")
+
+    def test_config_queues_empty(self):
+        obj = config.LibvirtConfigGuestInterface()
+        obj.net_type = "vhostuser"
+        obj.vhostuser_type = "unix"
+        obj.vhostuser_path = "/tmp/vhostuser.sock"
+        obj.vhostuser_mode = "server"
+        obj.mac_addr = "DE:AD:BE:EF:CA:FE"
+        obj.model = "virtio"
+        obj.queues = None
+
+        xml = obj.to_xml()
+        self.assertXmlEqual(xml, """
+            <interface type="vhostuser">
+              <mac address="DE:AD:BE:EF:CA:FE"/>
+              <model type="virtio"/>
+              <source type="unix" path="/tmp/vhostuser.sock" mode="server"/>
+            </interface>""")
+
+    def test_config_queues_with_driver(self):
+        obj = config.LibvirtConfigGuestInterface()
+        obj.net_type = "vhostuser"
+        obj.vhostuser_type = "unix"
+        obj.vhostuser_path = "/tmp/vhostuser.sock"
+        obj.vhostuser_mode = "server"
+        obj.mac_addr = "DE:AD:BE:EF:CA:FE"
+        obj.model = "virtio"
+        obj.queues = "2"
+        obj.driver_name = 'vhost'
+
+        xml = obj.to_xml()
+        self.assertXmlEqual(xml, """
+            <interface type="vhostuser">
+              <mac address="DE:AD:BE:EF:CA:FE"/>
+              <model type="virtio"/>
+              <driver name="vhost" queues="2"/>
+              <source type="unix" path="/tmp/vhostuser.sock" mode="server"/>
+            </interface>""")
+
 
 
 class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
