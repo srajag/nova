@@ -142,3 +142,13 @@ def set_vif_bandwidth_config(conf, inst_type):
         if len(scope) > 1 and scope[0] == 'quota':
             if scope[1] in bandwidth_items:
                 setattr(conf, scope[1], value)
+
+
+def set_vif_queues_config(conf, queues):
+    """Populate a LibvirtConfigGuestInterface instance with driver queues
+    config
+
+    :param queues: Number of queues to be used
+    """
+
+    conf.queues = str(queues)
