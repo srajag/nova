@@ -132,12 +132,12 @@ class LibvirtBaseVIFDriver(object):
             conf, vif['address'], model, driver)
 
         # Add queues config only if number is greater than 1
-        if CONF.libvirt.number_of_virtio_queues >= 1:
-            if model is "virtio" and driver in ['network', 'bridge']:
+        if CONF.libvirt.number_of_virtio_queues > 1:
+            if model is "virtio" and driver in ['vhost', None]:
                 designer.set_vif_queues_config(conf,
                         CONF.libvirt.number_of_virtio_queues)
             else:
-                LOG.warn('Multiqueue is not supported if model is %s' % model +
+                LOG.warn('Multiqueue is not supported if model is %s ' % model +
                          'driver is %s. Skipping option.' % driver)
 
         return conf

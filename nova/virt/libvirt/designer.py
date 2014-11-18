@@ -151,4 +151,9 @@ def set_vif_queues_config(conf, queues):
     :param queues: Number of queues to be used
     """
 
+    # Workaround for libvirt-1.2.7, which requires explicit driver name to be
+    # specified in order to correctly populate qemu queues option
+    if not conf.driver_name:
+        conf.driver_name = 'vhost'
+
     conf.queues = str(queues)
