@@ -1401,7 +1401,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 guest.save_memory_state()
 
         snapshot_backend = self.image_backend.snapshot(
-                instance=instance,
+                instance,
                 disk_path,
                 image_type=source_format)
 
