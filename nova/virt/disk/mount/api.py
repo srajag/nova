@@ -16,10 +16,10 @@
 import os
 import time
 
-from oslo.utils import importutils
+from oslo_log import log as logging
+from oslo_utils import importutils
 
-from nova.i18n import _
-from nova.openstack.common import log as logging
+from nova.i18n import _, _LI, _LW
 from nova import utils
 
 LOG = logging.getLogger(__name__)
@@ -118,10 +118,11 @@ class Mount(object):
         start_time = time.time()
         device = self._inner_get_dev()
         while not device:
-            LOG.info(_('Device allocation failed. Will retry in 2 seconds.'))
+            LOG.info(_LI('Device allocation failed. Will retry in 2 seconds.'))
             time.sleep(2)
             if time.time() - start_time > MAX_DEVICE_WAIT:
-                LOG.warn(_('Device allocation failed after repeated retries.'))
+                LOG.warning(_LW('Device allocation failed after repeated '
+                                'retries.'))
                 return False
             device = self._inner_get_dev()
         return True

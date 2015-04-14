@@ -30,7 +30,8 @@ Programming HowTos and Tutorials
     unit_tests
     addmethod.openstackapi
     gmr
-
+    api_plugins
+    api_microversions
 
 Background Concepts for Nova
 ----------------------------
@@ -39,12 +40,15 @@ Background Concepts for Nova
 
    architecture
    aggregates
+   cells
    threading
    vmstates
-   il8n
+   i18n
    filter_scheduler
    rpc
    hooks
+   upgrade
+   policy_enforcement
 
 Development policies
 --------------------
@@ -54,6 +58,14 @@ Development policies
    kilo.blueprints
    policies
 
+Testing guides
+--------------
+
+.. toctree::
+    :maxdepth: 3
+
+    testing/libvirt-numa
+    testing/serial-console
 
 Other Resources
 ---------------

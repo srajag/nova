@@ -16,7 +16,7 @@
 """
 Exception classes specific for the VMware driver.
 """
-from oslo.vmware import exceptions as vexc
+from oslo_vmware import exceptions as vexc
 
 from nova.i18n import _
 
@@ -28,10 +28,6 @@ from nova.i18n import _
 
 class NoRootDiskDefined(vexc.VMwareDriverException):
     msg_fmt = _("No root disk defined.")
-
-
-class TaskInProgress(vexc.VMwareDriverException):
-    msg_fmt = _("Virtual machine is busy.")
 
 
 class PbmDefaultPolicyUnspecified(vexc.VMwareDriverConfigurationException):

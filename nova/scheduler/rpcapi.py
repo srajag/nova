@@ -16,8 +16,8 @@
 Client side of the scheduler manager RPC API.
 """
 
-from oslo.config import cfg
-from oslo import messaging
+from oslo_config import cfg
+import oslo_messaging as messaging
 
 from nova.objects import base as objects_base
 from nova import rpc
@@ -84,6 +84,14 @@ class SchedulerAPI(object):
         existing methods in 3.x after that point should be done such that they
         can handle the version_cap being set to 3.0.
 
+        * 3.1 - Made select_destinations() send flavor object
+
+        * 4.0 - Removed backwards compat for Icehouse
+        * 4.1 - Add update_aggregates() and delete_aggregate()
+        * 4.2 - Added update_instance_info(), delete_instance_info(), and
+                sync_instance_info()  methods
+
+
     '''
 
     VERSION_ALIASES = {
@@ -91,11 +99,12 @@ class SchedulerAPI(object):
         'havana': '2.9',
         'icehouse': '3.0',
         'juno': '3.0',
+        'kilo': '4.0',
     }
 
     def __init__(self):
         super(SchedulerAPI, self).__init__()
-        target = messaging.Target(topic=CONF.scheduler_topic, version='3.0')
+        target = messaging.Target(topic=CONF.scheduler_topic, version='4.0')
         version_cap = self.VERSION_ALIASES.get(CONF.upgrade_levels.scheduler,
                                                CONF.upgrade_levels.scheduler)
         serializer = objects_base.NovaObjectSerializer()
@@ -103,6 +112,31 @@ class SchedulerAPI(object):
                                      serializer=serializer)
 
     def select_destinations(self, ctxt, request_spec, filter_properties):
-        cctxt = self.client.prepare()
+        cctxt = self.client.prepare(version='4.0')
         return cctxt.call(ctxt, 'select_destinations',
             request_spec=request_spec, filter_properties=filter_properties)
+
+    def update_aggregates(self, ctxt, aggregates):
+        # NOTE(sbauza): Yes, it's a fanout, we need to update all schedulers
+        cctxt = self.client.prepare(fanout=True, version='4.1')
+        cctxt.cast(ctxt, 'update_aggregates', aggregates=aggregates)
+
+    def delete_aggregate(self, ctxt, aggregate):
+        # NOTE(sbauza): Yes, it's a fanout, we need to update all schedulers
+        cctxt = self.client.prepare(fanout=True, version='4.1')
+        cctxt.cast(ctxt, 'delete_aggregate', aggregate=aggregate)
+
+    def update_instance_info(self, ctxt, host_name, instance_info):
+        cctxt = self.client.prepare(version='4.2', fanout=True)
+        return cctxt.cast(ctxt, 'update_instance_info', host_name=host_name,
+                          instance_info=instance_info)
+
+    def delete_instance_info(self, ctxt, host_name, instance_uuid):
+        cctxt = self.client.prepare(version='4.2', fanout=True)
+        return cctxt.cast(ctxt, 'delete_instance_info', host_name=host_name,
+                          instance_uuid=instance_uuid)
+
+    def sync_instance_info(self, ctxt, host_name, instance_uuids):
+        cctxt = self.client.prepare(version='4.2', fanout=True)
+        return cctxt.cast(ctxt, 'sync_instance_info', host_name=host_name,
+                          instance_uuids=instance_uuids)

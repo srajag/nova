@@ -15,9 +15,9 @@
 
 """Client side of the conductor RPC API."""
 
-from oslo.config import cfg
-from oslo import messaging
-from oslo.serialization import jsonutils
+from oslo_config import cfg
+import oslo_messaging as messaging
+from oslo_serialization import jsonutils
 
 from nova.objects import base as objects_base
 from nova import rpc
@@ -137,6 +137,7 @@ class ConductorAPI(object):
            - Remove aggregate_host_add() and aggregate_host_delete()
            - Remove network_migrate_instance_start() and
              network_migrate_instance_finish()
+           - Remove vol_get_usage_by_time
 
     ... Icehouse supports message version 2.0.  So, any changes to
     existing methods in 2.x after that point should be done such
@@ -154,6 +155,11 @@ class ConductorAPI(object):
     ... Juno supports message version 2.0.  So, any changes to
     existing methods in 2.x after that point should be done such
     that they can handle the version_cap being set to 2.0.
+
+    * 2.1  - Make notify_usage_exists() take an instance object
+    * Remove bw_usage_update()
+    * Remove notify_usage_exists()
+    * Remove get_ec2_ids()
 
     """
 
@@ -196,19 +202,6 @@ class ConductorAPI(object):
                           host=host,
                           key=key)
 
-    def bw_usage_update(self, context, uuid, mac, start_period,
-                        bw_in=None, bw_out=None,
-                        last_ctr_in=None, last_ctr_out=None,
-                        last_refreshed=None, update_cells=True):
-        msg_kwargs = dict(uuid=uuid, mac=mac, start_period=start_period,
-                          bw_in=bw_in, bw_out=bw_out, last_ctr_in=last_ctr_in,
-                          last_ctr_out=last_ctr_out,
-                          last_refreshed=last_refreshed,
-                          update_cells=update_cells)
-
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'bw_usage_update', **msg_kwargs)
-
     def provider_fw_rule_get_all(self, context):
         cctxt = self.client.prepare()
         return cctxt.call(context, 'provider_fw_rule_get_all')
@@ -225,12 +218,6 @@ class ConductorAPI(object):
         cctxt = self.client.prepare()
         return cctxt.call(context, 'block_device_mapping_get_all_by_instance',
                           instance=instance_p, legacy=legacy)
-
-    def vol_get_usage_by_time(self, context, start_time):
-        start_time_p = jsonutils.to_primitive(start_time)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'vol_get_usage_by_time',
-                          start_time=start_time_p)
 
     def vol_usage_update(self, context, vol_id, rd_req, rd_bytes, wr_req,
                          wr_bytes, instance, last_refreshed=None,
@@ -319,21 +306,6 @@ class ConductorAPI(object):
                           task_name=task_name, begin=begin, end=end,
                           host=host, errors=errors, message=message)
 
-    def notify_usage_exists(self, context, instance, current_period=False,
-                            ignore_missing_network_data=True,
-                            system_metadata=None, extra_usage_info=None):
-        instance_p = jsonutils.to_primitive(instance)
-        system_metadata_p = jsonutils.to_primitive(system_metadata)
-        extra_usage_info_p = jsonutils.to_primitive(extra_usage_info)
-        cctxt = self.client.prepare()
-        return cctxt.call(
-            context, 'notify_usage_exists',
-            instance=instance_p,
-            current_period=current_period,
-            ignore_missing_network_data=ignore_missing_network_data,
-            system_metadata=system_metadata_p,
-            extra_usage_info=extra_usage_info_p)
-
     def security_groups_trigger_handler(self, context, event, args):
         args_p = jsonutils.to_primitive(args)
         cctxt = self.client.prepare()
@@ -344,12 +316,6 @@ class ConductorAPI(object):
         cctxt = self.client.prepare()
         return cctxt.call(context, 'security_groups_trigger_members_refresh',
                           group_ids=group_ids)
-
-    def get_ec2_ids(self, context, instance):
-        instance_p = jsonutils.to_primitive(instance)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'get_ec2_ids',
-                          instance=instance_p)
 
     def object_class_action(self, context, objname, objmethod, objver,
                             args, kwargs):
@@ -384,6 +350,8 @@ class ComputeTaskAPI(object):
     1.7 - Do not send block_device_mapping and legacy_bdm to build_instances
     1.8 - Add rebuild_instance
     1.9 - Converted requested_networks to NetworkRequestList object
+    1.10 - Made migrate_server() and build_instances() send flavor objects
+    1.11 - Added clean_shutdown to migrate_server()
 
     """
 
@@ -397,40 +365,52 @@ class ComputeTaskAPI(object):
 
     def migrate_server(self, context, instance, scheduler_hint, live, rebuild,
                   flavor, block_migration, disk_over_commit,
-                  reservations=None):
-        if self.client.can_send_version('1.6'):
+                  reservations=None, clean_shutdown=True):
+        kw = {'instance': instance, 'scheduler_hint': scheduler_hint,
+              'live': live, 'rebuild': rebuild, 'flavor': flavor,
+              'block_migration': block_migration,
+              'disk_over_commit': disk_over_commit,
+              'reservations': reservations,
+              'clean_shutdown': clean_shutdown}
+        version = '1.11'
+        if not self.client.can_send_version(version):
+            del kw['clean_shutdown']
+            version = '1.10'
+        if not self.client.can_send_version(version):
+            kw['flavor'] = objects_base.obj_to_primitive(flavor)
             version = '1.6'
-        else:
-            instance = jsonutils.to_primitive(
+        if not self.client.can_send_version(version):
+            kw['instance'] = jsonutils.to_primitive(
                     objects_base.obj_to_primitive(instance))
             version = '1.4'
-        flavor_p = jsonutils.to_primitive(flavor)
         cctxt = self.client.prepare(version=version)
-        return cctxt.call(context, 'migrate_server',
-                          instance=instance, scheduler_hint=scheduler_hint,
-                          live=live, rebuild=rebuild, flavor=flavor_p,
-                          block_migration=block_migration,
-                          disk_over_commit=disk_over_commit,
-                          reservations=reservations)
+        return cctxt.call(context, 'migrate_server', **kw)
 
     def build_instances(self, context, instances, image, filter_properties,
             admin_password, injected_files, requested_networks,
             security_groups, block_device_mapping, legacy_bdm=True):
         image_p = jsonutils.to_primitive(image)
+        version = '1.10'
+        if not self.client.can_send_version(version):
+            version = '1.9'
+            if 'instance_type' in filter_properties:
+                flavor = filter_properties['instance_type']
+                flavor_p = objects_base.obj_to_primitive(flavor)
+                filter_properties = dict(filter_properties,
+                                         instance_type=flavor_p)
         kw = {'instances': instances, 'image': image_p,
                'filter_properties': filter_properties,
                'admin_password': admin_password,
                'injected_files': injected_files,
                'requested_networks': requested_networks,
                'security_groups': security_groups}
-
-        version = '1.9'
-        if not self.client.can_send_version('1.9'):
+        if not self.client.can_send_version(version):
             version = '1.8'
             kw['requested_networks'] = kw['requested_networks'].as_tuples()
         if not self.client.can_send_version('1.7'):
             version = '1.5'
-            kw.update({'block_device_mapping': block_device_mapping,
+            bdm_p = objects_base.obj_to_primitive(block_device_mapping)
+            kw.update({'block_device_mapping': bdm_p,
                        'legacy_bdm': legacy_bdm})
 
         cctxt = self.client.prepare(version=version)

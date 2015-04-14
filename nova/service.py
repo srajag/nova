@@ -21,19 +21,19 @@ import os
 import random
 import sys
 
-from oslo.concurrency import processutils
-from oslo.config import cfg
-from oslo import messaging
-from oslo.utils import importutils
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_utils import importutils
 
 from nova import baserpc
 from nova import conductor
 from nova import context
 from nova import debugger
 from nova import exception
-from nova.i18n import _, _LE
+from nova.i18n import _, _LE, _LI, _LW
 from nova.objects import base as objects_base
-from nova.openstack.common import log as logging
 from nova.openstack.common import service
 from nova import rpc
 from nova import servicegroup
@@ -158,15 +158,16 @@ class Service(service.Service):
 
     def start(self):
         verstr = version.version_string_with_package()
-        LOG.audit(_('Starting %(topic)s node (version %(version)s)'),
+        LOG.info(_LI('Starting %(topic)s node (version %(version)s)'),
                   {'topic': self.topic, 'version': verstr})
         self.basic_config_check()
         self.manager.init_host()
         self.model_disconnected = False
         ctxt = context.get_admin_context()
         try:
-            self.service_ref = self.conductor_api.service_get_by_args(ctxt,
-                    self.host, self.binary)
+            self.service_ref = (
+                self.conductor_api.service_get_by_host_and_binary(
+                    ctxt, self.host, self.binary))
             self.service_id = self.service_ref['id']
         except exception.NotFound:
             try:
@@ -175,8 +176,9 @@ class Service(service.Service):
                     exception.ServiceBinaryExists):
                 # NOTE(danms): If we race to create a record with a sibling
                 # worker, don't fail here.
-                self.service_ref = self.conductor_api.service_get_by_args(ctxt,
-                    self.host, self.binary)
+                self.service_ref = (
+                    self.conductor_api.service_get_by_host_and_binary(
+                        ctxt, self.host, self.binary))
 
         self.manager.pre_start_hook()
 
@@ -283,7 +285,7 @@ class Service(service.Service):
             self.conductor_api.service_destroy(context.get_admin_context(),
                                                self.service_id)
         except exception.NotFound:
-            LOG.warn(_('Service killed that has no database entry'))
+            LOG.warning(_LW('Service killed that has no database entry'))
 
     def stop(self):
         try:
@@ -295,7 +297,7 @@ class Service(service.Service):
         try:
             self.manager.cleanup_host()
         except Exception:
-            LOG.exception(_('Service error occurred during cleanup_host'))
+            LOG.exception(_LE('Service error occurred during cleanup_host'))
             pass
 
         super(Service, self).stop()
@@ -331,9 +333,14 @@ class WSGIService(object):
         self.manager = self._get_manager()
         self.loader = loader or wsgi.Loader()
         self.app = self.loader.load_app(name)
+        # inherit all compute_api worker counts from osapi_compute
+        if name.startswith('openstack_compute_api'):
+            wname = 'osapi_compute'
+        else:
+            wname = name
         self.host = getattr(CONF, '%s_listen' % name, "0.0.0.0")
         self.port = getattr(CONF, '%s_listen_port' % name, 0)
-        self.workers = (getattr(CONF, '%s_workers' % name, None) or
+        self.workers = (getattr(CONF, '%s_workers' % wname, None) or
                         processutils.get_worker_count())
         if self.workers and self.workers < 1:
             worker_name = '%s_workers' % name

@@ -18,18 +18,18 @@ import abc
 import functools
 import os
 
-from oslo.utils import importutils
+from oslo_log import log as logging
+from oslo_utils import importutils
 import six
 import webob.dec
 import webob.exc
 
 import nova.api.openstack
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova import exception
 from nova.i18n import _
+from nova.i18n import _LE
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 import nova.policy
 
 LOG = logging.getLogger(__name__)
@@ -50,10 +50,6 @@ class ExtensionDescriptor(object):
     alias = None
 
     # Description comes from the docstring for the class
-
-    # The XML namespace for the extension, e.g.,
-    # 'http://www.fox.in.socks/api/ext/pie/v1.0'
-    namespace = None
 
     # The timestamp when the extension was last updated, e.g.,
     # '2011-01-22T19:25:27Z'
@@ -82,54 +78,19 @@ class ExtensionDescriptor(object):
         controller_exts = []
         return controller_exts
 
-    @classmethod
-    def nsmap(cls):
-        """Synthesize a namespace map from extension."""
+    def __repr__(self):
+        return "<Extension: name=%s, alias=%s, updated=%s>" % (
+            self.name, self.alias, self.updated)
 
-        # Start with a base nsmap
-        nsmap = ext_nsmap.copy()
+    def is_valid(self):
+        """Validate required fields for extensions.
 
-        # Add the namespace for the extension
-        nsmap[cls.alias] = cls.namespace
-
-        return nsmap
-
-    @classmethod
-    def xmlname(cls, name):
-        """Synthesize element and attribute names."""
-
-        return '{%s}%s' % (cls.namespace, name)
-
-
-def make_ext(elem):
-    elem.set('name')
-    elem.set('namespace')
-    elem.set('alias')
-    elem.set('updated')
-
-    desc = xmlutil.SubTemplateElement(elem, 'description')
-    desc.text = 'description'
-
-    xmlutil.make_links(elem, 'links')
-
-
-ext_nsmap = {None: xmlutil.XMLNS_COMMON_V10, 'atom': xmlutil.XMLNS_ATOM}
-
-
-class ExtensionTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('extension', selector='extension')
-        make_ext(root)
-        return xmlutil.MasterTemplate(root, 1, nsmap=ext_nsmap)
-
-
-class ExtensionsTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('extensions')
-        elem = xmlutil.SubTemplateElement(root, 'extension',
-                                          selector='extensions')
-        make_ext(elem)
-        return xmlutil.MasterTemplate(root, 1, nsmap=ext_nsmap)
+        Raises an attribute error if the attr is not defined
+        """
+        for attr in ('name', 'alias', 'updated', 'namespace'):
+            if getattr(self, attr) is None:
+                raise AttributeError("%s is None, needs to be defined" % attr)
+        return True
 
 
 class ExtensionsController(wsgi.Resource):
@@ -148,14 +109,12 @@ class ExtensionsController(wsgi.Resource):
         ext_data['links'] = []  # TODO(dprince): implement extension links
         return ext_data
 
-    @wsgi.serializers(xml=ExtensionsTemplate)
     def index(self, req):
         extensions = []
         for ext in self.extension_manager.sorted_extensions():
             extensions.append(self._translate(ext))
         return dict(extensions=extensions)
 
-    @wsgi.serializers(xml=ExtensionTemplate)
     def show(self, req, id):
         try:
             # NOTE(dprince): the extensions alias is used as the 'id' for show
@@ -232,14 +191,9 @@ class ExtensionManager(object):
     def _check_extension(self, extension):
         """Checks for required methods in extension objects."""
         try:
-            LOG.debug('Ext name: %s', extension.name)
-            LOG.debug('Ext alias: %s', extension.alias)
-            LOG.debug('Ext description: %s',
-                      ' '.join(extension.__doc__.strip().split()))
-            LOG.debug('Ext namespace: %s', extension.namespace)
-            LOG.debug('Ext updated: %s', extension.updated)
-        except AttributeError as ex:
-            LOG.exception(_("Exception loading extension: %s"), ex)
+            extension.is_valid()
+        except AttributeError:
+            LOG.exception(_LE("Exception loading extension"))
             return False
 
         return True
@@ -274,9 +228,9 @@ class ExtensionManager(object):
             try:
                 self.load_extension(ext_factory)
             except Exception as exc:
-                LOG.warn(_LW('Failed to load extension %(ext_factory)s: '
-                             '%(exc)s'),
-                         {'ext_factory': ext_factory, 'exc': exc})
+                LOG.warning(_LW('Failed to load extension %(ext_factory)s: '
+                                '%(exc)s'),
+                            {'ext_factory': ext_factory, 'exc': exc})
 
 
 class ControllerExtension(object):
@@ -345,8 +299,8 @@ def load_standard_extensions(ext_mgr, logger, path, package, ext_list=None):
             try:
                 ext_mgr.load_extension(classpath)
             except Exception as exc:
-                logger.warn(_('Failed to load extension %(classpath)s: '
-                              '%(exc)s'),
+                logger.warn(_LW('Failed to load extension %(classpath)s: '
+                                '%(exc)s'),
                             {'classpath': classpath, 'exc': exc})
 
         # Now, let's consider any subdirectories we may have...
@@ -368,14 +322,19 @@ def load_standard_extensions(ext_mgr, logger, path, package, ext_list=None):
                 try:
                     ext(ext_mgr)
                 except Exception as exc:
-                    logger.warn(_('Failed to load extension %(ext_name)s:'
-                                  '%(exc)s'),
+                    logger.warn(_LW('Failed to load extension %(ext_name)s:'
+                                    '%(exc)s'),
                                 {'ext_name': ext_name, 'exc': exc})
 
         # Update the list of directories we'll explore...
+        # using os.walk 'the caller can modify the dirnames list in-place,
+        # and walk() will only recurse into the subdirectories whose names
+        # remain in dirnames'
+        # https://docs.python.org/2/library/os.html#os.walk
         dirnames[:] = subdirs
 
 
+# This will be deprecated after policy cleanup finished
 def core_authorizer(api_name, extension_name):
     def authorize(context, target=None, action=None):
         if target is None:
@@ -389,33 +348,52 @@ def core_authorizer(api_name, extension_name):
     return authorize
 
 
+# This is only used for Nova V2 API, after v2 API depreciated, this will be
+# deprecated also.
 def extension_authorizer(api_name, extension_name):
     return core_authorizer('%s_extension' % api_name, extension_name)
 
 
-def soft_authorizer(hard_authorizer, api_name, extension_name):
+def _soft_authorizer(hard_authorizer, api_name, extension_name):
     hard_authorize = hard_authorizer(api_name, extension_name)
 
-    def authorize(context, action=None):
+    def authorize(context, target=None, action=None):
         try:
-            hard_authorize(context, action=action)
+            hard_authorize(context, target=target, action=action)
             return True
         except exception.Forbidden:
             return False
     return authorize
 
 
+# This is only used for Nova V2 API, after V2 API depreciated, this will be
+# deprecated also.
 def soft_extension_authorizer(api_name, extension_name):
-    return soft_authorizer(extension_authorizer, api_name, extension_name)
+    return _soft_authorizer(extension_authorizer, api_name, extension_name)
 
 
+# This will be deprecated after policy cleanup finished
 def soft_core_authorizer(api_name, extension_name):
-    return soft_authorizer(core_authorizer, api_name, extension_name)
+    return _soft_authorizer(core_authorizer, api_name, extension_name)
 
 
+# This will be deprecated after ec2 old style policy removed in later release
 def check_compute_policy(context, action, target, scope='compute'):
     _action = '%s:%s' % (scope, action)
     nova.policy.enforce(context, _action, target)
+
+
+# NOTE(alex_xu): The functions os_compute_authorizer and
+# os_compute_soft_authorizer are used to policy enforcement for Openstack
+# Compute API, now Nova V2.1 REST API will invoke it.
+#
+
+def os_compute_authorizer(extension_name):
+    return core_authorizer('os_compute_api', extension_name)
+
+
+def os_compute_soft_authorizer(extension_name):
+    return soft_core_authorizer('os_compute_api', extension_name)
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -464,6 +442,20 @@ class V3APIExtensionBase(object):
         """Version of the extension."""
         pass
 
+    def __repr__(self):
+        return "<Extension: name=%s, alias=%s, version=%s>" % (
+            self.name, self.alias, self.version)
+
+    def is_valid(self):
+        """Validate required fields for extensions.
+
+        Raises an attribute error if the attr is not defined
+        """
+        for attr in ('name', 'alias', 'version'):
+            if getattr(self, attr) is None:
+                raise AttributeError("%s is None, needs to be defined" % attr)
+        return True
+
 
 def expected_errors(errors):
     """Decorator for v3 API methods which specifies expected exceptions.
@@ -498,7 +490,7 @@ def expected_errors(errors):
                     # expected error.
                     raise
 
-                LOG.exception(_("Unexpected exception in API method"))
+                LOG.exception(_LE("Unexpected exception in API method"))
                 msg = _('Unexpected API Error. Please report this at '
                     'http://bugs.launchpad.net/nova/ and attach the Nova '
                     'API log if possible.\n%s') % type(exc)

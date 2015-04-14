@@ -15,7 +15,7 @@
 
 """Extension for hiding server addresses in certain states."""
 
-from oslo.config import cfg
+from oslo_config import cfg
 
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
@@ -32,7 +32,7 @@ CONF = cfg.CONF
 CONF.register_opts(opts)
 
 ALIAS = 'os-hide-server-addresses'
-authorize = extensions.soft_extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_soft_authorizer(ALIAS)
 
 
 class Controller(wsgi.Controller):

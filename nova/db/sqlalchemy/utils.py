@@ -13,8 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.db import exception as db_exc
-from oslo.db.sqlalchemy import utils as oslodbutils
+from oslo_db import exception as db_exc
+from oslo_db.sqlalchemy import utils as oslodbutils
+from oslo_log import log as logging
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy import MetaData
@@ -24,8 +25,7 @@ from sqlalchemy.types import NullType
 
 from nova.db.sqlalchemy import api as db
 from nova import exception
-from nova.i18n import _
-from nova.openstack.common import log as logging
+from nova.i18n import _, _LE
 
 
 LOG = logging.getLogger(__name__)
@@ -60,8 +60,8 @@ def check_shadow_table(migrate_engine, table_name):
     shadow_table = Table(db._SHADOW_TABLE_PREFIX + table_name, meta,
                          autoload=True)
 
-    columns = dict([(c.name, c) for c in table.columns])
-    shadow_columns = dict([(c.name, c) for c in shadow_table.columns])
+    columns = {c.name: c for c in table.columns}
+    shadow_columns = {c.name: c for c in shadow_table.columns}
 
     for name, column in columns.iteritems():
         if name not in shadow_columns:
@@ -129,8 +129,8 @@ def create_shadow_table(migrate_engine, table_name=None, table=None,
         # which raises unwrapped OperationalError, so we should catch it until
         # oslo.db would wraps all such exceptions
         LOG.info(repr(shadow_table))
-        LOG.exception(_('Exception while creating table.'))
+        LOG.exception(_LE('Exception while creating table.'))
         raise exception.ShadowTableExists(name=shadow_table_name)
     except Exception:
         LOG.info(repr(shadow_table))
-        LOG.exception(_('Exception while creating table.'))
+        LOG.exception(_LE('Exception while creating table.'))

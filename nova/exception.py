@@ -25,12 +25,12 @@ SHOULD include dedicated exception logging.
 import functools
 import sys
 
-from oslo.config import cfg
-from oslo.utils import excutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
 import webob.exc
 
-from nova.i18n import _
-from nova.openstack.common import log as logging
+from nova.i18n import _, _LE
 from nova import safe_utils
 
 LOG = logging.getLogger(__name__)
@@ -55,13 +55,13 @@ class ConvertedException(webob.exc.WSGIHTTPException):
 
 def _cleanse_dict(original):
     """Strip all admin_password, new_pass, rescue_pass keys from a dict."""
-    return dict((k, v) for k, v in original.iteritems() if "_pass" not in k)
+    return {k: v for k, v in original.iteritems() if "_pass" not in k}
 
 
 def wrap_exception(notifier=None, get_notifier=None):
     """This decorator wraps a method to catch any exceptions that may
-    get thrown. It logs the exception as well as optionally sending
-    it to the notification system.
+    get thrown. It also optionally sends the exception to the notification
+    system.
     """
     def inner(f):
         def wrapped(self, context, *args, **kw):
@@ -121,7 +121,7 @@ class NovaException(Exception):
                 exc_info = sys.exc_info()
                 # kwargs doesn't match a variable in the message
                 # log the issue and the kwargs
-                LOG.exception(_('Exception in string format operation'))
+                LOG.exception(_LE('Exception in string format operation'))
                 for name, value in kwargs.iteritems():
                     LOG.error("%s: %s" % (name, value))    # noqa
 
@@ -158,6 +158,10 @@ class VirtualInterfaceCreateException(NovaException):
 class VirtualInterfaceMacAddressException(NovaException):
     msg_fmt = _("Creation of virtual interface with "
                 "unique mac address failed")
+
+
+class VirtualInterfacePlugException(NovaException):
+    msg_fmt = _("Virtual interface plugin failed")
 
 
 class GlanceConnectionFailed(NovaException):
@@ -321,6 +325,20 @@ class InvalidUnicodeParameter(Invalid):
                 "Unicode is not supported by the current database.")
 
 
+class InvalidAPIVersionString(Invalid):
+    msg_fmt = _("API Version String %(version)s is of invalid format. Must "
+                "be of format MajorNum.MinorNum.")
+
+
+class VersionNotFoundForAPIMethod(Invalid):
+    msg_fmt = _("API version %(version)s is not supported on this method.")
+
+
+class InvalidGlobalAPIVersion(Invalid):
+    msg_fmt = _("Version %(req_ver)s is not supported by the API. Minimum "
+                "is %(min_ver)s and maximum is %(max_ver)s.")
+
+
 # Cannot be templated as the error syntax varies.
 # msg needs to be constructed when raised.
 class InvalidParameterValue(Invalid):
@@ -329,7 +347,27 @@ class InvalidParameterValue(Invalid):
 
 
 class InvalidAggregateAction(Invalid):
-    msg_fmt = _("Cannot perform action '%(action)s' on aggregate "
+    msg_fmt = _("Unacceptable parameters.")
+    code = 400
+
+
+class InvalidAggregateActionAdd(InvalidAggregateAction):
+    msg_fmt = _("Cannot add host to aggregate "
+                "%(aggregate_id)s. Reason: %(reason)s.")
+
+
+class InvalidAggregateActionDelete(InvalidAggregateAction):
+    msg_fmt = _("Cannot remove host from aggregate "
+                "%(aggregate_id)s. Reason: %(reason)s.")
+
+
+class InvalidAggregateActionUpdate(InvalidAggregateAction):
+    msg_fmt = _("Cannot update aggregate "
+                "%(aggregate_id)s. Reason: %(reason)s.")
+
+
+class InvalidAggregateActionUpdateMeta(InvalidAggregateAction):
+    msg_fmt = _("Cannot update metadata of aggregate "
                 "%(aggregate_id)s. Reason: %(reason)s.")
 
 
@@ -586,6 +624,10 @@ class StorageRepositoryNotFound(NotFound):
     msg_fmt = _("Cannot find SR to read/write VDI.")
 
 
+class InstanceMappingNotFound(NotFound):
+    msg_fmt = _("Instance %(uuid)s has no mapping to a cell.")
+
+
 class NetworkDuplicated(Invalid):
     msg_fmt = _("Network %(network_id)s is duplicated.")
 
@@ -596,6 +638,10 @@ class NetworkDhcpReleaseFailed(NovaException):
 
 class NetworkInUse(NovaException):
     msg_fmt = _("Network %(network_id)s is still in use.")
+
+
+class NetworkSetHostFailed(NovaException):
+    msg_fmt = _("Network set host failed for network %(network_id)s.")
 
 
 class NetworkNotCreated(Invalid):
@@ -670,14 +716,14 @@ class NoMoreNetworks(NovaException):
     msg_fmt = _("No more available networks.")
 
 
-class NetworkNotFoundForProject(NotFound):
+class NetworkNotFoundForProject(NetworkNotFound):
     msg_fmt = _("Either network uuid %(network_uuid)s is not present or "
                 "is not assigned to the project %(project_id)s.")
 
 
 class NetworkAmbiguous(Invalid):
     msg_fmt = _("More than one possible network found. Specify "
-                "network ID(s) to select which one(s) to connect to,")
+                "network ID(s) to select which one(s) to connect to.")
 
 
 class NetworkRequiresSubnet(Invalid):
@@ -692,6 +738,11 @@ class ExternalNetworkAttachForbidden(Forbidden):
 
 class NetworkMissingPhysicalNetwork(NovaException):
     msg_fmt = _("Physical network is missing for network %(network_uuid)s")
+
+
+class VifDetailsMissingVhostuserSockPath(Invalid):
+    msg_fmt = _("vhostuser_sock_path not present in vif_details"
+                " for vif %(vif_id)s")
 
 
 class DatastoreNotFound(NotFound):
@@ -742,6 +793,10 @@ class FixedIpNotFoundForSpecificInstance(FixedIpNotFound):
 class FixedIpNotFoundForNetwork(FixedIpNotFound):
     msg_fmt = _("Fixed IP address (%(address)s) does not exist in "
                 "network (%(network_uuid)s).")
+
+
+class FixedIpAssociateFailed(NovaException):
+    msg_fmt = _("Fixed IP associate failed for network: %(net)s.")
 
 
 class FixedIpAlreadyInUse(NovaException):
@@ -818,6 +873,10 @@ class NoFloatingIpsDefined(NotFound):
 class NoFloatingIpInterface(NotFound):
     ec2_code = "UnsupportedOperation"
     msg_fmt = _("Interface %(interface)s not found.")
+
+
+class FloatingIpAllocateFailed(NovaException):
+    msg_fmt = _("Floating IP allocate failed.")
 
 
 class CannotDisassociateAutoAssignedFloatingIP(NovaException):
@@ -1096,6 +1155,10 @@ class ClassNotFound(NotFound):
 
 class NotAllowed(NovaException):
     msg_fmt = _("Action not allowed.")
+
+
+class InstanceTagNotFound(NotFound):
+    msg_fmt = _("Instance %(instance_id)s has no tag '%(tag)s'")
 
 
 class ImageRotationNotAllowed(NovaException):
@@ -1557,17 +1620,17 @@ class PciDeviceNotFoundById(NotFound):
     msg_fmt = _("PCI device %(id)s not found")
 
 
-class PciDeviceNotFound(NovaException):
+class PciDeviceNotFound(NotFound):
     msg_fmt = _("PCI Device %(node_id)s:%(address)s not found.")
 
 
-class PciDeviceInvalidStatus(NovaException):
+class PciDeviceInvalidStatus(Invalid):
     msg_fmt = _(
         "PCI device %(compute_node_id)s:%(address)s is %(status)s "
         "instead of %(hopestatus)s")
 
 
-class PciDeviceInvalidOwner(NovaException):
+class PciDeviceInvalidOwner(Invalid):
     msg_fmt = _(
         "PCI device %(compute_node_id)s:%(address)s is owned by %(owner)s "
         "instead of %(hopeowner)s")
@@ -1584,7 +1647,7 @@ class PciDevicePoolEmpty(NovaException):
         "from empty pool")
 
 
-class PciInvalidAlias(NovaException):
+class PciInvalidAlias(Invalid):
     msg_fmt = _("Invalid PCI alias definition: %(reason)s")
 
 
@@ -1602,7 +1665,7 @@ class PciConfigInvalidWhitelist(Invalid):
     msg_fmt = _("Invalid PCI devices Whitelist config %(reason)s")
 
 
-class PciTrackerInvalidNodeId(NovaException):
+class PciTrackerInvalidNodeId(Invalid):
     msg_fmt = _("Cannot change %(node_id)s to %(new_node_id)s")
 
 
@@ -1691,7 +1754,7 @@ class ImageNUMATopologyIncomplete(Invalid):
                 "NUMA nodes")
 
 
-class ImageNUMATopologyForbidden(Invalid):
+class ImageNUMATopologyForbidden(Forbidden):
     msg_fmt = _("Image property '%(name)s' is not permitted to override "
                 "NUMA configuration set against the flavor")
 
@@ -1749,7 +1812,7 @@ class InvalidImageConfigDrive(Invalid):
 
 
 class InvalidHypervisorVirtType(Invalid):
-    msg_fmt = _("Hypervisor virtualization type '%(hvtype)s' is not "
+    msg_fmt = _("Hypervisor virtualization type '%(hv_type)s' is not "
                 "recognised")
 
 
@@ -1763,3 +1826,51 @@ class InvalidToken(Invalid):
 
 class InvalidConnectionInfo(Invalid):
     msg_fmt = _("Invalid Connection Info")
+
+
+class InstanceQuiesceNotSupported(Invalid):
+    msg_fmt = _('Quiescing is not supported in instance %(instance_id)s: '
+                '%(reason)s')
+
+
+class MemoryPageSizeInvalid(Invalid):
+    msg_fmt = _("Invalid memory page size '%(pagesize)s'")
+
+
+class MemoryPageSizeForbidden(Invalid):
+    msg_fmt = _("Page size %(pagesize)s forbidden against '%(against)s'")
+
+
+class MemoryPageSizeNotSupported(Invalid):
+    msg_fmt = _("Page size %(pagesize)s is not supported by the host.")
+
+
+class CPUPinningNotSupported(Invalid):
+    msg_fmt = _("CPU pinning is not supported by the host: "
+                "%(reason)s")
+
+
+class CPUPinningInvalid(Invalid):
+    msg_fmt = _("Cannot pin/unpin cpus %(requested)s from the following "
+                "pinned set %(pinned)s")
+
+
+class ImageCPUPinningForbidden(Forbidden):
+    msg_fmt = _("Image property 'hw_cpu_policy' is not permitted to override "
+                "CPU pinning policy set against the flavor")
+
+
+class UnsupportedPolicyException(Invalid):
+    msg_fmt = _("ServerGroup policy is not supported: %(reason)s")
+
+
+class CellMappingNotFound(NotFound):
+    msg_fmt = _("Cell %(uuid)s has no mapping.")
+
+
+class NUMATopologyUnsupported(Invalid):
+    msg_fmt = _("Host does not support guests with NUMA topology set")
+
+
+class MemoryPagesUnsupported(Invalid):
+    msg_fmt = _("Host does not support guests with custom memory page sizes")

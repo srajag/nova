@@ -16,27 +16,34 @@
 
 """Volume drivers for libvirt."""
 
+import errno
 import glob
 import os
+import platform
+import re
 import time
 import urllib2
 
-from oslo.concurrency import processutils
-from oslo.config import cfg
-from oslo.utils import strutils
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import strutils
 import six
 import six.moves.urllib.parse as urlparse
 
+from nova.compute import arch
 from nova import exception
 from nova.i18n import _
 from nova.i18n import _LE
+from nova.i18n import _LI
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 from nova.openstack.common import loopingcall
 from nova import paths
 from nova.storage import linuxscsi
 from nova import utils
 from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt import quobyte
+from nova.virt.libvirt import remotefs
 from nova.virt.libvirt import utils as libvirt_utils
 
 LOG = logging.getLogger(__name__)
@@ -58,8 +65,17 @@ volume_opts = [
                help='Directory where the NFS volume is mounted on the'
                ' compute node'),
     cfg.StrOpt('nfs_mount_options',
-               help='Mount options passedf to the NFS client. See section '
+               help='Mount options passed to the NFS client. See section '
                     'of the nfs man page for details'),
+    cfg.StrOpt('smbfs_mount_point_base',
+               default=paths.state_path_def('mnt'),
+               help='Directory where the SMBFS shares are mounted on the '
+                    'compute node'),
+    cfg.StrOpt('smbfs_mount_options',
+               default='',
+               help='Mount options passed to the SMBFS client. See '
+                    'mount.cifs man page for details. Note that the '
+                    'libvirt-qemu uid and gid must be specified.'),
     cfg.IntOpt('num_aoe_discover_tries',
                default=3,
                help='Number of times to rediscover AoE target to find volume'),
@@ -81,7 +97,22 @@ volume_opts = [
     cfg.ListOpt('qemu_allowed_storage_drivers',
                 default=[],
                 help='Protocols listed here will be accessed directly '
-                     'from QEMU. Currently supported protocols: [gluster]')
+                     'from QEMU. Currently supported protocols: [gluster]'),
+    cfg.StrOpt('quobyte_mount_point_base',
+               default=paths.state_path_def('mnt'),
+               help='Directory where the Quobyte volume is mounted on the '
+                    'compute node'),
+    cfg.StrOpt('quobyte_client_cfg',
+               help='Path to a Quobyte Client configuration file.'),
+    cfg.StrOpt('iscsi_iface',
+               deprecated_name='iscsi_transport',
+               help='The iSCSI transport iface to use to connect to target in '
+                    'case offload support is desired. Supported transports '
+                    'are be2iscsi, bnx2i, cxgb3i, cxgb4i, qla4xxx and ocs. '
+                    'Default format is transport_name.hwaddress and can be '
+                    'generated manually or via iscsiadm -m iface'),
+                    # iser is also supported, but use LibvirtISERVolumeDriver
+                    # instead
     ]
 
 CONF = cfg.CONF
@@ -98,7 +129,7 @@ class LibvirtBaseVolumeDriver(object):
         """Returns xml for libvirt."""
         conf = vconfig.LibvirtConfigGuestDisk()
         conf.driver_name = libvirt_utils.pick_disk_driver_name(
-            self.connection._get_hypervisor_version(),
+            self.connection._host.get_version(),
             self.is_block_dev
         )
 
@@ -146,6 +177,26 @@ class LibvirtBaseVolumeDriver(object):
                     access_mode=access_mode)
 
         return conf
+
+    def _get_secret_uuid(self, conf, password=None):
+        secret = self.connection._host.find_secret(conf.source_protocol,
+                                                   conf.source_name)
+        if secret is None:
+            secret = self.connection._host.create_secret(conf.source_protocol,
+                                                         conf.source_name,
+                                                         password)
+        return secret.UUIDString()
+
+    def _delete_secret_by_name(self, connection_info):
+        source_protocol = connection_info['driver_volume_type']
+        netdisk_properties = connection_info['data']
+        if source_protocol == 'rbd':
+            return
+        elif source_protocol == 'iscsi':
+            usage_type = 'iscsi'
+            usage_name = ("%(target_iqn)s/%(target_lun)s" %
+                          netdisk_properties)
+            self.connection._host.delete_secret(usage_type, usage_name)
 
     def connect_volume(self, connection_info, disk_info):
         """Connect the volume. Returns xml for libvirt."""
@@ -211,22 +262,93 @@ class LibvirtNetVolumeDriver(LibvirtBaseVolumeDriver):
             auth_enabled = True  # Force authentication locally
             if CONF.libvirt.rbd_user:
                 conf.auth_username = CONF.libvirt.rbd_user
+        if conf.source_protocol == 'iscsi':
+            try:
+                conf.source_name = ("%(target_iqn)s/%(target_lun)s" %
+                                    netdisk_properties)
+                target_portal = netdisk_properties['target_portal']
+            except KeyError:
+                raise exception.NovaException(_("Invalid volume source data"))
+
+            ip, port = utils.parse_server_string(target_portal)
+            if ip == '' or port == '':
+                raise exception.NovaException(_("Invalid target_lun"))
+            conf.source_hosts = [ip]
+            conf.source_ports = [port]
+            if netdisk_properties.get('auth_method') == 'CHAP':
+                auth_enabled = True
+                conf.auth_secret_type = 'iscsi'
+                password = netdisk_properties.get('auth_password')
+                conf.auth_secret_uuid = self._get_secret_uuid(conf, password)
         if auth_enabled:
             conf.auth_username = (conf.auth_username or
                                   netdisk_properties['auth_username'])
-            conf.auth_secret_type = netdisk_properties['secret_type']
+            conf.auth_secret_type = (conf.auth_secret_type or
+                                     netdisk_properties['secret_type'])
             conf.auth_secret_uuid = (conf.auth_secret_uuid or
                                      netdisk_properties['secret_uuid'])
         return conf
 
+    def disconnect_volume(self, connection_info, disk_dev):
+        """Detach the volume from instance_name."""
+        super(LibvirtNetVolumeDriver,
+              self).disconnect_volume(connection_info, disk_dev)
+        self._delete_secret_by_name(connection_info)
+
 
 class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
     """Driver to attach Network volumes to libvirt."""
+    supported_transports = ['be2iscsi', 'bnx2i', 'cxgb3i',
+                            'cxgb4i', 'qla4xxx', 'ocs']
+
     def __init__(self, connection):
         super(LibvirtISCSIVolumeDriver, self).__init__(connection,
                                                        is_block_dev=True)
         self.num_scan_tries = CONF.libvirt.num_iscsi_scan_tries
         self.use_multipath = CONF.libvirt.iscsi_use_multipath
+        if CONF.libvirt.iscsi_iface:
+            self.transport = CONF.libvirt.iscsi_iface
+        else:
+            self.transport = 'default'
+
+    def _get_transport(self):
+        if self._validate_transport(self.transport):
+            return self.transport
+        else:
+            return 'default'
+
+    def _validate_transport(self, transport_iface):
+        """Check that given iscsi_iface uses only supported transports
+
+        Accepted transport names for provided iface param are
+        be2iscsi, bnx2i, cxgb3i, cxgb4i, qla4xxx and ocs. iSER uses it's
+        own separate driver. Note the difference between transport and
+        iface; unlike iscsi_tcp/iser, this is not one and the same for
+        offloaded transports, where the default format is
+        transport_name.hwaddress
+        """
+        # We can support iser here as well, but currently reject it as the
+        # separate iser driver has not yet been deprecated.
+        if transport_iface == 'default':
+            return True
+        # Will return (6) if iscsi_iface file was not found, or (2) if iscsid
+        # could not be contacted
+        out = self._run_iscsiadm_bare(['-m',
+                                       'iface',
+                                       '-I',
+                                       transport_iface],
+                                       check_exit_code=[0, 2, 6])[0] or ""
+        LOG.debug("iscsiadm %(iface)s configuration: stdout=%(out)s",
+                  {'iface': transport_iface, 'out': out})
+        for data in [line.split() for line in out.splitlines()]:
+            if data[0] == 'iface.transport_name':
+                if data[2] in self.supported_transports:
+                    return True
+
+        LOG.warn(_LW("No useable transport found for iscsi iface %s. "
+                     "Falling back to default transport"),
+                 transport_iface)
+        return False
 
     def _run_iscsiadm(self, iscsi_properties, iscsi_command, **kwargs):
         check_exit_code = kwargs.pop('check_exit_code', 0)
@@ -273,23 +395,36 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
         """Attach the volume to instance_name."""
         iscsi_properties = connection_info['data']
 
+        # multipath installed, discovering other targets if available
+        # multipath should be configured on the nova-compute node,
+        # in order to fit storage vendor
+        out = None
         if self.use_multipath:
-            # multipath installed, discovering other targets if available
-            # multipath should be configured on the nova-compute node,
-            # in order to fit storage vendor
-            out = self._run_iscsiadm_bare(['-m',
-                                          'discovery',
-                                          '-t',
-                                          'sendtargets',
-                                          '-p',
-                                          iscsi_properties['target_portal']],
-                                          check_exit_code=[0, 255])[0] \
-                or ""
+            out = self._run_iscsiadm_discover(iscsi_properties)
 
-            for ip, iqn in self._get_target_portals_from_iscsiadm_output(out):
+            # There are two types of iSCSI multipath devices.  One which shares
+            # the same iqn between multiple portals, and the other which use
+            # different iqns on different portals.  Try to identify the type by
+            # checking the iscsiadm output if the iqn is used by multiple
+            # portals.  If it is, it's the former, so use the supplied iqn.
+            # Otherwise, it's the latter, so try the ip,iqn combinations to
+            # find the targets which constitutes the multipath device.
+            ips_iqns = self._get_target_portals_from_iscsiadm_output(out)
+            same_portal = False
+            all_portals = set()
+            match_portals = set()
+            for ip, iqn in ips_iqns:
+                all_portals.add(ip)
+                if iqn == iscsi_properties['target_iqn']:
+                    match_portals.add(ip)
+            if len(all_portals) == len(match_portals):
+                same_portal = True
+
+            for ip, iqn in ips_iqns:
                 props = iscsi_properties.copy()
-                props['target_portal'] = ip
-                props['target_iqn'] = iqn
+                props['target_portal'] = ip.split(",")[0]
+                if not same_portal:
+                    props['target_iqn'] = iqn
                 self._connect_to_iscsi_portal(props)
 
             self._rescan_iscsi()
@@ -305,7 +440,11 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
         # TODO(justinsb): This retry-with-delay is a pattern, move to utils?
         tries = 0
         disk_dev = disk_info['dev']
-        while not os.path.exists(host_device):
+
+        # Check host_device only when transport is used, since otherwise it is
+        # directly derived from properties. Only needed for unit tests
+        while ((self._get_transport() != "default" and not host_device)
+          or not os.path.exists(host_device)):
             if tries >= self.num_scan_tries:
                 raise exception.NovaException(_("iSCSI device not found at %s")
                                               % (host_device))
@@ -317,8 +456,14 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
             # The rescan isn't documented as being necessary(?), but it helps
             self._run_iscsiadm(iscsi_properties, ("--rescan",))
 
+            # For offloaded open-iscsi transports, host_device cannot be
+            # guessed unlike iscsi_tcp where it can be obtained from
+            # properties, so try and get it again.
+            if not host_device and self._get_transport() != "default":
+                host_device = self._get_host_device(iscsi_properties)
+
             tries = tries + 1
-            if not os.path.exists(host_device):
+            if not host_device or not os.path.exists(host_device):
                 time.sleep(tries ** 2)
 
         if tries != 0:
@@ -339,6 +484,60 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
                     multipath_device.split('/')[-1]
 
         connection_info['data']['device_path'] = host_device
+
+    def _run_iscsiadm_discover(self, iscsi_properties):
+        def run_iscsiadm_update_discoverydb():
+            return utils.execute(
+                            'iscsiadm',
+                            '-m', 'discoverydb',
+                            '-t', 'sendtargets',
+                            '-p', iscsi_properties['target_portal'],
+                            '--op', 'update',
+                            '-n', "discovery.sendtargets.auth.authmethod",
+                            '-v', iscsi_properties['discovery_auth_method'],
+                            '-n', "discovery.sendtargets.auth.username",
+                            '-v', iscsi_properties['discovery_auth_username'],
+                            '-n', "discovery.sendtargets.auth.password",
+                            '-v', iscsi_properties['discovery_auth_password'],
+                            run_as_root=True)
+
+        out = None
+        if iscsi_properties.get('discovery_auth_method'):
+            try:
+                run_iscsiadm_update_discoverydb()
+            except processutils.ProcessExecutionError as exc:
+                # iscsiadm returns 6 for "db record not found"
+                if exc.exit_code == 6:
+                    (out, err) = utils.execute(
+                                   'iscsiadm',
+                                   '-m', 'discoverydb',
+                                   '-t', 'sendtargets',
+                                   '-p', iscsi_properties['target_portal'],
+                                   '--op', 'new',
+                                   run_as_root=True)
+                    run_iscsiadm_update_discoverydb()
+                else:
+                    raise
+
+            out = self._run_iscsiadm_bare(
+                                        ['-m',
+                                        'discoverydb',
+                                        '-t',
+                                        'sendtargets',
+                                        '-p',
+                                        iscsi_properties['target_portal'],
+                                        '--discover'],
+                                        check_exit_code=[0, 255])[0] or ""
+        else:
+            out = self._run_iscsiadm_bare(
+                                        ['-m',
+                                        'discovery',
+                                        '-t',
+                                        'sendtargets',
+                                        '-p',
+                                        iscsi_properties['target_portal']],
+                                        check_exit_code=[0, 255])[0] or ""
+        return out
 
     @utils.synchronized('connect_volume')
     def disconnect_volume(self, connection_info, disk_dev):
@@ -362,11 +561,14 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
 
         # NOTE(vish): Only disconnect from the target if no luns from the
         #             target are in use.
-        device_prefix = ("/dev/disk/by-path/ip-%s-iscsi-%s-lun-" %
+        device_byname = ("ip-%s-iscsi-%s-lun-" %
                          (iscsi_properties['target_portal'],
                           iscsi_properties['target_iqn']))
         devices = self.connection._get_all_block_devices()
-        devices = [dev for dev in devices if dev.startswith(device_prefix)]
+        devices = [dev for dev in devices if (device_byname in dev
+                                              and
+                                              dev.startswith(
+                                                        '/dev/disk/by-path/'))]
         if not devices:
             self._disconnect_from_iscsi_portal(iscsi_properties)
         elif host_device not in devices:
@@ -414,16 +616,29 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
         # Do a discovery to find all targets.
         # Targets for multiple paths for the same multipath device
         # may not be the same.
-        out = self._run_iscsiadm_bare(['-m',
-                                      'discovery',
-                                      '-t',
-                                      'sendtargets',
-                                      '-p',
-                                      iscsi_properties['target_portal']],
-                                      check_exit_code=[0, 255])[0] \
-            or ""
+        out = self._run_iscsiadm_discover(iscsi_properties)
 
-        ips_iqns = self._get_target_portals_from_iscsiadm_output(out)
+        # Extract targets for the current multipath device.
+        ips_iqns = []
+        entries = self._get_iscsi_devices()
+        for ip, iqn in self._get_target_portals_from_iscsiadm_output(out):
+            ip_iqn = "%s-iscsi-%s" % (ip.split(",")[0], iqn)
+            for entry in entries:
+                entry_ip_iqn = entry.split("-lun-")[0]
+                if entry_ip_iqn[:3] == "ip-":
+                    entry_ip_iqn = entry_ip_iqn[3:]
+                elif entry_ip_iqn[:4] == "pci-":
+                    # Look at an offset of len('pci-0000:00:00.0')
+                    offset = entry_ip_iqn.find("ip-", 16, 21)
+                    entry_ip_iqn = entry_ip_iqn[(offset + 3):]
+                if (ip_iqn != entry_ip_iqn):
+                    continue
+                entry_real_path = os.path.realpath("/dev/disk/by-path/%s" %
+                                                   entry)
+                entry_mpdev = self._get_multipath_device_name(entry_real_path)
+                if entry_mpdev == multipath_device:
+                    ips_iqns.append([ip, iqn])
+                    break
 
         if not devices:
             # disconnect if no other multipath devices
@@ -545,7 +760,13 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
             devices = list(os.walk('/dev/disk/by-path'))[0][-1]
         except IndexError:
             return []
-        return [entry for entry in devices if entry.startswith("ip-")]
+        iscsi_devs = []
+        for entry in devices:
+            if (entry.startswith("ip-") or
+                    (entry.startswith('pci-') and 'ip-' in entry)):
+                iscsi_devs.append(entry)
+
+        return iscsi_devs
 
     def _delete_mpath(self, iscsi_properties, multipath_device, ips_iqns):
         entries = self._get_iscsi_devices()
@@ -609,14 +830,27 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
     def _rescan_multipath(self):
         self._run_multipath(['-r'], check_exit_code=[0, 1, 21])
 
-    def _get_host_device(self, iscsi_properties):
-        return ("/dev/disk/by-path/ip-%s-iscsi-%s-lun-%s" %
-                (iscsi_properties['target_portal'],
-                 iscsi_properties['target_iqn'],
-                 iscsi_properties.get('target_lun', 0)))
+    def _get_host_device(self, transport_properties):
+        """Find device path in devtemfs."""
+        device = ("ip-%s-iscsi-%s-lun-%s" %
+                  (transport_properties['target_portal'],
+                   transport_properties['target_iqn'],
+                   transport_properties.get('target_lun', 0)))
+        if self._get_transport() == "default":
+            return ("/dev/disk/by-path/%s" % device)
+        else:
+            host_device = None
+            look_for_device = glob.glob('/dev/disk/by-path/*%s' % device)
+            if look_for_device:
+                host_device = look_for_device[0]
+            return host_device
 
     def _reconnect(self, iscsi_properties):
-        self._run_iscsiadm(iscsi_properties, ('--op', 'new'))
+        # Note: iscsiadm does not support changing iface.iscsi_ifacename
+        # via --op update, so we do this at creation time
+        self._run_iscsiadm(iscsi_properties,
+                           ('--interface', self._get_transport(),
+                            '--op', 'new'))
 
 
 class LibvirtISERVolumeDriver(LibvirtISCSIVolumeDriver):
@@ -626,6 +860,9 @@ class LibvirtISERVolumeDriver(LibvirtISCSIVolumeDriver):
         self.num_scan_tries = CONF.libvirt.num_iser_scan_tries
         self.use_multipath = CONF.libvirt.iser_use_multipath
 
+    def _get_transport(self):
+        return 'iser'
+
     def _get_multipath_iqn(self, multipath_device):
         entries = self._get_iscsi_devices()
         for entry in entries:
@@ -634,22 +871,6 @@ class LibvirtISERVolumeDriver(LibvirtISCSIVolumeDriver):
             if entry_multipath == multipath_device:
                 return entry.split("iser-")[1].split("-lun")[0]
         return None
-
-    def _get_host_device(self, iser_properties):
-        time.sleep(1)
-        host_device = None
-        device = ("ip-%s-iscsi-%s-lun-%s" %
-                  (iser_properties['target_portal'],
-                   iser_properties['target_iqn'],
-                   iser_properties.get('target_lun', 0)))
-        look_for_device = glob.glob('/dev/disk/by-path/*%s' % device)
-        if look_for_device:
-            host_device = look_for_device[0]
-        return host_device
-
-    def _reconnect(self, iser_properties):
-        self._run_iscsiadm(iser_properties,
-                           ('--interface', 'iser', '--op', 'new'))
 
 
 class LibvirtNFSVolumeDriver(LibvirtBaseVolumeDriver):
@@ -718,7 +939,7 @@ class LibvirtNFSVolumeDriver(LibvirtBaseVolumeDriver):
         nfs_cmd = ['mount', '-t', 'nfs']
         if CONF.libvirt.nfs_mount_options is not None:
             nfs_cmd.extend(['-o', CONF.libvirt.nfs_mount_options])
-        if options is not None:
+        if options:
             nfs_cmd.extend(options.split(' '))
         nfs_cmd.extend([nfs_share, mount_path])
 
@@ -729,6 +950,70 @@ class LibvirtNFSVolumeDriver(LibvirtBaseVolumeDriver):
                 LOG.warn(_LW("%s is already mounted"), nfs_share)
             else:
                 raise
+
+
+class LibvirtSMBFSVolumeDriver(LibvirtBaseVolumeDriver):
+    """Class implements libvirt part of volume driver for SMBFS."""
+
+    def __init__(self, connection):
+        super(LibvirtSMBFSVolumeDriver,
+              self).__init__(connection, is_block_dev=False)
+        self.username_regex = re.compile(
+            r"(user(?:name)?)=(?:[^ ,]+\\)?([^ ,]+)")
+
+    def _get_device_path(self, connection_info):
+        smbfs_share = connection_info['data']['export']
+        mount_path = self._get_mount_path(smbfs_share)
+        volume_path = os.path.join(mount_path,
+                                   connection_info['data']['name'])
+        return volume_path
+
+    def _get_mount_path(self, smbfs_share):
+        mount_path = os.path.join(CONF.libvirt.smbfs_mount_point_base,
+                                  utils.get_hash_str(smbfs_share))
+        return mount_path
+
+    def get_config(self, connection_info, disk_info):
+        """Returns xml for libvirt."""
+        conf = super(LibvirtSMBFSVolumeDriver,
+                     self).get_config(connection_info, disk_info)
+
+        conf.source_type = 'file'
+        conf.driver_cache = 'writethrough'
+        conf.source_path = connection_info['data']['device_path']
+        conf.driver_format = connection_info['data'].get('format', 'raw')
+        return conf
+
+    def connect_volume(self, connection_info, disk_info):
+        """Connect the volume."""
+        smbfs_share = connection_info['data']['export']
+        mount_path = self._get_mount_path(smbfs_share)
+
+        if not libvirt_utils.is_mounted(mount_path, smbfs_share):
+            mount_options = self._parse_mount_options(connection_info)
+            remotefs.mount_share(mount_path, smbfs_share,
+                                 export_type='cifs', options=mount_options)
+
+        device_path = self._get_device_path(connection_info)
+        connection_info['data']['device_path'] = device_path
+
+    def disconnect_volume(self, connection_info, disk_dev):
+        """Disconnect the volume."""
+        smbfs_share = connection_info['data']['export']
+        mount_path = self._get_mount_path(smbfs_share)
+        remotefs.unmount_share(mount_path, smbfs_share)
+
+    def _parse_mount_options(self, connection_info):
+        mount_options = " ".join(
+            [connection_info['data'].get('options') or '',
+             CONF.libvirt.smbfs_mount_options])
+
+        if not self.username_regex.findall(mount_options):
+            mount_options = mount_options + ' -o username=guest'
+        else:
+            # Remove the Domain Name from user name
+            mount_options = self.username_regex.sub(r'\1=\2', mount_options)
+        return mount_options.strip(", ").split(' ')
 
 
 class LibvirtAOEVolumeDriver(LibvirtBaseVolumeDriver):
@@ -942,36 +1227,102 @@ class LibvirtFibreChannelVolumeDriver(LibvirtBaseVolumeDriver):
         conf.source_path = connection_info['data']['device_path']
         return conf
 
+    def _get_lun_string_for_s390(self, lun):
+        target_lun = 0
+        if lun < 256:
+            target_lun = "0x00%02x000000000000" % lun
+        elif lun <= 0xffffffff:
+            target_lun = "0x%08x00000000" % lun
+        return target_lun
+
+    def _get_device_file_path_s390(self, pci_num, target_wwn, lun):
+        """Returns device file path"""
+        # NOTE the format of device file paths depends on the system
+        # architecture. Most architectures use a PCI based format.
+        # Systems following the S390, or S390x architecture use a format
+        # which is based upon the inherent channel architecture (ccw).
+        host_device = ("/dev/disk/by-path/ccw-%s-zfcp-%s:%s" %
+                        (pci_num,
+                        target_wwn,
+                        lun))
+        return host_device
+
+    def _remove_lun_from_s390(self, connection_info):
+        """Rempove lun from s390 configuration"""
+        # If LUN scanning is turned off on systems following the s390, or
+        # s390x architecture LUNs need to be removed from the configuration
+        # using the unit_remove call. The unit_remove call needs to be issued
+        # for each (virtual) HBA and target_port.
+        fc_properties = connection_info['data']
+        lun = int(fc_properties.get('target_lun', 0))
+        target_lun = self._get_lun_string_for_s390(lun)
+        ports = fc_properties['target_wwn']
+
+        for device_num, target_wwn in self._get_possible_devices(ports):
+            libvirt_utils.perform_unit_remove_for_s390(device_num,
+                                              target_wwn,
+                                              target_lun)
+
+    def _get_possible_devices(self, wwnports):
+        """Compute the possible valid fiber channel device options.
+
+        :param wwnports: possible wwn addresses. Can either be string
+        or list of strings.
+
+        :returns: list of (pci_id, wwn) tuples
+
+        Given one or more wwn (mac addresses for fiber channel) ports
+        do the matrix math to figure out a set of pci device, wwn
+        tuples that are potentially valid (they won't all be). This
+        provides a search space for the device connection.
+
+        """
+        # the wwn (think mac addresses for fiber channel devices) can
+        # either be a single value or a list. Normalize it to a list
+        # for further operations.
+        wwns = []
+        if isinstance(wwnports, list):
+            for wwn in wwnports:
+                wwns.append(str(wwn))
+        elif isinstance(wwnports, six.string_types):
+            wwns.append(str(wwnports))
+
+        raw_devices = []
+        hbas = libvirt_utils.get_fc_hbas_info()
+        for hba in hbas:
+            pci_num = self._get_pci_num(hba)
+            if pci_num is not None:
+                for wwn in wwns:
+                    target_wwn = "0x%s" % wwn.lower()
+                    raw_devices.append((pci_num, target_wwn))
+        return raw_devices
+
     @utils.synchronized('connect_volume')
     def connect_volume(self, connection_info, disk_info):
         """Attach the volume to instance_name."""
         fc_properties = connection_info['data']
         mount_device = disk_info["dev"]
 
-        ports = fc_properties['target_wwn']
-        wwns = []
-        # we support a list of wwns or a single wwn
-        if isinstance(ports, list):
-            for wwn in ports:
-                wwns.append(str(wwn))
-        elif isinstance(ports, six.string_types):
-            wwns.append(str(ports))
-
-        # We need to look for wwns on every hba
-        # because we don't know ahead of time
-        # where they will show up.
-        hbas = libvirt_utils.get_fc_hbas_info()
+        possible_devs = self._get_possible_devices(fc_properties['target_wwn'])
+        # map the raw device possibilities to possible host device paths
         host_devices = []
-        for hba in hbas:
-            pci_num = self._get_pci_num(hba)
-            if pci_num is not None:
-                for wwn in wwns:
-                    target_wwn = "0x%s" % wwn.lower()
-                    host_device = ("/dev/disk/by-path/pci-%s-fc-%s-lun-%s" %
-                                  (pci_num,
-                                   target_wwn,
-                                   fc_properties.get('target_lun', 0)))
-                    host_devices.append(host_device)
+        for device in possible_devs:
+            pci_num, target_wwn = device
+            if platform.machine() in (arch.S390, arch.S390X):
+                target_lun = self._get_lun_string_for_s390(
+                                fc_properties.get('target_lun', 0))
+                host_device = self._get_device_file_path_s390(
+                                pci_num,
+                                target_wwn,
+                                target_lun)
+                libvirt_utils.perform_unit_add_for_s390(
+                                pci_num, target_wwn, target_lun)
+            else:
+                host_device = ("/dev/disk/by-path/pci-%s-fc-%s-lun-%s" %
+                           (pci_num,
+                            target_wwn,
+                            fc_properties.get('target_lun', 0)))
+            host_devices.append(host_device)
 
         if len(host_devices) == 0:
             # this is empty because we don't have any FC HBAs
@@ -1001,7 +1352,7 @@ class LibvirtFibreChannelVolumeDriver(LibvirtBaseVolumeDriver):
                          "Will rescan & retry.  Try number: %(tries)s"),
                      {'mount_device': mount_device, 'tries': tries})
 
-            linuxscsi.rescan_hosts(hbas)
+            linuxscsi.rescan_hosts(libvirt_utils.get_fc_hbas_info())
             self.tries = self.tries + 1
 
         self.host_device = None
@@ -1061,6 +1412,8 @@ class LibvirtFibreChannelVolumeDriver(LibvirtBaseVolumeDriver):
         # all of them
         for device in devices:
             linuxscsi.remove_device(device)
+        if platform.machine() in (arch.S390, arch.S390X):
+            self._remove_lun_from_s390(connection_info)
 
 
 class LibvirtScalityVolumeDriver(LibvirtBaseVolumeDriver):
@@ -1142,3 +1495,97 @@ class LibvirtScalityVolumeDriver(LibvirtBaseVolumeDriver):
             msg = _LW("Cannot mount Scality SOFS, check syslog for errors")
             LOG.warn(msg)
             raise exception.NovaException(msg)
+
+
+class LibvirtGPFSVolumeDriver(LibvirtBaseVolumeDriver):
+    """Class for volumes backed by gpfs volume."""
+    def __init__(self, connection):
+        super(LibvirtGPFSVolumeDriver,
+              self).__init__(connection, is_block_dev=False)
+
+    def get_config(self, connection_info, disk_info):
+        """Returns xml for libvirt."""
+        conf = super(LibvirtGPFSVolumeDriver,
+                     self).get_config(connection_info, disk_info)
+        conf.source_type = "file"
+        conf.source_path = connection_info['data']['device_path']
+        return conf
+
+
+class LibvirtQuobyteVolumeDriver(LibvirtBaseVolumeDriver):
+    """Class implements libvirt part of volume driver for Quobyte."""
+
+    def __init__(self, connection):
+        """Create back-end to Quobyte."""
+        super(LibvirtQuobyteVolumeDriver,
+              self).__init__(connection, is_block_dev=False)
+
+    def get_config(self, connection_info, disk_info):
+        conf = super(LibvirtQuobyteVolumeDriver,
+                     self).get_config(connection_info, disk_info)
+        data = connection_info['data']
+        conf.source_protocol = quobyte.SOURCE_PROTOCOL
+        conf.source_type = quobyte.SOURCE_TYPE
+        conf.driver_cache = quobyte.DRIVER_CACHE
+        conf.driver_io = quobyte.DRIVER_IO
+        conf.driver_format = data.get('format', 'raw')
+
+        quobyte_volume = self._normalize_url(data['export'])
+        path = os.path.join(self._get_mount_point_for_share(quobyte_volume),
+                            data['name'])
+        conf.source_path = path
+
+        return conf
+
+    @utils.synchronized('connect_volume')
+    def connect_volume(self, connection_info, disk_info):
+        """Connect the volume."""
+        data = connection_info['data']
+        quobyte_volume = self._normalize_url(data['export'])
+        mount_path = self._get_mount_point_for_share(quobyte_volume)
+        mounted = libvirt_utils.is_mounted(mount_path,
+                                           quobyte.SOURCE_PROTOCOL
+                                           + '@' + quobyte_volume)
+        if mounted:
+            try:
+                os.stat(mount_path)
+            except OSError as exc:
+                if exc.errno == errno.ENOTCONN:
+                    mounted = False
+                    LOG.info(_LI('Fixing previous mount %s which was not'
+                                 ' unmounted correctly.'), mount_path)
+                    quobyte.umount_volume(mount_path)
+
+        if not mounted:
+            quobyte.mount_volume(quobyte_volume,
+                                 mount_path,
+                                 CONF.libvirt.quobyte_client_cfg)
+
+        quobyte.validate_volume(mount_path)
+
+    @utils.synchronized('connect_volume')
+    def disconnect_volume(self, connection_info, disk_dev):
+        """Disconnect the volume."""
+
+        quobyte_volume = self._normalize_url(connection_info['data']['export'])
+        mount_path = self._get_mount_point_for_share(quobyte_volume)
+
+        if libvirt_utils.is_mounted(mount_path, 'quobyte@' + quobyte_volume):
+            quobyte.umount_volume(mount_path)
+        else:
+            LOG.info(_LI("Trying to disconnected unmounted volume at %s"),
+                     mount_path)
+
+    def _normalize_url(self, export):
+        protocol = quobyte.SOURCE_PROTOCOL + "://"
+        if export.startswith(protocol):
+            export = export[len(protocol):]
+        return export
+
+    def _get_mount_point_for_share(self, quobyte_volume):
+        """Return mount point for Quobyte volume.
+
+        :param quobyte_volume: Example: storage-host/openstack-volumes
+        """
+        return os.path.join(CONF.libvirt.quobyte_mount_point_base,
+                            utils.get_hash_str(quobyte_volume))

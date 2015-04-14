@@ -16,15 +16,16 @@
 
 import collections
 
+from oslo_log import log as logging
+
 from nova.compute import task_states
 from nova.compute import vm_states
-from nova import context
 from nova import exception
-from nova.i18n import _
+from nova.i18n import _LW
 from nova import objects
-from nova.openstack.common import log as logging
 from nova.pci import device
 from nova.pci import stats
+from nova.virt import hardware
 
 LOG = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class PciDevTracker(object):
     information is updated to DB when devices information is changed.
     """
 
-    def __init__(self, node_id=None):
+    def __init__(self, context, node_id=None):
         """Create a pci device tracker.
 
         If a node_id is passed in, it will fetch pci devices information
@@ -79,7 +80,8 @@ class PciDevTracker(object):
     def save(self, context):
         for dev in self.pci_devs:
             if dev.obj_what_changed():
-                dev.save(context)
+                with dev.obj_alternate_context(context):
+                    dev.save()
 
         self.pci_devs = [dev for dev in self.pci_devs
                          if dev['status'] != 'deleted']
@@ -109,11 +111,12 @@ class PciDevTracker(object):
                 try:
                     device.remove(existed)
                 except exception.PciDeviceInvalidStatus as e:
-                    LOG.warn(_("Trying to remove device with %(status)s "
-                               "ownership %(instance_uuid)s because of "
-                               "%(pci_exception)s"), {'status': existed.status,
-                                  'instance_uuid': existed.instance_uuid,
-                                  'pci_exception': e.format_message()})
+                    LOG.warning(_LW("Trying to remove device with %(status)s "
+                                    "ownership %(instance_uuid)s because of "
+                                    "%(pci_exception)s"),
+                                {'status': existed.status,
+                                 'instance_uuid': existed.instance_uuid,
+                                 'pci_exception': e.format_message()})
                     # Note(yjiang5): remove the device by force so that
                     # db entry is cleaned in next sync.
                     existed.status = 'removed'
@@ -140,11 +143,12 @@ class PciDevTracker(object):
                     # by force in future.
                     self.stale[new_value['address']] = new_value
                 else:
-                    device.update_device(existed, new_value)
+                    existed.update_device(new_value)
 
         for dev in [dev for dev in devices if
                     dev['address'] in new_addrs - exist_addrs]:
             dev['compute_node_id'] = self.node_id
+            # NOTE(danms): These devices are created with no context
             dev_obj = objects.PciDevice.create(dev)
             self.pci_devs.append(dev_obj)
             self.stats.add_device(dev_obj)
@@ -154,11 +158,23 @@ class PciDevTracker(object):
             context, instance)
         if not pci_requests.requests:
             return None
-        devs = self.stats.consume_requests(pci_requests.requests)
+        instance_numa_topology = hardware.instance_topology_from_instance(
+            instance)
+        instance_cells = None
+        if instance_numa_topology:
+            instance_cells = instance_numa_topology.cells
+
+        devs = self.stats.consume_requests(pci_requests.requests,
+                                           instance_cells)
         if not devs:
             raise exception.PciDeviceRequestFailed(pci_requests)
         for dev in devs:
             device.claim(dev, instance)
+        if instance_numa_topology and any(
+                                        dev.numa_node is None for dev in devs):
+            LOG.warning(_LW("Assigning a pci device without numa affinity to"
+            "instance %(instance)s which has numa topology"),
+                        {'instance': instance['uuid']})
         return devs
 
     def _allocate_instance(self, instance, devs):
@@ -169,7 +185,7 @@ class PciDevTracker(object):
         device.free(dev, instance)
         stale = self.stale.pop(dev['address'], None)
         if stale:
-            device.update_device(dev, stale)
+            dev.update_device(stale)
         self.stats.add_device(dev)
 
     def _free_instance(self, instance):
@@ -235,9 +251,9 @@ class PciDevTracker(object):
 
         The caller should hold the COMPUTE_RESOURCE_SEMAPHORE lock
         """
-        existed = [inst['uuid'] for inst in instances]
-        existed += [mig['instance_uuid'] for mig in migrations]
-        existed += [inst['uuid'] for inst in orphans]
+        existed = set(inst['uuid'] for inst in instances)
+        existed |= set(mig['instance_uuid'] for mig in migrations)
+        existed |= set(inst['uuid'] for inst in orphans)
 
         for uuid in self.claims.keys():
             if uuid not in existed:
@@ -249,22 +265,6 @@ class PciDevTracker(object):
                 devs = self.allocations.pop(uuid, [])
                 for dev in devs:
                     self._free_device(dev)
-
-    def set_compute_node_id(self, node_id):
-        """Set the compute node id that this object is tracking for.
-
-        In current resource tracker implementation, the
-        compute_node entry is created in the last step of
-        update_available_resoruces, thus we have to lazily set the
-        compute_node_id at that time.
-        """
-
-        if self.node_id and self.node_id != node_id:
-            raise exception.PciTrackerInvalidNodeId(node_id=self.node_id,
-                                                    new_node_id=node_id)
-        self.node_id = node_id
-        for dev in self.pci_devs:
-            dev.compute_node_id = node_id
 
 
 def get_instance_pci_devs(inst, request_id=None):

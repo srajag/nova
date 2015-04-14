@@ -20,17 +20,17 @@ within a cell).
 
 This is different than communication between child and parent nova-cells
 services.  That communication is handled by the cells driver via the
-messging module.
+messaging module.
 """
 
-from oslo.config import cfg
-from oslo import messaging
-from oslo.serialization import jsonutils
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_serialization import jsonutils
 
 from nova import exception
-from nova.i18n import _
+from nova.i18n import _LE
 from nova.objects import base as objects_base
-from nova.openstack.common import log as logging
 from nova import rpc
 
 LOG = logging.getLogger(__name__)
@@ -101,6 +101,13 @@ class CellsAPI(object):
         ... Juno supports message version 1.29.  So, any changes to
         existing methods in 1.x after that point should be done such that they
         can handle the version_cap being set to 1.29.
+
+        * 1.30 - Make build_instances() use flavor object
+        * 1.31 - Add clean_shutdown to stop, resize, rescue, and shelve
+        * 1.32 - Send objects for instances in build_instances()
+        * 1.33 - Add clean_shutdown to resize_instance()
+        * 1.34 - build_instances uses BlockDeviceMapping objects, drops
+                 legacy_bdm argument
     '''
 
     VERSION_ALIASES = {
@@ -115,7 +122,10 @@ class CellsAPI(object):
         target = messaging.Target(topic=CONF.cells.topic, version='1.0')
         version_cap = self.VERSION_ALIASES.get(CONF.upgrade_levels.cells,
                                                CONF.upgrade_levels.cells)
-        serializer = objects_base.NovaObjectSerializer()
+        # NOTE(sbauza): Yes, this is ugly but cells_utils is calling cells.db
+        # which itself calls cells.rpcapi... You meant import cycling ? Gah.
+        from nova.cells import utils as cells_utils
+        serializer = cells_utils.ProxyObjectSerializer()
         self.client = rpc.get_client(target,
                                      version_cap=version_cap,
                                      serializer=serializer)
@@ -146,11 +156,29 @@ class CellsAPI(object):
         """Build instances."""
         build_inst_kwargs = kwargs
         instances = build_inst_kwargs['instances']
-        instances_p = [jsonutils.to_primitive(inst) for inst in instances]
-        build_inst_kwargs['instances'] = instances_p
         build_inst_kwargs['image'] = jsonutils.to_primitive(
                 build_inst_kwargs['image'])
-        cctxt = self.client.prepare(version='1.8')
+
+        version = '1.34'
+        if self.client.can_send_version('1.34'):
+            build_inst_kwargs.pop('legacy_bdm', None)
+        else:
+            bdm_p = objects_base.obj_to_primitive(
+                    build_inst_kwargs['block_device_mapping'])
+            build_inst_kwargs['block_device_mapping'] = bdm_p
+            version = '1.32'
+        if not self.client.can_send_version('1.32'):
+            instances_p = [jsonutils.to_primitive(inst) for inst in instances]
+            build_inst_kwargs['instances'] = instances_p
+            version = '1.30'
+        if not self.client.can_send_version('1.30'):
+            if 'filter_properties' in build_inst_kwargs:
+                filter_properties = build_inst_kwargs['filter_properties']
+                flavor = filter_properties['instance_type']
+                flavor_p = objects_base.obj_to_primitive(flavor)
+                filter_properties['instance_type'] = flavor_p
+            version = '1.8'
+        cctxt = self.client.prepare(version=version)
         cctxt.cast(ctxt, 'build_instances',
                    build_inst_kwargs=build_inst_kwargs)
 
@@ -170,8 +198,8 @@ class CellsAPI(object):
         self.client.cast(ctxt, 'instance_destroy_at_top', instance=instance_p)
 
     def instance_delete_everywhere(self, ctxt, instance, delete_type):
-        """Delete instance everywhere.  delete_type may be 'soft_delete'
-        or 'delete'.  This is generally only used to resolve races
+        """Delete instance everywhere.  delete_type may be 'soft'
+        or 'hard'.  This is generally only used to resolve races
         when API cell doesn't know to what cell an instance belongs.
         """
         if not CONF.cells.enable:
@@ -381,7 +409,7 @@ class CellsAPI(object):
             cctxt.cast(ctxt, 'bdm_update_or_create_at_top',
                        bdm=bdm, create=create)
         except Exception:
-            LOG.exception(_("Failed to notify cells of BDM update/create."))
+            LOG.exception(_LE("Failed to notify cells of BDM update/create."))
 
     def bdm_destroy_at_top(self, ctxt, instance_uuid, device_name=None,
                            volume_id=None):
@@ -397,7 +425,7 @@ class CellsAPI(object):
                        device_name=device_name,
                        volume_id=volume_id)
         except Exception:
-            LOG.exception(_("Failed to notify cells of BDM destroy."))
+            LOG.exception(_LE("Failed to notify cells of BDM destroy."))
 
     def get_migrations(self, ctxt, filters):
         """Get all migrations applying the filters."""
@@ -429,17 +457,23 @@ class CellsAPI(object):
         cctxt = self.client.prepare(version='1.12')
         cctxt.cast(ctxt, 'start_instance', instance=instance)
 
-    def stop_instance(self, ctxt, instance, do_cast=True):
+    def stop_instance(self, ctxt, instance, do_cast=True, clean_shutdown=True):
         """Stop an instance in its cell.
 
         This method takes a new-world instance object.
         """
         if not CONF.cells.enable:
             return
-        cctxt = self.client.prepare(version='1.12')
+        msg_args = {'instance': instance,
+                    'do_cast': do_cast}
+        if self.client.can_send_version('1.31'):
+            version = '1.31'
+            msg_args['clean_shutdown'] = clean_shutdown
+        else:
+            version = '1.12'
+        cctxt = self.client.prepare(version=version)
         method = do_cast and cctxt.cast or cctxt.call
-        return method(ctxt, 'stop_instance',
-                      instance=instance, do_cast=do_cast)
+        return method(ctxt, 'stop_instance', **msg_args)
 
     def cell_create(self, ctxt, values):
         cctxt = self.client.prepare(version='1.13')
@@ -531,14 +565,22 @@ class CellsAPI(object):
         cctxt.cast(ctxt, 'soft_delete_instance', instance=instance)
 
     def resize_instance(self, ctxt, instance, extra_instance_updates,
-                       scheduler_hint, flavor, reservations):
+                       scheduler_hint, flavor, reservations,
+                       clean_shutdown=True):
         if not CONF.cells.enable:
             return
         flavor_p = jsonutils.to_primitive(flavor)
-        cctxt = self.client.prepare(version='1.20')
-        cctxt.cast(ctxt, 'resize_instance',
-                   instance=instance, flavor=flavor_p,
-                   extra_instance_updates=extra_instance_updates)
+        version = '1.33'
+        msg_args = {'instance': instance,
+                    'flavor': flavor_p,
+                    'extra_instance_updates': extra_instance_updates,
+                    'clean_shutdown': clean_shutdown}
+        if not self.client.can_send_version(version):
+            del msg_args['clean_shutdown']
+            version = '1.20'
+
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(ctxt, 'resize_instance', **msg_args)
 
     def live_migrate_instance(self, ctxt, instance, host_name,
                               block_migration, disk_over_commit):

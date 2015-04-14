@@ -23,18 +23,41 @@ import socket
 import sys
 import urlparse
 
+from oslo_log import log as logging
 import websockify
 
 from nova.consoleauth import rpcapi as consoleauth_rpcapi
 from nova import context
 from nova import exception
 from nova.i18n import _
-from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
 
 class NovaProxyRequestHandlerBase(object):
+    def address_string(self):
+        # NOTE(rpodolyaka): override the superclass implementation here and
+        # explicitly disable the reverse DNS lookup, which might fail on some
+        # deployments due to DNS configuration and break VNC access completely
+        return str(self.client_address[0])
+
+    def verify_origin_proto(self, connection_info, origin_proto):
+        access_url = connection_info.get('access_url')
+        if not access_url:
+            detail = _("No access_url in connection_info. "
+                        "Cannot validate protocol")
+            raise exception.ValidationError(detail=detail)
+        expected_protos = [urlparse.urlparse(access_url).scheme]
+        # NOTE: For serial consoles the expected protocol could be ws or
+        # wss which correspond to http and https respectively in terms of
+        # security.
+        if 'ws' in expected_protos:
+            expected_protos.append('http')
+        if 'wss' in expected_protos:
+            expected_protos.append('https')
+
+        return origin_proto in expected_protos
+
     def new_websocket_client(self):
         """Called after a new WebSocket connection has been established."""
         # Reopen the eventlet hub to make sure we don't share an epoll
@@ -72,6 +95,27 @@ class NovaProxyRequestHandlerBase(object):
 
         if not connect_info:
             raise exception.InvalidToken(token=token)
+
+        # Verify Origin
+        expected_origin_hostname = self.headers.getheader('Host')
+        if ':' in expected_origin_hostname:
+            e = expected_origin_hostname
+            expected_origin_hostname = e.split(':')[0]
+        origin_url = self.headers.getheader('Origin')
+        # missing origin header indicates non-browser client which is OK
+        if origin_url is not None:
+            origin = urlparse.urlparse(origin_url)
+            origin_hostname = origin.hostname
+            origin_scheme = origin.scheme
+            if origin_hostname == '' or origin_scheme == '':
+                detail = _("Origin header not valid.")
+                raise exception.ValidationError(detail=detail)
+            if expected_origin_hostname != origin_hostname:
+                detail = _("Origin header does not match this host.")
+                raise exception.ValidationError(detail=detail)
+            if not self.verify_origin_proto(connect_info, origin_scheme):
+                detail = _("Origin header protocol does not match this host.")
+                raise exception.ValidationError(detail=detail)
 
         self.msg(_('connect info: %s'), str(connect_info))
         host = connect_info['host']

@@ -15,6 +15,7 @@
 
 """The hosts admin extension."""
 
+from oslo_log import log as logging
 import webob.exc
 
 from nova.api.openstack.compute.schemas.v3 import hosts
@@ -24,11 +25,12 @@ from nova.api import validation
 from nova import compute
 from nova import exception
 from nova.i18n import _
-from nova.openstack.common import log as logging
+from nova.i18n import _LI
+from nova import objects
 
 LOG = logging.getLogger(__name__)
 ALIAS = 'os-hosts'
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class HostController(wsgi.Controller):
@@ -72,8 +74,8 @@ class HostController(wsgi.Controller):
         |     'service': 'scheduler',
         |     'zone': 'internal'},
         |    {'host_name': 'vol1.host.com',
-        |     'service': 'volume'},
-        |     'zone': 'internal']}
+        |     'service': 'volume',
+        |     'zone': 'internal'}]}
 
         """
         context = req.environ['nova.context']
@@ -82,9 +84,6 @@ class HostController(wsgi.Controller):
         zone = req.GET.get('zone', None)
         if zone:
             filters['availability_zone'] = zone
-        service = req.GET.get('service')
-        if service:
-            filters['topic'] = service
         services = self.api.service_get_all(context, filters=filters,
                                             set_zones=True)
         hosts = []
@@ -132,7 +131,7 @@ class HostController(wsgi.Controller):
         """Start/Stop host maintenance window. On start, it triggers
         guest VMs evacuation.
         """
-        LOG.audit(_("Putting host %(host_name)s in maintenance mode "
+        LOG.info(_LI("Putting host %(host_name)s in maintenance mode "
                     "%(mode)s."),
                   {'host_name': host_name, 'mode': mode})
         try:
@@ -154,9 +153,9 @@ class HostController(wsgi.Controller):
                         on the host.
         """
         if enabled:
-            LOG.audit(_("Enabling host %s."), host_name)
+            LOG.info(_LI("Enabling host %s."), host_name)
         else:
-            LOG.audit(_("Disabling host %s."), host_name)
+            LOG.info(_LI("Disabling host %s."), host_name)
         try:
             result = self.api.set_host_enabled(context, host_name=host_name,
                                                enabled=enabled)
@@ -264,7 +263,9 @@ class HostController(wsgi.Controller):
         authorize(context)
         host_name = id
         try:
-            service = self.api.service_get_by_compute_host(context, host_name)
+            compute_node = (
+                objects.ComputeNode.get_first_node_by_host_for_old_compat(
+                    context, host_name))
         except exception.ComputeHostNotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.format_message())
         except exception.AdminRequired:
@@ -273,7 +274,6 @@ class HostController(wsgi.Controller):
             # be removed
             msg = _("Describe-resource is admin only functionality")
             raise webob.exc.HTTPForbidden(explanation=msg)
-        compute_node = service['compute_node']
         instances = self.api.instance_get_all_by_host(context, host_name)
         resources = [self._get_total_resources(host_name, compute_node)]
         resources.append(self._get_used_now_resources(host_name,
@@ -295,7 +295,7 @@ class Hosts(extensions.V3APIExtensionBase):
     version = 1
 
     def get_resources(self):
-        resources = [extensions.ResourceExtension('os-hosts',
+        resources = [extensions.ResourceExtension(ALIAS,
                 HostController(),
                 member_actions={"startup": "GET", "shutdown": "GET",
                         "reboot": "GET"})]

@@ -12,13 +12,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from nova.api.ec2 import ec2utils
 from nova import db
 from nova import exception
 from nova.objects import base
 from nova.objects import fields
 
 
-class EC2InstanceMapping(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+class EC2InstanceMapping(base.NovaPersistentObject, base.NovaObject,
+                         base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     VERSION = '1.0'
 
@@ -36,12 +39,12 @@ class EC2InstanceMapping(base.NovaPersistentObject, base.NovaObject):
         return imap
 
     @base.remotable
-    def create(self, context):
+    def create(self):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
-        db_imap = db.ec2_instance_create(context, self.uuid)
-        self._from_db_object(context, self, db_imap)
+        db_imap = db.ec2_instance_create(self._context, self.uuid)
+        self._from_db_object(self._context, self, db_imap)
 
     @base.remotable_classmethod
     def get_by_uuid(cls, context, instance_uuid):
@@ -56,7 +59,9 @@ class EC2InstanceMapping(base.NovaPersistentObject, base.NovaObject):
             return cls._from_db_object(context, cls(), db_imap)
 
 
-class EC2VolumeMapping(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+class EC2VolumeMapping(base.NovaPersistentObject, base.NovaObject,
+                       base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     VERSION = '1.0'
 
@@ -74,12 +79,12 @@ class EC2VolumeMapping(base.NovaPersistentObject, base.NovaObject):
         return vmap
 
     @base.remotable
-    def create(self, context):
+    def create(self):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
-        db_vmap = db.ec2_volume_create(context, self.uuid)
-        self._from_db_object(context, self, db_vmap)
+        db_vmap = db.ec2_volume_create(self._context, self.uuid)
+        self._from_db_object(self._context, self, db_vmap)
 
     @base.remotable_classmethod
     def get_by_uuid(cls, context, volume_uuid):
@@ -94,7 +99,9 @@ class EC2VolumeMapping(base.NovaPersistentObject, base.NovaObject):
             return cls._from_db_object(context, cls(context), db_vmap)
 
 
-class EC2SnapshotMapping(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+class EC2SnapshotMapping(base.NovaPersistentObject, base.NovaObject,
+                         base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     VERSION = '1.0'
 
@@ -112,12 +119,12 @@ class EC2SnapshotMapping(base.NovaPersistentObject, base.NovaObject):
         return smap
 
     @base.remotable
-    def create(self, context):
+    def create(self):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
-        db_smap = db.ec2_snapshot_create(context, self.uuid)
-        self._from_db_object(context, self, db_smap)
+        db_smap = db.ec2_snapshot_create(self._context, self.uuid)
+        self._from_db_object(self._context, self, db_smap)
 
     @base.remotable_classmethod
     def get_by_uuid(cls, context, snapshot_uuid):
@@ -132,7 +139,9 @@ class EC2SnapshotMapping(base.NovaPersistentObject, base.NovaObject):
             return cls._from_db_object(context, cls(context), db_smap)
 
 
-class S3ImageMapping(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+class S3ImageMapping(base.NovaPersistentObject, base.NovaObject,
+                     base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     VERSION = '1.0'
 
@@ -150,12 +159,12 @@ class S3ImageMapping(base.NovaPersistentObject, base.NovaObject):
         return s3imap
 
     @base.remotable
-    def create(self, context):
+    def create(self):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
-        db_s3imap = db.s3_image_create(context, self.uuid)
-        self._from_db_object(context, self, db_s3imap)
+        db_s3imap = db.s3_image_create(self._context, self.uuid)
+        self._from_db_object(self._context, self, db_s3imap)
 
     @base.remotable_classmethod
     def get_by_uuid(cls, context, s3_image_uuid):
@@ -168,3 +177,44 @@ class S3ImageMapping(base.NovaPersistentObject, base.NovaObject):
         db_s3imap = db.s3_image_get(context, s3_id)
         if db_s3imap:
             return cls._from_db_object(context, cls(context), db_s3imap)
+
+
+class EC2Ids(base.NovaObject):
+    # Version 1.0: Initial version
+    VERSION = '1.0'
+
+    fields = {
+        'instance_id': fields.StringField(read_only=True),
+        'ami_id': fields.StringField(nullable=True, read_only=True),
+        'kernel_id': fields.StringField(nullable=True, read_only=True),
+        'ramdisk_id': fields.StringField(nullable=True, read_only=True),
+    }
+
+    @staticmethod
+    def _from_dict(ec2ids, dict_ec2ids):
+        for field in ec2ids.fields:
+            setattr(ec2ids, field, dict_ec2ids[field])
+        return ec2ids
+
+    @staticmethod
+    def _get_ec2_ids(context, instance):
+        ec2_ids = {}
+
+        ec2_ids['instance_id'] = ec2utils.id_to_ec2_inst_id(instance.uuid)
+        ec2_ids['ami_id'] = ec2utils.glance_id_to_ec2_id(context,
+                                                         instance.image_ref)
+        for image_type in ['kernel', 'ramdisk']:
+            image_id = getattr(instance, '%s_id' % image_type)
+            ec2_id = None
+            if image_id is not None:
+                ec2_image_type = ec2utils.image_type(image_type)
+                ec2_id = ec2utils.glance_id_to_ec2_id(context, image_id,
+                                                      ec2_image_type)
+            ec2_ids['%s_id' % image_type] = ec2_id
+
+        return ec2_ids
+
+    @base.remotable_classmethod
+    def get_by_instance(cls, context, instance):
+        ec2_ids = cls._get_ec2_ids(context, instance)
+        return cls._from_dict(cls(context), ec2_ids)

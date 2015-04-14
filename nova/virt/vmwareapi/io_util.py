@@ -22,11 +22,11 @@ to the write using a LightQueue as a Pipe between the reader and the writer.
 from eventlet import event
 from eventlet import greenthread
 from eventlet import queue
+from oslo_log import log as logging
 
 from nova import exception
-from nova.i18n import _
+from nova.i18n import _, _LE
 from nova import image
-from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 IMAGE_API = image.API()
@@ -52,7 +52,7 @@ class ThreadSafePipe(queue.LightQueue):
         that the data chunks written to the pipe by readers is the same as the
         chunks asked for by the Writer.
         """
-        if self.transferred < self.transfer_size:
+        if self.transfer_size == 0 or self.transferred < self.transfer_size:
             data_item = self.get()
             self.transferred += len(data_item)
             return data_item
@@ -180,7 +180,7 @@ class IOThread(object):
                     greenthread.sleep(IO_THREAD_SLEEP_TIME)
                 except Exception as exc:
                     self.stop()
-                    LOG.exception(exc)
+                    LOG.exception(_LE('Read/Write data failed'))
                     self.done.send_exception(exc)
 
         greenthread.spawn(_inner)

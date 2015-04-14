@@ -14,14 +14,14 @@
 
 """Handles all requests to the conductor service."""
 
-from oslo.config import cfg
-from oslo import messaging
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
 
 from nova import baserpc
 from nova.conductor import manager
 from nova.conductor import rpcapi
-from nova.i18n import _
-from nova.openstack.common import log as logging
+from nova.i18n import _LI, _LW
 from nova import utils
 
 conductor_opts = [
@@ -84,19 +84,6 @@ class LocalAPI(object):
                                                             host,
                                                             key)
 
-    def bw_usage_get(self, context, uuid, start_period, mac):
-        return self._manager.bw_usage_update(context, uuid, mac, start_period,
-                None, None, None, None, None, False)
-
-    def bw_usage_update(self, context, uuid, mac, start_period,
-                        bw_in, bw_out, last_ctr_in, last_ctr_out,
-                        last_refreshed=None, update_cells=True):
-        return self._manager.bw_usage_update(context, uuid, mac, start_period,
-                                             bw_in, bw_out,
-                                             last_ctr_in, last_ctr_out,
-                                             last_refreshed,
-                                             update_cells=update_cells)
-
     def provider_fw_rule_get_all(self, context):
         return self._manager.provider_fw_rule_get_all(context)
 
@@ -120,9 +107,6 @@ class LocalAPI(object):
                                                  legacy=True):
         return self._manager.block_device_mapping_get_all_by_instance(
             context, instance, legacy)
-
-    def vol_get_usage_by_time(self, context, start_time):
-        return self._manager.vol_get_usage_by_time(context, start_time)
 
     def vol_usage_update(self, context, vol_id, rd_req, rd_bytes, wr_req,
                          wr_bytes, instance, last_refreshed=None,
@@ -156,7 +140,7 @@ class LocalAPI(object):
         # single entry, so we should just return 'result' at that point.
         return result[0]
 
-    def service_get_by_args(self, context, host, binary):
+    def service_get_by_host_and_binary(self, context, host, binary):
         return self._manager.service_get_all_by(context, host=host,
                                                 binary=binary, topic=None)
 
@@ -195,13 +179,6 @@ class LocalAPI(object):
                                                begin, end, host,
                                                errors, message)
 
-    def notify_usage_exists(self, context, instance, current_period=False,
-                            ignore_missing_network_data=True,
-                            system_metadata=None, extra_usage_info=None):
-        return self._manager.notify_usage_exists(
-            context, instance, current_period, ignore_missing_network_data,
-            system_metadata, extra_usage_info)
-
     def security_groups_trigger_handler(self, context, event, *args):
         return self._manager.security_groups_trigger_handler(context,
                                                              event, args)
@@ -209,9 +186,6 @@ class LocalAPI(object):
     def security_groups_trigger_members_refresh(self, context, group_ids):
         return self._manager.security_groups_trigger_members_refresh(context,
                                                                      group_ids)
-
-    def get_ec2_ids(self, context, instance):
-        return self._manager.get_ec2_ids(context, instance)
 
     def object_backport(self, context, objinst, target_version):
         return self._manager.object_backport(context, objinst, target_version)
@@ -225,13 +199,15 @@ class LocalComputeTaskAPI(object):
                 manager.ComputeTaskManager())
 
     def resize_instance(self, context, instance, extra_instance_updates,
-                        scheduler_hint, flavor, reservations):
+                        scheduler_hint, flavor, reservations,
+                        clean_shutdown=True):
         # NOTE(comstud): 'extra_instance_updates' is not used here but is
         # needed for compatibility with the cells_rpcapi version of this
         # method.
         self._manager.migrate_server(
-            context, instance, scheduler_hint, False, False, flavor,
-            None, None, reservations)
+            context, instance, scheduler_hint, live=False, rebuild=False,
+            flavor=flavor, block_migration=None, disk_over_commit=None,
+            reservations=reservations, clean_shutdown=clean_shutdown)
 
     def live_migrate_instance(self, context, instance, host_name,
                               block_migration, disk_over_commit):
@@ -312,16 +288,16 @@ class API(LocalAPI):
                 self.base_rpcapi.ping(context, '1.21 GigaWatts',
                                       timeout=timeout)
                 if has_timedout:
-                    LOG.info(_('nova-conductor connection '
-                               'established successfully'))
+                    LOG.info(_LI('nova-conductor connection '
+                                 'established successfully'))
                 break
             except messaging.MessagingTimeout:
                 has_timedout = True
-                LOG.warning(_('Timed out waiting for nova-conductor.  '
-                              'Is it running? Or did this service start '
-                              'before nova-conductor?  '
-                              'Reattempting establishment of '
-                              'nova-conductor connection...'))
+                LOG.warning(_LW('Timed out waiting for nova-conductor.  '
+                                'Is it running? Or did this service start '
+                                'before nova-conductor?  '
+                                'Reattempting establishment of '
+                                'nova-conductor connection...'))
 
     def instance_update(self, context, instance_uuid, **updates):
         """Perform an instance update in the database."""
@@ -336,13 +312,15 @@ class ComputeTaskAPI(object):
         self.conductor_compute_rpcapi = rpcapi.ComputeTaskAPI()
 
     def resize_instance(self, context, instance, extra_instance_updates,
-                        scheduler_hint, flavor, reservations):
+                        scheduler_hint, flavor, reservations,
+                        clean_shutdown=True):
         # NOTE(comstud): 'extra_instance_updates' is not used here but is
         # needed for compatibility with the cells_rpcapi version of this
         # method.
         self.conductor_compute_rpcapi.migrate_server(
-            context, instance, scheduler_hint, False, False, flavor,
-            None, None, reservations)
+            context, instance, scheduler_hint, live=False, rebuild=False,
+            flavor=flavor, block_migration=None, disk_over_commit=None,
+            reservations=reservations, clean_shutdown=clean_shutdown)
 
     def live_migrate_instance(self, context, instance, host_name,
                               block_migration, disk_over_commit):

@@ -15,12 +15,12 @@
 
 import re
 
-from oslo.config import cfg
-from oslo.utils import strutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import strutils
 
 from nova import exception
 from nova.i18n import _
-from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt import driver
 
@@ -86,9 +86,7 @@ class BlockDeviceDict(dict):
         if bdm_dict.get('device_name'):
             bdm_dict['device_name'] = prepend_dev(bdm_dict['device_name'])
         # NOTE (ndipanov): Never default db fields
-        self.update(
-            dict((field, None)
-                 for field in self._fields - do_not_default))
+        self.update({field: None for field in self._fields - do_not_default})
         self.update(list(bdm_dict.iteritems()))
 
     def _validate(self, bdm_dict):
@@ -139,8 +137,8 @@ class BlockDeviceDict(dict):
         non_computable_fields = set(['boot_index', 'disk_bus',
                                      'guest_format', 'device_type'])
 
-        new_bdm = dict((fld, val) for fld, val in legacy_bdm.iteritems()
-                        if fld in copy_over_fields)
+        new_bdm = {fld: val for fld, val in legacy_bdm.iteritems()
+                   if fld in copy_over_fields}
 
         virt_name = legacy_bdm.get('virtual_name')
 
@@ -173,7 +171,7 @@ class BlockDeviceDict(dict):
         return cls(new_bdm, non_computable_fields)
 
     @classmethod
-    def from_api(cls, api_dict):
+    def from_api(cls, api_dict, image_uuid_specified):
         """Transform the API format of data to the internally used one.
 
         Only validate if the source_type field makes sense.
@@ -182,6 +180,7 @@ class BlockDeviceDict(dict):
 
             source_type = api_dict.get('source_type')
             device_uuid = api_dict.get('uuid')
+            destination_type = api_dict.get('destination_type')
 
             if source_type not in ('volume', 'image', 'snapshot', 'blank'):
                 raise exception.InvalidBDMFormat(
@@ -194,6 +193,14 @@ class BlockDeviceDict(dict):
                     raise exception.InvalidBDMFormat(
                         details=_("Missing device UUID."))
                 api_dict[source_type + '_id'] = device_uuid
+            if source_type == 'image' and destination_type == 'local':
+                boot_index = api_dict.get('boot_index', -1)
+
+                # if this bdm is generated from --image ,then
+                # source_type = image and destination_type = local is allowed
+                if not (image_uuid_specified and boot_index == 0):
+                    raise exception.InvalidBDMFormat(
+                        details=_("Mapping image to local is not supported."))
 
         api_dict.pop('uuid', None)
         return cls(api_dict)
@@ -203,8 +210,8 @@ class BlockDeviceDict(dict):
         copy_over_fields |= (bdm_db_only_fields |
                              bdm_db_inherited_fields)
 
-        legacy_block_device = dict((field, self.get(field))
-            for field in copy_over_fields if field in self)
+        legacy_block_device = {field: self.get(field)
+            for field in copy_over_fields if field in self}
 
         source_type = self.get('source_type')
         destination_type = self.get('destination_type')
@@ -384,6 +391,9 @@ def validate_and_default_volume_size(bdm):
             bdm['volume_size'] = utils.validate_integer(
                 bdm['volume_size'], 'volume_size', min_value=0)
         except exception.InvalidInput:
+            # NOTE: We can remove this validation code after removing
+            # Nova v2.0 API code because v2.1 API validates this case
+            # already at its REST API layer.
             raise exception.InvalidBDMFormat(
                 details=_("Invalid volume_size."))
 
@@ -459,11 +469,11 @@ def prepend_dev(device_name):
     return device_name and '/dev/' + strip_dev(device_name)
 
 
-_pref = re.compile('^((x?v|s)d)')
+_pref = re.compile('^((x?v|s|h)d)')
 
 
 def strip_prefix(device_name):
-    """remove both leading /dev/ and xvd or sd or vd."""
+    """remove both leading /dev/ and xvd or sd or vd or hd."""
     device_name = strip_dev(device_name)
     return _pref.sub('', device_name)
 

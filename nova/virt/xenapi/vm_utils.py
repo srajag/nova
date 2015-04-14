@@ -28,25 +28,24 @@ from xml.dom import minidom
 from xml.parsers import expat
 
 from eventlet import greenthread
-from oslo.concurrency import processutils
-from oslo.config import cfg
-from oslo.utils import excutils
-from oslo.utils import importutils
-from oslo.utils import strutils
-from oslo.utils import timeutils
-from oslo.utils import units
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import importutils
+from oslo_utils import strutils
+from oslo_utils import timeutils
+from oslo_utils import units
 import six
 import six.moves.urllib.parse as urlparse
 
 from nova.api.metadata import base as instance_metadata
-from nova.compute import flavors
 from nova.compute import power_state
 from nova.compute import task_states
 from nova.compute import vm_mode
 from nova import exception
-from nova.i18n import _, _LE, _LI
+from nova.i18n import _, _LE, _LI, _LW
 from nova.network import model as network_model
-from nova.openstack.common import log as logging
 from nova.openstack.common import versionutils
 from nova import utils
 from nova.virt import configdrive
@@ -99,7 +98,8 @@ xenapi_vm_utils_opts = [
                      'won\'t have to be rsynced'),
     cfg.IntOpt('num_vbd_unplug_retries',
                default=10,
-               help='Maximum number of retries to unplug VBD'),
+               help='Maximum number of retries to unplug VBD. if <=0, '
+                    'should try once and no retry'),
     cfg.StrOpt('torrent_images',
                default='none',
                help='Whether or not to download images via Bit Torrent '
@@ -230,11 +230,11 @@ def create_vm(session, instance, name_label, kernel, ramdisk,
 
         3. Using hardware virtualization
     """
-    flavor = flavors.extract_flavor(instance)
-    mem = str(long(flavor['memory_mb']) * units.Mi)
-    vcpus = str(flavor['vcpus'])
+    flavor = instance.get_flavor()
+    mem = str(long(flavor.memory_mb) * units.Mi)
+    vcpus = str(flavor.vcpus)
 
-    vcpu_weight = flavor['vcpu_weight']
+    vcpu_weight = flavor.vcpu_weight
     vcpu_params = {}
     if vcpu_weight is not None:
         # NOTE(johngarbutt) bug in XenServer 6.1 and 6.2 means
@@ -315,8 +315,8 @@ def destroy_vm(session, instance, vm_ref):
     """Destroys a VM record."""
     try:
         session.VM.destroy(vm_ref)
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Destroy VM failed'))
         return
 
     LOG.debug("VM destroyed", instance=instance)
@@ -324,30 +324,30 @@ def destroy_vm(session, instance, vm_ref):
 
 def clean_shutdown_vm(session, instance, vm_ref):
     if is_vm_shutdown(session, vm_ref):
-        LOG.warn(_("VM already halted, skipping shutdown..."),
-                 instance=instance)
+        LOG.warning(_LW("VM already halted, skipping shutdown..."),
+                    instance=instance)
         return True
 
     LOG.debug("Shutting down VM (cleanly)", instance=instance)
     try:
         session.call_xenapi('VM.clean_shutdown', vm_ref)
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Shutting down VM (cleanly) failed.'))
         return False
     return True
 
 
 def hard_shutdown_vm(session, instance, vm_ref):
     if is_vm_shutdown(session, vm_ref):
-        LOG.warn(_("VM already halted, skipping shutdown..."),
-                 instance=instance)
+        LOG.warning(_LW("VM already halted, skipping shutdown..."),
+                    instance=instance)
         return True
 
     LOG.debug("Shutting down VM (hard)", instance=instance)
     try:
         session.call_xenapi('VM.hard_shutdown', vm_ref)
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Shutting down VM (hard) failed'))
         return False
     return True
 
@@ -360,8 +360,8 @@ def is_vm_shutdown(session, vm_ref):
 
 
 def is_enough_free_mem(session, instance):
-    flavor = flavors.extract_flavor(instance)
-    mem = long(flavor['memory_mb']) * units.Mi
+    flavor = instance.get_flavor()
+    mem = long(flavor.memory_mb) * units.Mi
     host_free_mem = long(session.call_xenapi("host.compute_free_memory",
                                              session.host_ref))
     return host_free_mem >= mem
@@ -380,7 +380,8 @@ def _should_retry_unplug_vbd(err):
 
 
 def unplug_vbd(session, vbd_ref, this_vm_ref):
-    max_attempts = CONF.xenserver.num_vbd_unplug_retries + 1
+    # make sure that perform at least once
+    max_attempts = max(0, CONF.xenserver.num_vbd_unplug_retries) + 1
     for num_attempt in xrange(1, max_attempts + 1):
         try:
             if num_attempt > 1:
@@ -391,15 +392,15 @@ def unplug_vbd(session, vbd_ref, this_vm_ref):
         except session.XenAPI.Failure as exc:
             err = len(exc.details) > 0 and exc.details[0]
             if err == 'DEVICE_ALREADY_DETACHED':
-                LOG.info(_('VBD %s already detached'), vbd_ref)
+                LOG.info(_LI('VBD %s already detached'), vbd_ref)
                 return
             elif _should_retry_unplug_vbd(err):
-                LOG.info(_('VBD %(vbd_ref)s uplug failed with "%(err)s", '
-                           'attempt %(num_attempt)d/%(max_attempts)d'),
+                LOG.info(_LI('VBD %(vbd_ref)s uplug failed with "%(err)s", '
+                             'attempt %(num_attempt)d/%(max_attempts)d'),
                          {'vbd_ref': vbd_ref, 'num_attempt': num_attempt,
                           'max_attempts': max_attempts, 'err': err})
             else:
-                LOG.exception(exc)
+                LOG.exception(_LE('Unable to unplug VBD'))
                 raise exception.StorageError(
                         reason=_('Unable to unplug VBD %s') % vbd_ref)
 
@@ -413,8 +414,8 @@ def destroy_vbd(session, vbd_ref):
     """Destroy VBD from host database."""
     try:
         session.call_xenapi('VBD.destroy', vbd_ref)
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Unable to destroy VBD'))
         raise exception.StorageError(
                 reason=_('Unable to destroy VBD %s') % vbd_ref)
 
@@ -843,7 +844,7 @@ def _find_cached_image(session, image_id, sr_ref):
     number_found = len(recs)
     if number_found > 0:
         if number_found > 1:
-            LOG.warn(_("Multiple base images for image: %s") % image_id)
+            LOG.warning(_LW("Multiple base images for image: %s"), image_id)
         return recs.keys()[0]
 
 
@@ -901,7 +902,7 @@ def update_vdi_virtual_size(session, instance, vdi_ref, new_gb):
         msg = _("VDI %(vdi_ref)s is %(virtual_size)d bytes which is larger "
                 "than flavor size of %(new_disk_size)d bytes.")
         msg = msg % {'vdi_ref': vdi_ref, 'virtual_size': virtual_size,
-             'new_disk_size': new_disk_size}
+              'new_disk_size': new_disk_size}
         LOG.debug(msg, instance=instance)
         raise exception.ResizeError(reason=msg)
 
@@ -982,7 +983,7 @@ def try_auto_configure_disk(session, vdi_ref, new_gb):
     try:
         _auto_configure_disk(session, vdi_ref, new_gb)
     except exception.CannotResizeDisk as e:
-        msg = _('Attempted auto_configure_disk failed because: %s')
+        msg = _LW('Attempted auto_configure_disk failed because: %s')
         LOG.warn(msg % e)
 
 
@@ -1233,9 +1234,9 @@ def _create_cached_image(context, session, instance, name_label,
     sr_type = session.call_xenapi('SR.get_type', sr_ref)
 
     if CONF.use_cow_images and sr_type != "ext":
-        LOG.warning(_("Fast cloning is only supported on default local SR "
-                      "of type ext. SR on this system was found to be of "
-                      "type %s. Ignoring the cow flag."), sr_type)
+        LOG.warning(_LW("Fast cloning is only supported on default local SR "
+                        "of type ext. SR on this system was found to be of "
+                        "type %s. Ignoring the cow flag."), sr_type)
 
     @utils.synchronized('xenapi-image-cache' + image_id)
     def _create_cached_image_impl(context, session, instance, name_label,
@@ -1308,8 +1309,8 @@ def create_image(context, session, instance, name_label, image_id,
     elif cache_images == 'none':
         cache = False
     else:
-        LOG.warning(_("Unrecognized cache_images value '%s', defaulting to"
-                      " True"), CONF.xenserver.cache_images)
+        LOG.warning(_LW("Unrecognized cache_images value '%s', defaulting to"
+                        " True"), CONF.xenserver.cache_images)
         cache = True
 
     # Fetch (and cache) the image
@@ -1384,7 +1385,7 @@ def _image_uses_bittorrent(context, instance):
     elif torrent_images == 'none':
         pass
     else:
-        LOG.warning(_("Invalid value '%s' for torrent_images"),
+        LOG.warning(_LW("Invalid value '%s' for torrent_images"),
                     torrent_images)
 
     return bittorrent
@@ -1407,8 +1408,8 @@ def _choose_download_handler(context, instance):
 def get_compression_level():
     level = CONF.xenserver.image_compression_level
     if level is not None and (level < 1 or level > 9):
-        LOG.warn(_("Invalid value '%d' for image_compression_level"),
-                 level)
+        LOG.warning(_LW("Invalid value '%d' for image_compression_level"),
+                    level)
         return None
     return level
 
@@ -1433,11 +1434,11 @@ def _fetch_vhd_image(context, session, instance, image_id):
         if type(handler) == type(default_handler):
             raise
 
-        LOG.exception(_("Download handler '%(handler)s' raised an"
-                        " exception, falling back to default handler"
-                        " '%(default_handler)s'") %
-                        {'handler': handler,
-                         'default_handler': default_handler})
+        LOG.exception(_LE("Download handler '%(handler)s' raised an"
+                          " exception, falling back to default handler"
+                          " '%(default_handler)s'"),
+                      {'handler': handler,
+                       'default_handler': default_handler})
 
         vdis = default_handler.download_image(
                 context, session, instance, image_id)
@@ -1480,10 +1481,10 @@ def _get_vdi_chain_size(session, vdi_uuid):
 
 
 def _check_vdi_size(context, session, instance, vdi_uuid):
-    flavor = flavors.extract_flavor(instance)
-    allowed_size = (flavor['root_gb'] +
+    flavor = instance.get_flavor()
+    allowed_size = (flavor.root_gb +
                     VHD_SIZE_CHECK_FUDGE_FACTOR_GB) * units.Gi
-    if not flavor['root_gb']:
+    if not flavor.root_gb:
         # root_gb=0 indicates that we're disabling size checks
         return
 
@@ -1582,7 +1583,7 @@ def _fetch_disk_image(context, session, instance, name_label, image_id,
             return {vdi_role: dict(uuid=vdi_uuid, file=None)}
     except (session.XenAPI.Failure, IOError, OSError) as e:
         # We look for XenAPI and OS failures.
-        LOG.exception(_("Failed to fetch glance image"),
+        LOG.exception(_LE("Failed to fetch glance image"),
                       instance=instance)
         e.args = e.args + ([dict(type=ImageType.to_string(image_type),
                                  uuid=vdi_uuid,
@@ -1683,8 +1684,8 @@ def lookup_vm_vdis(session, vm_ref):
                 if not vbd_other_config.get('osvol'):
                     # This is not an attached volume
                     vdi_refs.append(vdi_ref)
-            except session.XenAPI.Failure as exc:
-                LOG.exception(exc)
+            except session.XenAPI.Failure:
+                LOG.exception(_LE('"Look for the VDIs failed'))
     return vdi_refs
 
 
@@ -1753,11 +1754,10 @@ def compile_info(session, vm_ref):
     mem = session.call_xenapi("VM.get_memory_dynamic_max", vm_ref)
     num_cpu = session.call_xenapi("VM.get_VCPUs_max", vm_ref)
 
-    return {'state': power_state,
-            'max_mem': long(max_mem) >> 10,
-            'mem': long(mem) >> 10,
-            'num_cpu': num_cpu,
-            'cpu_time': 0}
+    return hardware.InstanceInfo(state=power_state,
+                                 max_mem_kb=long(max_mem) >> 10,
+                                 mem_kb=long(mem) >> 10,
+                                 num_cpu=num_cpu)
 
 
 def compile_instance_diagnostics(instance, vm_rec):
@@ -1815,7 +1815,7 @@ def compile_diagnostics(vm_rec):
 
         return diags
     except expat.ExpatError as e:
-        LOG.exception(_('Unable to parse rrd of %s'), e)
+        LOG.exception(_LE('Unable to parse rrd of %s'), e)
         return {"Unable to retrieve diagnostics": e}
 
 
@@ -1845,8 +1845,8 @@ def _scan_sr(session, sr_ref=None, max_attempts=4):
                         if exc.details[0] == 'SR_BACKEND_FAILURE_40':
                             if attempt < max_attempts:
                                 ctxt.reraise = False
-                                LOG.warn(_("Retry SR scan due to error: %s")
-                                         % exc)
+                                LOG.warning(_LW("Retry SR scan due to error: "
+                                                "%s"), exc)
                                 greenthread.sleep(2 ** attempt)
                                 attempt += 1
         do_scan(sr_ref)
@@ -1878,8 +1878,8 @@ def _find_sr(session):
         filter_pattern = tokens[1]
     except IndexError:
         # oops, flag is invalid
-        LOG.warning(_("Flag sr_matching_filter '%s' does not respect "
-                      "formatting convention"),
+        LOG.warning(_LW("Flag sr_matching_filter '%s' does not respect "
+                        "formatting convention"),
                     CONF.xenserver.sr_matching_filter)
         return None
 
@@ -1965,8 +1965,8 @@ def _get_rrd(server, vm_uuid):
             vm_uuid))
         return xml.read()
     except IOError:
-        LOG.exception(_('Unable to obtain RRD XML for VM %(vm_uuid)s with '
-                        'server details: %(server)s.'),
+        LOG.exception(_LE('Unable to obtain RRD XML for VM %(vm_uuid)s with '
+                          'server details: %(server)s.'),
                       {'vm_uuid': vm_uuid, 'server': server})
         return None
 
@@ -2173,7 +2173,7 @@ def cleanup_attached_vdis(session):
         if 'nova_instance_uuid' in vdi_rec['other_config']:
             # Belongs to an instance and probably left over after an
             # unclean restart
-            LOG.info(_('Disconnecting stale VDI %s from compute domU'),
+            LOG.info(_LI('Disconnecting stale VDI %s from compute domU'),
                      vdi_rec['uuid'])
             unplug_vbd(session, vbd_ref, this_vm_ref)
             destroy_vbd(session, vbd_ref)
@@ -2466,7 +2466,7 @@ def _mounted_processing(device, key, net, metadata):
                     vfs = vfsimpl.VFSLocalFS(imgfile=None,
                                              imgfmt=None,
                                              imgdir=tmpdir)
-                    LOG.info(_('Manipulating interface files directly'))
+                    LOG.info(_LI('Manipulating interface files directly'))
                     # for xenapi, we don't 'inject' admin_password here,
                     # it's handled at instance startup time, nor do we
                     # support injecting arbitrary files here.
@@ -2475,8 +2475,8 @@ def _mounted_processing(device, key, net, metadata):
             finally:
                 utils.execute('umount', dev_path, run_as_root=True)
         else:
-            LOG.info(_('Failed to mount filesystem (expected for '
-                       'non-linux instances): %s') % err)
+            LOG.info(_LI('Failed to mount filesystem (expected for '
+                         'non-linux instances): %s'), err)
 
 
 def ensure_correct_host(session):
@@ -2494,8 +2494,10 @@ def ensure_correct_host(session):
                           'specified by connection_url'))
 
 
-def import_all_migrated_disks(session, instance):
-    root_vdi = _import_migrated_root_disk(session, instance)
+def import_all_migrated_disks(session, instance, import_root=True):
+    root_vdi = None
+    if import_root:
+        root_vdi = _import_migrated_root_disk(session, instance)
     eph_vdis = _import_migrate_ephemeral_disks(session, instance)
     return {'root': root_vdi, 'ephemerals': eph_vdis}
 
@@ -2559,7 +2561,7 @@ def migrate_vhd(session, instance, vdi_uuid, dest, sr_path, seq_num,
                 instance_uuid=chain_label, host=dest, vdi_uuid=vdi_uuid,
                 sr_path=sr_path, seq_num=seq_num)
     except session.XenAPI.Failure:
-        msg = _("Failed to transfer vhd to new host")
+        msg = "Failed to transfer vhd to new host"
         LOG.debug(msg, instance=instance, exc_info=True)
         raise exception.MigrationError(reason=msg)
 
@@ -2585,14 +2587,14 @@ def handle_ipxe_iso(session, instance, cd_vdi, network_info):
     """
     boot_menu_url = CONF.xenserver.ipxe_boot_menu_url
     if not boot_menu_url:
-        LOG.warn(_('ipxe_boot_menu_url not set, user will have to'
-                   ' enter URL manually...'), instance=instance)
+        LOG.warning(_LW('ipxe_boot_menu_url not set, user will have to'
+                        ' enter URL manually...'), instance=instance)
         return
 
     network_name = CONF.xenserver.ipxe_network_name
     if not network_name:
-        LOG.warn(_('ipxe_network_name not set, user will have to'
-                   ' enter IP manually...'), instance=instance)
+        LOG.warning(_LW('ipxe_network_name not set, user will have to'
+                        ' enter IP manually...'), instance=instance)
         return
 
     network = None
@@ -2602,9 +2604,9 @@ def handle_ipxe_iso(session, instance, cd_vdi, network_info):
             break
 
     if not network:
-        LOG.warn(_("Unable to find network matching '%(network_name)s', user"
-                   " will have to enter IP manually...") %
-                 {'network_name': network_name}, instance=instance)
+        LOG.warning(_LW("Unable to find network matching '%(network_name)s', "
+                        "user will have to enter IP manually..."),
+                    {'network_name': network_name}, instance=instance)
         return
 
     sr_path = get_sr_path(session)
@@ -2626,8 +2628,8 @@ def handle_ipxe_iso(session, instance, cd_vdi, network_info):
     except session.XenAPI.Failure as exc:
         _type, _method, error = exc.details[:3]
         if error == 'CommandNotFound':
-            LOG.warn(_("ISO creation tool '%s' does not exist.") %
-                     CONF.xenserver.ipxe_mkisofs_cmd, instance=instance)
+            LOG.warning(_LW("ISO creation tool '%s' does not exist."),
+                        CONF.xenserver.ipxe_mkisofs_cmd, instance=instance)
         else:
             raise
 

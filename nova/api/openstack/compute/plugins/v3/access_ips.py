@@ -17,7 +17,7 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 
 ALIAS = "os-access-ips"
-authorize = extensions.soft_extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_soft_authorizer(ALIAS)
 
 
 class AccessIPsController(wsgi.Controller):
@@ -29,13 +29,6 @@ class AccessIPsController(wsgi.Controller):
                 str(ip_v4) if ip_v4 is not None else '')
             server['accessIPv6'] = (
                 str(ip_v6) if ip_v6 is not None else '')
-
-    @wsgi.extends
-    def create(self, req, resp_obj, body):
-        context = req.environ['nova.context']
-        if authorize(context) and 'server' in resp_obj.obj:
-            server = resp_obj.obj['server']
-            self._extend_server(req, server)
 
     @wsgi.extends
     def show(self, req, resp_obj, id):

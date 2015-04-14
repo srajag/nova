@@ -11,6 +11,7 @@
 #    under the License.
 
 from nova.api.openstack import extensions
+from nova.api.openstack import wsgi
 from nova import compute
 from nova.objects import base as obj_base
 
@@ -19,8 +20,7 @@ ALIAS = "os-migrations"
 
 
 def authorize(context, action_name):
-    action = 'v3:%s:%s' % (ALIAS, action_name)
-    extensions.extension_authorizer('compute', action)(context)
+    extensions.os_compute_authorizer(ALIAS)(context, action=action_name)
 
 
 def output(migrations_obj):
@@ -36,7 +36,7 @@ def output(migrations_obj):
     return objects
 
 
-class MigrationsController(object):
+class MigrationsController(wsgi.Controller):
     """Controller for accessing migrations in OpenStack API."""
     def __init__(self):
         self.compute_api = compute.API()
@@ -58,7 +58,7 @@ class Migrations(extensions.V3APIExtensionBase):
 
     def get_resources(self):
         resources = []
-        resource = extensions.ResourceExtension('os-migrations',
+        resource = extensions.ResourceExtension(ALIAS,
                                                 MigrationsController())
         resources.append(resource)
         return resources

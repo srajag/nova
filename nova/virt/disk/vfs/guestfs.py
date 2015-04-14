@@ -13,14 +13,14 @@
 # under the License.
 
 from eventlet import tpool
-from oslo.config import cfg
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
 import six
 
 from nova import exception
 from nova.i18n import _
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 from nova.virt.disk.vfs import api as vfs
 
 
@@ -69,6 +69,7 @@ class VFSGuestFS(vfs.VFS):
                     _("libguestfs is not installed (%s)") % e)
 
         self.handle = None
+        self.mount = False
 
     def inspect_capabilities(self):
         """Determines whether guestfs is well configured."""
@@ -163,7 +164,7 @@ class VFSGuestFS(vfs.VFS):
                 else:
                     raise exception.NovaException(msg)
 
-    def setup(self):
+    def setup(self, mount=True):
         LOG.debug("Setting up appliance for %(imgfile)s %(imgfmt)s",
                   {'imgfile': self.imgfile, 'imgfmt': self.imgfmt})
         try:
@@ -189,17 +190,18 @@ class VFSGuestFS(vfs.VFS):
         except AttributeError as ex:
             # set_backend_settings method doesn't exist in older
             # libguestfs versions, so nothing we can do but ignore
-            LOG.warn(_LW("Unable to force TCG mode, libguestfs too old? %s"),
-                     ex)
+            LOG.warning(_LW("Unable to force TCG mode, "
+                            "libguestfs too old? %s"), ex)
             pass
 
         try:
             self.handle.add_drive_opts(self.imgfile, format=self.imgfmt)
             self.handle.launch()
 
-            self.setup_os()
-
-            self.handle.aug_init("/", 0)
+            if mount:
+                self.setup_os()
+                self.handle.aug_init("/", 0)
+                self.mount = True
         except RuntimeError as e:
             # explicitly teardown instead of implicit close()
             # to prevent orphaned VMs in cases when an implicit
@@ -220,9 +222,10 @@ class VFSGuestFS(vfs.VFS):
 
         try:
             try:
-                self.handle.aug_close()
+                if self.mount:
+                    self.handle.aug_close()
             except RuntimeError as e:
-                LOG.warn(_("Failed to close augeas %s"), e)
+                LOG.warning(_LW("Failed to close augeas %s"), e)
 
             try:
                 self.handle.shutdown()
@@ -230,7 +233,7 @@ class VFSGuestFS(vfs.VFS):
                 # Older libguestfs versions haven't an explicit shutdown
                 pass
             except RuntimeError as e:
-                LOG.warn(_("Failed to shutdown appliance %s"), e)
+                LOG.warning(_LW("Failed to shutdown appliance %s"), e)
 
             try:
                 self.handle.close()
@@ -238,7 +241,7 @@ class VFSGuestFS(vfs.VFS):
                 # Older libguestfs versions haven't an explicit close
                 pass
             except RuntimeError as e:
-                LOG.warn(_("Failed to close guest handle %s"), e)
+                LOG.warning(_LW("Failed to close guest handle %s"), e)
         finally:
             # dereference object and implicitly close()
             self.handle = None
@@ -302,3 +305,6 @@ class VFSGuestFS(vfs.VFS):
         LOG.debug("chown uid=%(uid)d gid=%(gid)s",
                   {'uid': uid, 'gid': gid})
         self.handle.chown(uid, gid, path)
+
+    def get_image_fs(self):
+        return self.handle.vfs_type('/dev/sda')

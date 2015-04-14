@@ -18,17 +18,18 @@ import webob
 
 from nova.api.openstack.compute.schemas.v3 import flavors_extraspecs
 from nova.api.openstack import extensions
+from nova.api.openstack import wsgi
 from nova.api import validation
 from nova import exception
 from nova.i18n import _
 from nova import objects
 from nova import utils
 
-ALIAS = 'flavor-extra-specs'
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+ALIAS = 'os-flavor-extra-specs'
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
-class FlavorExtraSpecsController(object):
+class FlavorExtraSpecsController(wsgi.Controller):
     """The flavor extra specs API controller for the OpenStack API."""
 
     def __init__(self, *args, **kwargs):
@@ -107,8 +108,7 @@ class FlavorExtraSpecsController(object):
         try:
             flavor = objects.Flavor.get_by_flavor_id(context, flavor_id)
             return {id: flavor.extra_specs[id]}
-        except (exception.FlavorExtraSpecsNotFound,
-                exception.FlavorNotFound) as e:
+        except exception.FlavorNotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.format_message())
         except KeyError:
             msg = _("Flavor %(flavor_id)s has no extra specs with "
@@ -140,7 +140,7 @@ class FlavorExtraSpecsController(object):
 
 class FlavorsExtraSpecs(extensions.V3APIExtensionBase):
     """Flavors extra specs support."""
-    name = 'FlavorsExtraSpecs'
+    name = 'FlavorExtraSpecs'
     alias = ALIAS
     version = 1
 

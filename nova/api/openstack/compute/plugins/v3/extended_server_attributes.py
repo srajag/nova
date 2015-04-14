@@ -14,20 +14,31 @@
 
 """The Extended Server Attributes API extension."""
 
+from nova.api.openstack import api_version_request
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 
 
 ALIAS = "os-extended-server-attributes"
-authorize = extensions.soft_extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_soft_authorizer(ALIAS)
 
 
 class ExtendedServerAttributesController(wsgi.Controller):
-    def _extend_server(self, context, server, instance):
-        key = "OS-EXT-SRV-ATTR:hypervisor_hostname"
-        server[key] = instance['node']
+    def __init__(self, *args, **kwargs):
+        super(ExtendedServerAttributesController, self).__init__(*args,
+                                                                 **kwargs)
+        self.api_version_2_3 = api_version_request.APIVersionRequest('2.3')
 
-        for attr in ['host', 'name']:
+    def _extend_server(self, context, server, instance, requested_version):
+        key = "OS-EXT-SRV-ATTR:hypervisor_hostname"
+        server[key] = instance.node
+
+        properties = ['host', 'name']
+        if requested_version >= self.api_version_2_3:
+            properties += ['reservation_id', 'launch_index',
+                           'hostname', 'kernel_id', 'ramdisk_id',
+                           'root_device_name', 'user_data']
+        for attr in properties:
             if attr == 'name':
                 key = "OS-EXT-SRV-ATTR:instance_%s" % attr
             else:
@@ -42,7 +53,8 @@ class ExtendedServerAttributesController(wsgi.Controller):
             db_instance = req.get_db_instance(server['id'])
             # server['id'] is guaranteed to be in the cache due to
             # the core API adding it in its 'show' method.
-            self._extend_server(context, server, db_instance)
+            self._extend_server(context, server, db_instance,
+                                req.api_version_request)
 
     @wsgi.extends
     def detail(self, req, resp_obj):
@@ -53,7 +65,8 @@ class ExtendedServerAttributesController(wsgi.Controller):
                 db_instance = req.get_db_instance(server['id'])
                 # server['id'] is guaranteed to be in the cache due to
                 # the core API adding it in its 'detail' method.
-                self._extend_server(context, server, db_instance)
+                self._extend_server(context, server, db_instance,
+                                    req.api_version_request)
 
 
 class ExtendedServerAttributes(extensions.V3APIExtensionBase):

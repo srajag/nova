@@ -12,11 +12,11 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from oslo_log import log as logging
+from oslo_utils import importutils
+
 from nova import exception
 from nova.i18n import _LI
-from nova.openstack.common import log as logging
-
-from oslo.utils import importutils
 
 LOG = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class VFS(object):
                 # check for capabilities.
                 raise
             else:
-                LOG.info(_LI("Unable to import guestfs"
+                LOG.info(_LI("Unable to import guestfs, "
                              "falling back to VFSLocalFS"))
 
         return importutils.import_object(
@@ -76,7 +76,7 @@ class VFS(object):
         self.imgfmt = imgfmt
         self.partition = partition
 
-    def setup(self):
+    def setup(self, mount=True):
         """Performs any one-time setup.
 
         Perform any one-time setup tasks to make the virtual filesystem
@@ -137,5 +137,13 @@ class VFS(object):
         The ownership must be passed in string form, allowing subclasses to
         translate to uid/gid form as required. The file must exist prior to
         this call.
+        """
+        pass
+
+    def get_image_fs(self):
+        """Returns the filesystem type or an empty string.
+
+        Determine the filesystem type whether the disk image is
+        partition less.
         """
         pass

@@ -30,15 +30,15 @@ import tempfile
 if os.name != 'nt':
     import crypt
 
-from oslo.concurrency import processutils
-from oslo.config import cfg
-from oslo.serialization import jsonutils
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
 
 from nova import exception
 from nova.i18n import _
 from nova.i18n import _LE
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt.disk.mount import api as mount
 from nova.virt.disk.vfs import api as vfs
@@ -51,7 +51,7 @@ disk_opts = [
     # NOTE(yamahata): ListOpt won't work because the command may include a
     #                 comma. For example:
     #
-    #                 mkfs.ext3 -O dir_index,extent -E stride=8,stripe-width=16
+    #                 mkfs.ext4 -O dir_index,extent -E stride=8,stripe-width=16
     #                           --label %(fs_label)s %(target)s
     #
     #                 list arguments are comma separated and there is no way to
@@ -85,7 +85,13 @@ FS_FORMAT_XFS = "xfs"
 FS_FORMAT_NTFS = "ntfs"
 FS_FORMAT_VFAT = "vfat"
 
-_DEFAULT_FS_BY_OSTYPE = {'linux': FS_FORMAT_EXT3,
+SUPPORTED_FS_TO_EXTEND = (
+    FS_FORMAT_EXT2,
+    FS_FORMAT_EXT3,
+    FS_FORMAT_EXT4)
+
+_DEFAULT_FILE_SYSTEM = FS_FORMAT_VFAT
+_DEFAULT_FS_BY_OSTYPE = {'linux': FS_FORMAT_EXT4,
                          'windows': FS_FORMAT_NTFS}
 
 for s in CONF.virt_mkfs:
@@ -100,6 +106,20 @@ for s in CONF.virt_mkfs:
 
 def get_fs_type_for_os_type(os_type):
     return os_type if _MKFS_COMMAND.get(os_type) else 'default'
+
+
+def get_file_extension_for_os_type(os_type, specified_fs=None):
+    mkfs_command = _MKFS_COMMAND.get(os_type, _DEFAULT_MKFS_COMMAND)
+    if mkfs_command:
+        extension = mkfs_command
+    else:
+        if not specified_fs:
+            specified_fs = CONF.default_ephemeral_format
+            if not specified_fs:
+                specified_fs = _DEFAULT_FS_BY_OSTYPE.get(os_type,
+                                                         _DEFAULT_FILE_SYSTEM)
+        extension = specified_fs
+    return utils.get_hash_str(extension)[:7]
 
 
 def mkfs(os_type, fs_label, target, run_as_root=True, specified_fs=None):
@@ -119,7 +139,8 @@ def mkfs(os_type, fs_label, target, run_as_root=True, specified_fs=None):
         if not specified_fs:
             specified_fs = CONF.default_ephemeral_format
             if not specified_fs:
-                specified_fs = _DEFAULT_FS_BY_OSTYPE.get(os_type, 'ext3')
+                specified_fs = _DEFAULT_FS_BY_OSTYPE.get(os_type,
+                                                         _DEFAULT_FILE_SYSTEM)
 
         utils.mkfs(specified_fs, target, fs_label, run_as_root=run_as_root)
 
@@ -159,7 +180,7 @@ def extend(image, size, use_cow=False):
     utils.execute('qemu-img', 'resize', image, size)
 
     # if we can't access the filesystem, we can't do anything more
-    if not is_image_partitionless(image, use_cow):
+    if not is_image_extendable(image, use_cow):
         return
 
     def safe_resize2fs(dev, run_as_root=False, finally_call=lambda: None):
@@ -200,23 +221,33 @@ def can_resize_image(image, size):
     return True
 
 
-def is_image_partitionless(image, use_cow=False):
-    """Check whether we can resize contained file system."""
-    LOG.debug('Checking if we can resize filesystem inside %(image)s. '
+def is_image_extendable(image, use_cow=False):
+    """Check whether we can extend the image."""
+    LOG.debug('Checking if we can extend filesystem inside %(image)s. '
               'CoW=%(use_cow)s', {'image': image, 'use_cow': use_cow})
 
     # Check the image is unpartitioned
     if use_cow:
+        fs = None
         try:
             fs = vfs.VFS.instance_for_image(image, 'qcow2', None)
-            fs.setup()
-            fs.teardown()
+            fs.setup(mount=False)
+            if fs.get_image_fs() in SUPPORTED_FS_TO_EXTEND:
+                return True
         except exception.NovaException as e:
-            LOG.debug('Unable to mount image %(image)s with '
-                      'error %(error)s. Cannot resize.',
-                      {'image': image,
-                       'error': e})
-            return False
+            # FIXME(sahid): At this step we probably want to break the
+            # process if something wrong happens however our CI
+            # provides a bad configuration for libguestfs reported in
+            # the bug lp#1413142. When resolved we should remove this
+            # except to let the error to be propagated.
+            LOG.warning(_LW('Unable to mount image %(image)s with '
+                            'error %(error)s. Cannot resize.'),
+                        {'image': image, 'error': e})
+        finally:
+            if fs is not None:
+                fs.teardown()
+
+        return False
     else:
         # For raw, we can directly inspect the file system
         try:
@@ -363,8 +394,8 @@ def inject_data(image, key=None, net=None, metadata=None, admin_password=None,
             inject_val = locals()[inject]
             if inject_val:
                 raise
-        LOG.warn(_LW('Ignoring error injecting data into image %(image)s '
-                   '(%(e)s)'), {'image': image, 'e': e})
+        LOG.warning(_LW('Ignoring error injecting data into image %(image)s '
+                        '(%(e)s)'), {'image': image, 'e': e})
         return False
 
     try:
@@ -414,8 +445,8 @@ def teardown_container(container_dir, container_root_device=None):
                 LOG.debug('Release nbd device %s', container_root_device)
                 utils.execute('qemu-nbd', '-d', container_root_device,
                               run_as_root=True)
-    except Exception as exn:
-        LOG.exception(_('Failed to teardown container filesystem: %s'), exn)
+    except Exception:
+        LOG.exception(_LE('Failed to teardown container filesystem'))
 
 
 def clean_lxc_namespace(container_dir):
@@ -427,8 +458,8 @@ def clean_lxc_namespace(container_dir):
     try:
         img = _DiskImage(image=None, mount_dir=container_dir)
         img.umount()
-    except Exception as exn:
-        LOG.exception(_('Failed to umount container filesystem: %s'), exn)
+    except Exception:
+        LOG.exception(_LE('Failed to umount container filesystem'))
 
 
 def inject_data_into_fs(fs, key, net, metadata, admin_password, files,
@@ -453,8 +484,8 @@ def inject_data_into_fs(fs, key, net, metadata, admin_password, files,
             except Exception as e:
                 if inject in mandatory:
                     raise
-                LOG.warn(_LW('Ignoring error injecting %(inject)s into image '
-                           '(%(e)s)'), {'inject': inject, 'e': e})
+                LOG.warning(_LW('Ignoring error injecting %(inject)s into '
+                                'image (%(e)s)'), {'inject': inject, 'e': e})
                 status = False
     return status
 
@@ -605,9 +636,9 @@ def _set_passwd(username, admin_passwd, passwd_data, shadow_data):
     if the username is not found in both files, an exception is raised.
 
     :param username: the username
-    :param encrypted_passwd: the  encrypted password
-    :param passwd_file: path to the passwd file
-    :param shadow_file: path to the shadow password file
+    :param admin_passwd: the admin password
+    :param passwd_data: path to the passwd file
+    :param shadow_data: path to the shadow password file
     :returns: nothing
     :raises: exception.NovaException(), IOError()
 

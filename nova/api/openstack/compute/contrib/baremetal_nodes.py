@@ -15,17 +15,17 @@
 
 """The bare-metal admin extension with Ironic Proxy."""
 
-from oslo.config import cfg
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
 import webob
 
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova.i18n import _
-from nova.openstack.common import log as logging
 
 ironic_client = importutils.try_import('ironicclient.client')
+ironic_exc = importutils.try_import('ironicclient.exc')
 
 authorize = extensions.extension_authorizer('compute', 'baremetal_nodes')
 
@@ -58,23 +58,11 @@ CONF.import_opt('compute_driver', 'nova.virt.driver')
 LOG = logging.getLogger(__name__)
 
 
-def _interface_dict(interface_ref):
-    d = {}
-    for f in interface_fields:
-        d[f] = interface_ref.get(f)
-    return d
-
-
-def _make_node_elem(elem):
-    for f in node_fields:
-        elem.set(f)
-    for f in node_ext_fields:
-        elem.set(f)
-
-
-def _make_interface_elem(elem):
-    for f in interface_fields:
-        elem.set(f)
+def _check_ironic_client_enabled():
+    """Check whether Ironic is installed or not."""
+    if ironic_client is None:
+        msg = _("Ironic client unavailable, cannot access Ironic.")
+        raise webob.exc.HTTPNotImplemented(explanation=msg)
 
 
 def _get_ironic_client():
@@ -99,31 +87,6 @@ def _no_ironic_proxy(cmd):
                                   "action.") % {'cmd': cmd})
 
 
-class NodeTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        node_elem = xmlutil.TemplateElement('node', selector='node')
-        _make_node_elem(node_elem)
-        ifs_elem = xmlutil.TemplateElement('interfaces')
-        if_elem = xmlutil.SubTemplateElement(ifs_elem, 'interface',
-                                             selector='interfaces')
-        _make_interface_elem(if_elem)
-        node_elem.append(ifs_elem)
-        return xmlutil.MasterTemplate(node_elem, 1)
-
-
-class NodesTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('nodes')
-        node_elem = xmlutil.SubTemplateElement(root, 'node', selector='nodes')
-        _make_node_elem(node_elem)
-        ifs_elem = xmlutil.TemplateElement('interfaces')
-        if_elem = xmlutil.SubTemplateElement(ifs_elem, 'interface',
-                                             selector='interfaces')
-        _make_interface_elem(if_elem)
-        node_elem.append(ifs_elem)
-        return xmlutil.MasterTemplate(root, 1)
-
-
 class BareMetalNodeController(wsgi.Controller):
     """The Bare-Metal Node API controller for the OpenStack API.
 
@@ -145,12 +108,12 @@ class BareMetalNodeController(wsgi.Controller):
                 d[f] = node_ref.get(f)
         return d
 
-    @wsgi.serializers(xml=NodesTemplate)
     def index(self, req):
         context = req.environ['nova.context']
         authorize(context)
         nodes = []
         # proxy command to Ironic
+        _check_ironic_client_enabled()
         ironicclient = _get_ironic_client()
         ironic_nodes = ironicclient.node.list(detail=True)
         for inode in ironic_nodes:
@@ -158,33 +121,36 @@ class BareMetalNodeController(wsgi.Controller):
                     'interfaces': [],
                     'host': 'IRONIC MANAGED',
                     'task_state': inode.provision_state,
-                    'cpus': inode.properties['cpus'],
-                    'memory_mb': inode.properties['memory_mb'],
-                    'disk_gb': inode.properties['local_gb']}
+                    'cpus': inode.properties.get('cpus', 0),
+                    'memory_mb': inode.properties.get('memory_mb', 0),
+                    'disk_gb': inode.properties.get('local_gb', 0)}
             nodes.append(node)
         return {'nodes': nodes}
 
-    @wsgi.serializers(xml=NodeTemplate)
     def show(self, req, id):
         context = req.environ['nova.context']
         authorize(context)
         # proxy command to Ironic
+        _check_ironic_client_enabled()
         icli = _get_ironic_client()
-        inode = icli.node.get(id)
+        try:
+            inode = icli.node.get(id)
+        except ironic_exc.NotFound:
+            msg = _("Node %s could not be found.") % id
+            raise webob.exc.HTTPNotFound(explanation=msg)
         iports = icli.node.list_ports(id)
         node = {'id': inode.uuid,
                 'interfaces': [],
                 'host': 'IRONIC MANAGED',
                 'task_state': inode.provision_state,
-                'cpus': inode.properties['cpus'],
-                'memory_mb': inode.properties['memory_mb'],
-                'disk_gb': inode.properties['local_gb'],
+                'cpus': inode.properties.get('cpus', 0),
+                'memory_mb': inode.properties.get('memory_mb', 0),
+                'disk_gb': inode.properties.get('local_gb', 0),
                 'instance_uuid': inode.instance_uuid}
         for port in iports:
             node['interfaces'].append({'address': port.address})
         return {'node': node}
 
-    @wsgi.serializers(xml=NodeTemplate)
     def create(self, req, body):
         _no_ironic_proxy("port-create")
 

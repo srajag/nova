@@ -16,19 +16,16 @@
 
 """The cells extension."""
 
-from oslo.config import cfg
-from oslo import messaging
-from oslo.utils import strutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+import oslo_messaging as messaging
+from oslo_utils import strutils
+from oslo_utils import timeutils
 import six
 from webob import exc
 
 from nova.api.openstack import common
 from nova.api.openstack import extensions
-from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova.cells import rpcapi as cells_rpcapi
-from nova.compute import api as compute
 from nova import exception
 from nova.i18n import _
 from nova import rpc
@@ -41,101 +38,12 @@ CONF.import_opt('capabilities', 'nova.cells.opts', group='cells')
 authorize = extensions.extension_authorizer('compute', 'cells')
 
 
-def make_cell(elem):
-    elem.set('name')
-    elem.set('username')
-    elem.set('type')
-    elem.set('rpc_host')
-    elem.set('rpc_port')
-
-    caps = xmlutil.SubTemplateElement(elem, 'capabilities',
-            selector='capabilities')
-    cap = xmlutil.SubTemplateElement(caps, xmlutil.Selector(0),
-            selector=xmlutil.get_items)
-    cap.text = 1
-    make_capacity(elem)
-
-
-def make_capacity(cell):
-
-    def get_units_by_mb(capacity_info):
-        return capacity_info['units_by_mb'].items()
-
-    capacity = xmlutil.SubTemplateElement(cell, 'capacities',
-                                          selector='capacities')
-
-    ram_free = xmlutil.SubTemplateElement(capacity, 'ram_free',
-                                          selector='ram_free')
-    ram_free.set('total_mb', 'total_mb')
-    unit_by_mb = xmlutil.SubTemplateElement(ram_free, 'unit_by_mb',
-                                            selector=get_units_by_mb)
-    unit_by_mb.set('mb', 0)
-    unit_by_mb.set('unit', 1)
-
-    disk_free = xmlutil.SubTemplateElement(capacity, 'disk_free',
-                                           selector='disk_free')
-    disk_free.set('total_mb', 'total_mb')
-    unit_by_mb = xmlutil.SubTemplateElement(disk_free, 'unit_by_mb',
-                                            selector=get_units_by_mb)
-    unit_by_mb.set('mb', 0)
-    unit_by_mb.set('unit', 1)
-
-cell_nsmap = {None: wsgi.XMLNS_V10}
-
-
-class CellTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('cell', selector='cell')
-        make_cell(root)
-        return xmlutil.MasterTemplate(root, 1, nsmap=cell_nsmap)
-
-
-class CellsTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('cells')
-        elem = xmlutil.SubTemplateElement(root, 'cell', selector='cells')
-        make_cell(elem)
-        return xmlutil.MasterTemplate(root, 1, nsmap=cell_nsmap)
-
-
-class CellDeserializer(wsgi.XMLDeserializer):
-    """Deserializer to handle xml-formatted cell create requests."""
-
-    def _extract_capabilities(self, cap_node):
-        caps = {}
-        for cap in cap_node.childNodes:
-            cap_name = cap.tagName
-            caps[cap_name] = self.extract_text(cap)
-        return caps
-
-    def _extract_cell(self, node):
-        cell = {}
-        cell_node = self.find_first_child_named(node, 'cell')
-
-        extract_fns = {
-            'capabilities': self._extract_capabilities,
-            'rpc_port': lambda child: int(self.extract_text(child)),
-        }
-
-        for child in cell_node.childNodes:
-            name = child.tagName
-            extract_fn = extract_fns.get(name, self.extract_text)
-            cell[name] = extract_fn(child)
-        return cell
-
-    def default(self, string):
-        """Deserialize an xml-formatted cell create request."""
-        node = xmlutil.safe_minidom_parse_string(string)
-
-        return {'body': {'cell': self._extract_cell(node)}}
-
-
 def _filter_keys(item, keys):
     """Filters all model attributes except for keys
     item is a dict
 
     """
-    return dict((k, v) for k, v in item.iteritems() if k in keys)
+    return {k: v for k, v in item.iteritems() if k in keys}
 
 
 def _fixup_cell_info(cell_info, keys):
@@ -185,7 +93,6 @@ class Controller(object):
     """Controller for Cell resources."""
 
     def __init__(self, ext_mgr):
-        self.compute_api = compute.API()
         self.cells_rpcapi = cells_rpcapi.CellsAPI()
         self.ext_mgr = ext_mgr
 
@@ -197,7 +104,6 @@ class Controller(object):
         items = [_scrub_cell(item, detail=detail) for item in items]
         return dict(cells=items)
 
-    @wsgi.serializers(xml=CellsTemplate)
     @common.check_cells_enabled
     def index(self, req):
         """Return all cells in brief."""
@@ -205,7 +111,6 @@ class Controller(object):
         authorize(ctxt)
         return self._get_cells(ctxt, req)
 
-    @wsgi.serializers(xml=CellsTemplate)
     @common.check_cells_enabled
     def detail(self, req):
         """Return all cells in detail."""
@@ -213,7 +118,6 @@ class Controller(object):
         authorize(ctxt)
         return self._get_cells(ctxt, req, detail=True)
 
-    @wsgi.serializers(xml=CellTemplate)
     @common.check_cells_enabled
     def info(self, req):
         """Return name and capabilities for this cell."""
@@ -232,7 +136,6 @@ class Controller(object):
                 'capabilities': cell_capabs}
         return dict(cell=cell)
 
-    @wsgi.serializers(xml=CellTemplate)
     @common.check_cells_enabled
     def capacities(self, req, id=None):
         """Return capacities for a given cell or all cells."""
@@ -252,7 +155,6 @@ class Controller(object):
 
         return dict(cell={"capacities": capacities})
 
-    @wsgi.serializers(xml=CellTemplate)
     @common.check_cells_enabled
     def show(self, req, id):
         """Return data about the given cell name.  'id' is a cell name."""
@@ -323,7 +225,12 @@ class Controller(object):
         if not transport_url.hosts:
             transport_url.hosts.append(messaging.TransportHost())
         transport_host = transport_url.hosts[0]
-
+        if cell.get('rpc_port') is not None:
+            try:
+                cell['rpc_port'] = int(cell['rpc_port'])
+            except ValueError:
+                raise exc.HTTPBadRequest(
+                    explanation=_('rpc_port must be integer'))
         # Copy over the input fields
         transport_field_map = {
             'username': 'username',
@@ -339,8 +246,6 @@ class Controller(object):
         # Now set the transport URL
         cell['transport_url'] = str(transport_url)
 
-    @wsgi.serializers(xml=CellTemplate)
-    @wsgi.deserializers(xml=CellDeserializer)
     @common.check_cells_enabled
     def create(self, req, body):
         """Create a child cell entry."""
@@ -364,8 +269,6 @@ class Controller(object):
             raise exc.HTTPForbidden(explanation=e.format_message())
         return dict(cell=_scrub_cell(cell))
 
-    @wsgi.serializers(xml=CellTemplate)
-    @wsgi.deserializers(xml=CellDeserializer)
     @common.check_cells_enabled
     def update(self, req, id, body):
         """Update a child cell entry.  'id' is the cell name to update."""

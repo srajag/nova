@@ -15,7 +15,9 @@
 
 import functools
 
-from oslo.utils import importutils
+from oslo_utils import importutils
+
+from nova.scheduler import utils
 
 
 class LazyLoader(object):
@@ -44,9 +46,27 @@ class SchedulerClient(object):
         self.reportclient = LazyLoader(importutils.import_class(
             'nova.scheduler.client.report.SchedulerReportClient'))
 
+    @utils.retry_select_destinations
     def select_destinations(self, context, request_spec, filter_properties):
         return self.queryclient.select_destinations(
             context, request_spec, filter_properties)
 
+    def update_aggregates(self, context, aggregates):
+        self.queryclient.update_aggregates(context, aggregates)
+
+    def delete_aggregate(self, context, aggregate):
+        self.queryclient.delete_aggregate(context, aggregate)
+
     def update_resource_stats(self, context, name, stats):
         self.reportclient.update_resource_stats(context, name, stats)
+
+    def update_instance_info(self, context, host_name, instance_info):
+        self.queryclient.update_instance_info(context, host_name,
+                                              instance_info)
+
+    def delete_instance_info(self, context, host_name, instance_uuid):
+        self.queryclient.delete_instance_info(context, host_name,
+                                              instance_uuid)
+
+    def sync_instance_info(self, context, host_name, instance_uuids):
+        self.queryclient.sync_instance_info(context, host_name, instance_uuids)

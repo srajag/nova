@@ -18,16 +18,16 @@
 
 import datetime
 
-from oslo.config import cfg
-from oslo.utils import importutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
+from oslo_utils import timeutils
 import six
 
 from nova import db
 from nova import exception
-from nova.i18n import _
+from nova.i18n import _LE
 from nova import objects
-from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
@@ -46,8 +46,8 @@ quota_opts = [
                help='Number of floating IPs allowed per project'),
     cfg.IntOpt('quota_fixed_ips',
                default=-1,
-               help=('Number of fixed IPs allowed per project (this should be '
-                     'at least the number of instances allowed)')),
+               help='Number of fixed IPs allowed per project (this should be '
+                    'at least the number of instances allowed)'),
     cfg.IntOpt('quota_metadata_items',
                default=128,
                help='Number of metadata items allowed per instance'),
@@ -59,10 +59,7 @@ quota_opts = [
                help='Number of bytes allowed per injected file'),
     cfg.IntOpt('quota_injected_file_path_length',
                default=255,
-               deprecated_name='quota_injected_file_path_bytes',
                help='Length of injected file path'),
-    # TODO(lyj): quota_injected_file_path_bytes is deprecated in Juno, and will
-    #            be removed in K.
     cfg.IntOpt('quota_security_groups',
                default=10,
                help='Number of security groups per project'),
@@ -83,10 +80,19 @@ quota_opts = [
                help='Number of seconds until a reservation expires'),
     cfg.IntOpt('until_refresh',
                default=0,
-               help='Count of reservations until usage is refreshed'),
+               help='Count of reservations until usage is refreshed. This '
+                    'defaults to 0(off) to avoid additional load but it is '
+                    'useful to turn on to help keep quota usage up to date '
+                    'and reduce the impact of out of sync usage issues.'),
     cfg.IntOpt('max_age',
                default=0,
-               help='Number of seconds between subsequent usage refreshes'),
+               help='Number of seconds between subsequent usage refreshes. '
+                    'This defaults to 0(off) to avoid additional load but it '
+                    'is useful to turn on to help keep quota usage up to date '
+                    'and reduce the impact of out of sync usage issues. '
+                    'Note that quotas are not updated on a periodic task, '
+                    'they will update on a new reservation if max_age has '
+                    'passed since the last reservation'),
     cfg.StrOpt('quota_driver',
                default='nova.quota.DbQuotaDriver',
                help='Default driver to use for quota checks'),
@@ -232,8 +238,12 @@ class DbQuotaDriver(object):
         :param user_quotas: Quotas dictionary for the specified project
                             and user.
         """
-        user_quotas = user_quotas or db.quota_get_all_by_project_and_user(
-            context, project_id, user_id)
+        if user_quotas:
+            user_quotas = user_quotas.copy()
+        else:
+            user_quotas = db.quota_get_all_by_project_and_user(context,
+                                                               project_id,
+                                                               user_id)
         # Use the project quota for default user quota.
         proj_quotas = project_quotas or db.quota_get_all_by_project(
             context, project_id)
@@ -277,6 +287,7 @@ class DbQuotaDriver(object):
             context, project_id)
         project_usages = None
         if usages:
+            LOG.debug('Getting all quota usages for project: %s', project_id)
             project_usages = db.quota_usage_get_all_by_project(context,
                                                                project_id)
         return self._process_quotas(context, resources, project_id,
@@ -375,8 +386,8 @@ class DbQuotaDriver(object):
         else:
             sync_filt = lambda x: not hasattr(x, 'sync')
         desired = set(keys)
-        sub_resources = dict((k, v) for k, v in resources.items()
-                             if k in desired and sync_filt(v))
+        sub_resources = {k: v for k, v in resources.items()
+                        if k in desired and sync_filt(v)}
 
         # Make sure we accounted for all of them...
         if len(keys) != len(sub_resources):
@@ -384,12 +395,18 @@ class DbQuotaDriver(object):
             raise exception.QuotaResourceUnknown(unknown=sorted(unknown))
 
         if user_id:
+            LOG.debug('Getting quotas for user %(user_id)s and project '
+                      '%(project_id)s. Resources: %(keys)s',
+                      {'user_id': user_id, 'project_id': project_id,
+                       'keys': keys})
             # Grab and return the quotas (without usages)
             quotas = self.get_user_quotas(context, sub_resources,
                                           project_id, user_id,
                                           context.quota_class, usages=False,
                                           project_quotas=project_quotas)
         else:
+            LOG.debug('Getting quotas for project %(project_id)s. Resources: '
+                      '%(keys)s', {'project_id': project_id, 'keys': keys})
             # Grab and return the quotas (without usages)
             quotas = self.get_project_quotas(context, sub_resources,
                                              project_id,
@@ -397,7 +414,7 @@ class DbQuotaDriver(object):
                                              usages=False,
                                              project_quotas=project_quotas)
 
-        return dict((k, v['limit']) for k, v in quotas.items())
+        return {k: v['limit'] for k, v in quotas.items()}
 
     def limit_check(self, context, resources, values, project_id=None,
                     user_id=None):
@@ -519,22 +536,41 @@ class DbQuotaDriver(object):
         # If project_id is None, then we use the project_id in context
         if project_id is None:
             project_id = context.project_id
+            LOG.debug('Reserving resources using context.project_id: %s',
+                      project_id)
         # If user_id is None, then we use the project_id in context
         if user_id is None:
             user_id = context.user_id
+            LOG.debug('Reserving resources using context.user_id: %s',
+                      user_id)
+
+        LOG.debug('Attempting to reserve resources for project %(project_id)s '
+                  'and user %(user_id)s. Deltas: %(deltas)s',
+                  {'project_id': project_id, 'user_id': user_id,
+                   'deltas': deltas})
 
         # Get the applicable quotas.
         # NOTE(Vek): We're not worried about races at this point.
         #            Yes, the admin may be in the process of reducing
         #            quotas, but that's a pretty rare thing.
         project_quotas = db.quota_get_all_by_project(context, project_id)
+        LOG.debug('Quota limits for project %(project_id)s: '
+                  '%(project_quotas)s', {'project_id': project_id,
+                                         'project_quotas': project_quotas})
+
         quotas = self._get_quotas(context, resources, deltas.keys(),
                                   has_sync=True, project_id=project_id,
                                   project_quotas=project_quotas)
+        LOG.debug('Quotas for project %(project_id)s after resource sync: '
+                  '%(quotas)s', {'project_id': project_id, 'quotas': quotas})
         user_quotas = self._get_quotas(context, resources, deltas.keys(),
                                        has_sync=True, project_id=project_id,
                                        user_id=user_id,
                                        project_quotas=project_quotas)
+        LOG.debug('Quotas for project %(project_id)s and user %(user_id)s '
+                  'after resource sync: %(quotas)s',
+                  {'project_id': project_id, 'user_id': user_id,
+                   'quotas': quotas})
 
         # NOTE(Vek): Most of the work here has to be done in the DB
         #            API, because we have to do it in a transaction,
@@ -1207,7 +1243,6 @@ class QuotaEngine(object):
         the given user or project.
 
         :param context: The request context, for access checks.
-        :param resources: A dictionary of the registered resources.
         :param project_id: The ID of the project to return quotas for.
         :param user_id: The ID of the user to return quotas for.
         """
@@ -1330,7 +1365,8 @@ class QuotaEngine(object):
             # usage resynchronization and the reservation expiration
             # mechanisms will resolve the issue.  The exception is
             # logged, however, because this is less than optimal.
-            LOG.exception(_("Failed to commit reservations %s"), reservations)
+            LOG.exception(_LE("Failed to commit reservations %s"),
+                          reservations)
             return
         LOG.debug("Committed reservations %s", reservations)
 
@@ -1353,7 +1389,7 @@ class QuotaEngine(object):
             # usage resynchronization and the reservation expiration
             # mechanisms will resolve the issue.  The exception is
             # logged, however, because this is less than optimal.
-            LOG.exception(_("Failed to roll back reservations %s"),
+            LOG.exception(_LE("Failed to roll back reservations %s"),
                           reservations)
             return
         LOG.debug("Rolled back reservations %s", reservations)
@@ -1419,7 +1455,7 @@ def _keypair_get_count_by_user(*args, **kwargs):
 
 def _server_group_count_members_by_user(context, group, user_id):
     """Helper method to avoid referencing objects.InstanceGroup on import."""
-    return group.count_members_by_user(context, user_id)
+    return group.count_members_by_user(user_id)
 
 
 QUOTAS = QuotaEngine()

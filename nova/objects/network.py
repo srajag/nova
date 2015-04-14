@@ -13,10 +13,11 @@
 #    under the License.
 
 import netaddr
-from oslo.config import cfg
+from oslo_config import cfg
 
 from nova import db
 from nova import exception
+from nova.i18n import _
 from nova import objects
 from nova.objects import base as obj_base
 from nova.objects import fields
@@ -39,7 +40,9 @@ CONF = cfg.CONF
 CONF.register_opts(network_opts)
 
 
-class Network(obj_base.NovaPersistentObject, obj_base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+class Network(obj_base.NovaPersistentObject, obj_base.NovaObject,
+              obj_base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Added in_use_on_host()
     # Version 1.2: Added mtu, dhcp_server, enable_dhcp, share_address
@@ -94,8 +97,8 @@ class Network(obj_base.NovaPersistentObject, obj_base.NovaObject):
         try:
             return netaddr.IPNetwork(netmask).netmask
         except netaddr.AddrFormatError:
-            raise ValueError('IPv6 netmask "%s" must be a netmask '
-                             'or integral prefix' % netmask)
+            raise ValueError(_('IPv6 netmask "%s" must be a netmask '
+                               'or integral prefix') % netmask)
 
     def obj_make_compatible(self, primitive, target_version):
         target_version = utils.convert_version_to_tuple(target_version)
@@ -166,22 +169,23 @@ class Network(obj_base.NovaPersistentObject, obj_base.NovaObject):
         return changes
 
     @obj_base.remotable
-    def create(self, context):
+    def create(self):
         updates = self._get_primitive_changes()
         if 'id' in updates:
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
-        db_network = db.network_create_safe(context, updates)
-        self._from_db_object(context, self, db_network)
+        db_network = db.network_create_safe(self._context, updates)
+        self._from_db_object(self._context, self, db_network)
 
     @obj_base.remotable
-    def destroy(self, context):
-        db.network_delete_safe(context, self.id)
+    def destroy(self):
+        db.network_delete_safe(self._context, self.id)
         self.deleted = True
         self.obj_reset_changes(['deleted'])
 
     @obj_base.remotable
-    def save(self, context):
+    def save(self):
+        context = self._context
         updates = self._get_primitive_changes()
         if 'netmask_v6' in updates:
             # NOTE(danms): For some reason, historical code stores the

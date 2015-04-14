@@ -17,7 +17,7 @@
 
 import collections
 
-from oslo.config import cfg
+from oslo_config import cfg
 
 from nova import objects
 from nova.openstack.common import memorycache
@@ -75,14 +75,6 @@ def _build_metadata_by_host(aggregates, hosts=None):
     return metadata
 
 
-def _build_metadata_by_key(aggregates):
-    metadata = collections.defaultdict(set)
-    for aggregate in aggregates:
-        for key, value in aggregate.metadata.iteritems():
-            metadata[key].add(value)
-    return metadata
-
-
 def set_availability_zones(context, services):
     # Makes sure services isn't a sqlalchemy object
     services = [dict(service.iteritems()) for service in services]
@@ -105,16 +97,11 @@ def set_availability_zones(context, services):
     return services
 
 
-def get_host_availability_zone(context, host, conductor_api=None):
-    if conductor_api:
-        metadata = conductor_api.aggregate_metadata_get_by_host(
-            context, host, key='availability_zone')
-    else:
-        aggregates = objects.AggregateList.get_by_host(context, host,
-                                                       key='availability_zone')
-        metadata = _build_metadata_by_key(aggregates)
-    if 'availability_zone' in metadata:
-        az = list(metadata['availability_zone'])[0]
+def get_host_availability_zone(context, host):
+    aggregates = objects.AggregateList.get_by_host(context, host,
+                                                   key='availability_zone')
+    if aggregates:
+        az = aggregates[0].metadata['availability_zone']
     else:
         az = CONF.default_availability_zone
     return az
@@ -140,8 +127,8 @@ def get_availability_zones(context, get_only_available=False,
         :param with_hosts: whether to return hosts part of the AZs
         :type with_hosts: bool
     """
-    enabled_services = objects.ServiceList.get_all(context, disabled=False)
-    enabled_services = set_availability_zones(context, enabled_services)
+    enabled_services = objects.ServiceList.get_all(context, disabled=False,
+                                                   set_zones=True)
 
     available_zones = []
     for (zone, host) in [(service['availability_zone'], service['host'])
@@ -156,8 +143,8 @@ def get_availability_zones(context, get_only_available=False,
             available_zones = list(_available_zones.items())
 
     if not get_only_available:
-        disabled_services = objects.ServiceList.get_all(context, disabled=True)
-        disabled_services = set_availability_zones(context, disabled_services)
+        disabled_services = objects.ServiceList.get_all(context, disabled=True,
+                                                        set_zones=True)
         not_available_zones = []
         azs = available_zones if not with_hosts else dict(available_zones)
         zones = [(service['availability_zone'], service['host'])

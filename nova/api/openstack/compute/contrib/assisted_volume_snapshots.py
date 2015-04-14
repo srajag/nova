@@ -12,34 +12,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.serialization import jsonutils
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
 import six
 import webob
 
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova import compute
 from nova import exception
-from nova.i18n import _
-from nova.openstack.common import log as logging
+from nova.i18n import _LI
 
 
 LOG = logging.getLogger(__name__)
 authorize = extensions.extension_authorizer('compute',
         'os-assisted-volume-snapshots')
-
-
-def make_snapshot(elem):
-    elem.set('id')
-    elem.set('volumeId')
-
-
-class SnapshotTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('snapshot', selector='snapshot')
-        make_snapshot(root)
-        return xmlutil.MasterTemplate(root, 1)
 
 
 class AssistedVolumeSnapshotsController(wsgi.Controller):
@@ -48,7 +35,6 @@ class AssistedVolumeSnapshotsController(wsgi.Controller):
         self.compute_api = compute.API()
         super(AssistedVolumeSnapshotsController, self).__init__()
 
-    @wsgi.serializers(xml=SnapshotTemplate)
     def create(self, req, body):
         """Creates a new snapshot."""
         context = req.environ['nova.context']
@@ -64,7 +50,7 @@ class AssistedVolumeSnapshotsController(wsgi.Controller):
         except KeyError:
             raise webob.exc.HTTPBadRequest()
 
-        LOG.audit(_("Create assisted snapshot from volume %s"), volume_id,
+        LOG.info(_LI("Create assisted snapshot from volume %s"), volume_id,
                   context=context)
 
         return self.compute_api.volume_snapshot_create(context, volume_id,
@@ -75,7 +61,7 @@ class AssistedVolumeSnapshotsController(wsgi.Controller):
         context = req.environ['nova.context']
         authorize(context, action='delete')
 
-        LOG.audit(_("Delete snapshot with id: %s"), id, context=context)
+        LOG.info(_LI("Delete snapshot with id: %s"), id, context=context)
 
         delete_metadata = {}
         delete_metadata.update(req.GET)

@@ -15,13 +15,18 @@
 
 import os
 import shutil
+import sys
 
-from oslo.config import cfg
+if sys.platform == 'win32':
+    import wmi
+
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from nova.i18n import _
-from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt.hyperv import constants
+from nova.virt.hyperv import vmutils
 
 LOG = logging.getLogger(__name__)
 
@@ -39,8 +44,13 @@ CONF = cfg.CONF
 CONF.register_opts(hyperv_opts, 'hyperv')
 CONF.import_opt('instances_path', 'nova.compute.manager')
 
+ERROR_INVALID_NAME = 123
+
 
 class PathUtils(object):
+    def __init__(self):
+        self._smb_conn = wmi.WMI(moniker=r"root\Microsoft\Windows\SMB")
+
     def open(self, path, mode):
         """Wrapper on __builtin__.open used to simplify unit testing."""
         import __builtin__
@@ -104,11 +114,22 @@ class PathUtils(object):
                                create_dir=True, remove_dir=False):
         instances_path = self.get_instances_dir(remote_server)
         path = os.path.join(instances_path, dir_name)
-        if remove_dir:
-            self._check_remove_dir(path)
-        if create_dir:
-            self._check_create_dir(path)
-        return path
+        try:
+            if remove_dir:
+                self._check_remove_dir(path)
+            if create_dir:
+                self._check_create_dir(path)
+            return path
+        except WindowsError as ex:
+            if ex.winerror == ERROR_INVALID_NAME:
+                raise vmutils.HyperVException(_(
+                    "Cannot access \"%(instances_path)s\", make sure the "
+                    "path exists and that you have the proper permissions. "
+                    "In particular Nova-Compute must not be executed with the "
+                    "builtin SYSTEM account or other accounts unable to "
+                    "authenticate on a remote host.") %
+                    {'instances_path': instances_path})
+            raise
 
     def get_instance_migr_revert_dir(self, instance_name, create_dir=False,
                                      remove_dir=False):
@@ -150,8 +171,9 @@ class PathUtils(object):
         instance_path = self.get_instance_dir(instance_name)
         return os.path.join(instance_path, 'root.' + format_ext.lower())
 
-    def get_configdrive_path(self, instance_name, format_ext):
-        instance_path = self.get_instance_dir(instance_name)
+    def get_configdrive_path(self, instance_name, format_ext,
+                             remote_server=None):
+        instance_path = self.get_instance_dir(instance_name, remote_server)
         return os.path.join(instance_path, 'configdrive.' + format_ext.lower())
 
     def get_ephemeral_vhd_path(self, instance_name, format_ext):
@@ -171,3 +193,52 @@ class PathUtils(object):
                                              remote_server)
         console_log_path = os.path.join(instance_dir, 'console.log')
         return console_log_path, console_log_path + '.1'
+
+    def check_smb_mapping(self, smbfs_share):
+        mappings = self._smb_conn.Msft_SmbMapping(RemotePath=smbfs_share)
+
+        if not mappings:
+            return False
+
+        if os.path.exists(smbfs_share):
+            LOG.debug('Share already mounted: %s', smbfs_share)
+            return True
+        else:
+            LOG.debug('Share exists but is unavailable: %s ', smbfs_share)
+            self.unmount_smb_share(smbfs_share, force=True)
+            return False
+
+    def mount_smb_share(self, smbfs_share, username=None, password=None):
+        try:
+            LOG.debug('Mounting share: %s', smbfs_share)
+            self._smb_conn.Msft_SmbMapping.Create(RemotePath=smbfs_share,
+                                                  UserName=username,
+                                                  Password=password)
+        except wmi.x_wmi as exc:
+            err_msg = (_(
+                'Unable to mount SMBFS share: %(smbfs_share)s '
+                'WMI exception: %(wmi_exc)s'), {'smbfs_share': smbfs_share,
+                                                'wmi_exc': exc})
+            raise vmutils.HyperVException(err_msg)
+
+    def unmount_smb_share(self, smbfs_share, force=False):
+        mappings = self._smb_conn.Msft_SmbMapping(RemotePath=smbfs_share)
+        if not mappings:
+            LOG.debug('Share %s is not mounted. Skipping unmount.',
+                      smbfs_share)
+
+        for mapping in mappings:
+            # Due to a bug in the WMI module, getting the output of
+            # methods returning None will raise an AttributeError
+            try:
+                mapping.Remove(Force=force)
+            except AttributeError:
+                pass
+            except wmi.x_wmi:
+                # If this fails, a 'Generic Failure' exception is raised.
+                # This happens even if we unforcefully unmount an in-use
+                # share, for which reason we'll simply ignore it in this
+                # case.
+                if force:
+                    raise vmutils.HyperVException(
+                        _("Could not unmount share: %s"), smbfs_share)

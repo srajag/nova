@@ -26,22 +26,24 @@ reached.
 
 The interface into this module is the MessageRunner class.
 """
+
 import sys
 import traceback
 
 from eventlet import queue
-from oslo.config import cfg
-from oslo import messaging
-from oslo.serialization import jsonutils
-from oslo.utils import excutils
-from oslo.utils import importutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_serialization import jsonutils
+from oslo_utils import excutils
+from oslo_utils import importutils
+from oslo_utils import timeutils
+from oslo_utils import uuidutils
 import six
 
 from nova.cells import state as cells_state
 from nova.cells import utils as cells_utils
 from nova import compute
-from nova.compute import delete_types
 from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import task_states
 from nova.compute import vm_states
@@ -49,12 +51,10 @@ from nova.consoleauth import rpcapi as consoleauth_rpcapi
 from nova import context
 from nova.db import base
 from nova import exception
-from nova.i18n import _, _LE
+from nova.i18n import _, _LE, _LI, _LW
 from nova.network import model as network_model
 from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common import log as logging
-from nova.openstack.common import uuidutils
 from nova import rpc
 from nova import utils
 
@@ -199,12 +199,11 @@ class _BaseMessage(object):
         try:
             resp_value = self.msg_runner._process_message_locally(self)
             failure = False
-        except Exception as exc:
+        except Exception:
             resp_value = sys.exc_info()
             failure = True
-            LOG.exception(_("Error processing message locally: %(exc)s"),
-                          {'exc': exc})
-        return Response(self.routing_path, resp_value, failure)
+            LOG.exception(_LE("Error processing message locally"))
+        return Response(self.ctxt, self.routing_path, resp_value, failure)
 
     def _setup_response_queue(self):
         """Shortcut to creating a response queue in the MessageRunner."""
@@ -258,7 +257,7 @@ class _BaseMessage(object):
         if self.source_is_us():
             responses = []
             for json_response in json_responses:
-                responses.append(Response.from_json(json_response))
+                responses.append(Response.from_json(self.ctxt, json_response))
             return responses
         direction = self.direction == 'up' and 'down' or 'up'
         response_kwargs = {'orig_message': self.to_json(),
@@ -290,7 +289,7 @@ class _BaseMessage(object):
         """Take an exception as returned from sys.exc_info(), encode
         it in a Response, and send it.
         """
-        response = Response(self.routing_path, exc_info, True)
+        response = Response(self.ctxt, self.routing_path, exc_info, True)
         return self._send_response(response)
 
     def _to_dict(self):
@@ -346,6 +345,11 @@ class _TargetedMessage(_BaseMessage):
                 target_cell = '%s%s%s' % (self.our_path_part,
                                           _PATH_CELL_SEP,
                                           target_cell.name)
+        # NOTE(alaski): This occurs when hosts are specified with no cells
+        # routing information.
+        if target_cell is None:
+            reason = _('No cell given in routing path.')
+            raise exception.CellRoutingInconsistency(reason=reason)
         self.target_cell = target_cell
         self.base_attrs_to_json.append('target_cell')
 
@@ -405,10 +409,9 @@ class _TargetedMessage(_BaseMessage):
         """
         try:
             next_hop = self._get_next_hop()
-        except Exception as exc:
+        except Exception:
             exc_info = sys.exc_info()
-            LOG.exception(_("Error locating next hop for message: %(exc)s"),
-                          {'exc': exc})
+            LOG.exception(_LE("Error locating next hop for message"))
             return self._send_response_from_exception(exc_info)
 
         if next_hop.is_me:
@@ -432,18 +435,17 @@ class _TargetedMessage(_BaseMessage):
                 raise exception.CellMaxHopCountReached(
                         hop_count=self.hop_count)
             next_hop.send_message(self)
-        except Exception as exc:
+        except Exception:
             exc_info = sys.exc_info()
-            err_str = _("Failed to send message to cell: %(next_hop)s: "
-                        "%(exc)s")
-            LOG.exception(err_str, {'exc': exc, 'next_hop': next_hop})
+            err_str = _LE("Failed to send message to cell: %(next_hop)s")
+            LOG.exception(err_str, {'next_hop': next_hop})
             self._cleanup_response_queue()
             return self._send_response_from_exception(exc_info)
 
         if wait_for_response:
             # Targeted messages only have 1 response.
             remote_response = self._wait_for_json_responses()[0]
-            return Response.from_json(remote_response)
+            return Response.from_json(self.ctxt, remote_response)
 
 
 class _BroadcastMessage(_BaseMessage):
@@ -511,10 +513,9 @@ class _BroadcastMessage(_BaseMessage):
         """
         try:
             next_hops = self._get_next_hops()
-        except Exception as exc:
+        except Exception:
             exc_info = sys.exc_info()
-            LOG.exception(_("Error locating next hops for message: %(exc)s"),
-                          {'exc': exc})
+            LOG.exception(_LE("Error locating next hops for message"))
             return self._send_response_from_exception(exc_info)
 
         # Short circuit if we don't need to respond
@@ -529,12 +530,11 @@ class _BroadcastMessage(_BaseMessage):
         try:
             self._setup_response_queue()
             self._send_to_cells(next_hops)
-        except Exception as exc:
+        except Exception:
             # Error just trying to send to cells.  Send a single response
             # with the failure.
             exc_info = sys.exc_info()
-            LOG.exception(_("Error sending message to next hops: %(exc)s"),
-                          {'exc': exc})
+            LOG.exception(_LE("Error sending message to next hops."))
             self._cleanup_response_queue()
             return self._send_response_from_exception(exc_info)
 
@@ -547,13 +547,12 @@ class _BroadcastMessage(_BaseMessage):
         try:
             remote_responses = self._wait_for_json_responses(
                     num_responses=len(next_hops))
-        except Exception as exc:
+        except Exception:
             # Error waiting for responses, most likely a timeout.
             # Send a single response back with the failure.
             exc_info = sys.exc_info()
-            err_str = _("Error waiting for responses from neighbor cells: "
-                        "%(exc)s")
-            LOG.exception(err_str, {'exc': exc})
+            LOG.exception(_LE("Error waiting for responses from"
+                              " neighbor cells"))
             return self._send_response_from_exception(exc_info)
 
         if local_response:
@@ -732,9 +731,7 @@ class _TargetedMessageMethods(_BaseMessageMethods):
 
     def service_get_by_compute_host(self, message, host_name):
         """Return the service entry for a compute host."""
-        service = self.db.service_get_by_compute_host(message.ctxt,
-                                                      host_name)
-        return jsonutils.to_primitive(service)
+        return objects.Service.get_by_compute_host(message.ctxt, host_name)
 
     def service_update(self, message, host_name, binary, params_to_update):
         """Used to enable/disable a service. For compute services, setting to
@@ -745,19 +742,18 @@ class _TargetedMessageMethods(_BaseMessageMethods):
         :param binary: The name of the executable that the service runs as
         :param params_to_update: eg. {'disabled': True}
         """
-        return jsonutils.to_primitive(
-            self.host_api.service_update(message.ctxt, host_name, binary,
-                                         params_to_update))
+        return self.host_api._service_update(message.ctxt, host_name, binary,
+                                             params_to_update)
 
     def service_delete(self, message, service_id):
         """Deletes the specified service."""
-        self.host_api.service_delete(message.ctxt, service_id)
+        self.host_api._service_delete(message.ctxt, service_id)
 
     def proxy_rpc_to_manager(self, message, host_name, rpc_message,
                              topic, timeout):
         """Proxy RPC to the given compute topic."""
         # Check that the host exists.
-        self.db.service_get_by_compute_host(message.ctxt, host_name)
+        objects.Service.get_by_compute_host(message.ctxt, host_name)
 
         topic, _sep, server = topic.partition('.')
 
@@ -774,9 +770,7 @@ class _TargetedMessageMethods(_BaseMessageMethods):
 
     def compute_node_get(self, message, compute_id):
         """Get compute node by ID."""
-        compute_node = self.db.compute_node_get(message.ctxt,
-                                                compute_id)
-        return jsonutils.to_primitive(compute_node)
+        return objects.ComputeNode.get_by_id(message.ctxt, compute_id)
 
     def actions_get(self, message, instance_uuid):
         actions = self.db.actions_get(message.ctxt, instance_uuid)
@@ -826,7 +820,7 @@ class _TargetedMessageMethods(_BaseMessageMethods):
         # NOTE(alaski): A cell should be authoritative for its system_metadata
         # and metadata so we don't want to sync it down from the api.
         instance.obj_reset_changes(['metadata', 'system_metadata'])
-        instance.save(message.ctxt, expected_vm_state=expected_vm_state,
+        instance.save(expected_vm_state=expected_vm_state,
                       expected_task_state=expected_task_state)
 
     def _call_compute_api_with_obj(self, ctxt, instance, method, *args,
@@ -834,7 +828,7 @@ class _TargetedMessageMethods(_BaseMessageMethods):
         try:
             # NOTE(comstud): We need to refresh the instance from this
             # cell's view in the DB.
-            instance.refresh(ctxt)
+            instance.refresh()
         except exception.InstanceNotFound:
             with excutils.save_and_reraise_exception():
                 # Must be a race condition.  Let's try to resolve it by
@@ -844,7 +838,7 @@ class _TargetedMessageMethods(_BaseMessageMethods):
                 self.msg_runner.instance_destroy_at_top(ctxt,
                                                         instance)
         except exception.InstanceInfoCacheNotFound:
-            if method != delete_types.DELETE:
+            if method != 'delete':
                 raise
 
         fn = getattr(self.compute_api, method, None)
@@ -854,11 +848,12 @@ class _TargetedMessageMethods(_BaseMessageMethods):
         """Start an instance via compute_api.start()."""
         self._call_compute_api_with_obj(message.ctxt, instance, 'start')
 
-    def stop_instance(self, message, instance):
+    def stop_instance(self, message, instance, clean_shutdown=True):
         """Stop an instance via compute_api.stop()."""
         do_cast = not message.need_response
         return self._call_compute_api_with_obj(message.ctxt, instance,
-                                               'stop', do_cast=do_cast)
+                                               'stop', do_cast=do_cast,
+                                               clean_shutdown=clean_shutdown)
 
     def reboot_instance(self, message, instance, reboot_type):
         """Reboot an instance via compute_api.reboot()."""
@@ -877,12 +872,10 @@ class _TargetedMessageMethods(_BaseMessageMethods):
         return self.host_api.get_host_uptime(message.ctxt, host_name)
 
     def terminate_instance(self, message, instance):
-        self._call_compute_api_with_obj(message.ctxt, instance,
-                                        delete_types.DELETE)
+        self._call_compute_api_with_obj(message.ctxt, instance, 'delete')
 
     def soft_delete_instance(self, message, instance):
-        self._call_compute_api_with_obj(message.ctxt, instance,
-                                        delete_types.SOFT_DELETE)
+        self._call_compute_api_with_obj(message.ctxt, instance, 'soft_delete')
 
     def pause_instance(self, message, instance):
         """Pause an instance via compute_api.pause()."""
@@ -893,10 +886,11 @@ class _TargetedMessageMethods(_BaseMessageMethods):
         self._call_compute_api_with_obj(message.ctxt, instance, 'unpause')
 
     def resize_instance(self, message, instance, flavor,
-                        extra_instance_updates):
+                        extra_instance_updates, clean_shutdown=True):
         """Resize an instance via compute_api.resize()."""
         self._call_compute_api_with_obj(message.ctxt, instance, 'resize',
                                         flavor_id=flavor['flavorid'],
+                                        clean_shutdown=clean_shutdown,
                                         **extra_instance_updates)
 
     def live_migrate_instance(self, message, instance, block_migration,
@@ -1098,7 +1092,7 @@ class _BroadcastMessageMethods(_BaseMessageMethods):
         """
         LOG.debug("Got broadcast to %(delete_type)s delete instance",
                   {'delete_type': delete_type}, instance=instance)
-        if delete_type == delete_types.SOFT_DELETE:
+        if delete_type == 'soft':
             self.compute_api.soft_delete(message.ctxt, instance)
         else:
             self.compute_api.delete(message.ctxt, instance)
@@ -1110,9 +1104,7 @@ class _BroadcastMessageMethods(_BaseMessageMethods):
         items_to_remove = ['id']
         for key in items_to_remove:
             instance_fault.pop(key, None)
-        log_str = _("Got message to create instance fault: "
-                    "%(instance_fault)s")
-        LOG.debug(log_str, {'instance_fault': instance_fault})
+        LOG.debug("Got message to create instance fault: %s", instance_fault)
         fault = objects.InstanceFault(context=message.ctxt)
         fault.update(instance_fault)
         fault.create()
@@ -1133,8 +1125,8 @@ class _BroadcastMessageMethods(_BaseMessageMethods):
                        **kwargs):
         projid_str = project_id is None and "<all>" or project_id
         since_str = updated_since is None and "<all>" or updated_since
-        LOG.info(_("Forcing a sync of instances, project_id="
-                   "%(projid_str)s, updated_since=%(since_str)s"),
+        LOG.info(_LI("Forcing a sync of instances, project_id="
+                     "%(projid_str)s, updated_since=%(since_str)s"),
                  {'projid_str': projid_str, 'since_str': since_str})
         if updated_since is not None:
             updated_since = timeutils.parse_isotime(updated_since)
@@ -1148,12 +1140,11 @@ class _BroadcastMessageMethods(_BaseMessageMethods):
         if filters is None:
             filters = {}
         disabled = filters.pop('disabled', None)
-        services = self.db.service_get_all(message.ctxt, disabled=disabled)
+        services = objects.ServiceList.get_all(message.ctxt, disabled=disabled)
         ret_services = []
         for service in services:
-            service = jsonutils.to_primitive(service)
             for key, val in filters.iteritems():
-                if service[key] != val:
+                if getattr(service, key) != val:
                     break
             else:
                 ret_services.append(service)
@@ -1162,11 +1153,9 @@ class _BroadcastMessageMethods(_BaseMessageMethods):
     def compute_node_get_all(self, message, hypervisor_match):
         """Return compute nodes in this cell."""
         if hypervisor_match is not None:
-            nodes = self.db.compute_node_search_by_hypervisor(message.ctxt,
-                    hypervisor_match)
-        else:
-            nodes = self.db.compute_node_get_all(message.ctxt)
-        return jsonutils.to_primitive(nodes)
+            return objects.ComputeNodeList.get_by_hypervisor(message.ctxt,
+                                                             hypervisor_match)
+        return objects.ComputeNodeList.get_all(message.ctxt)
 
     def compute_node_stats(self, message):
         """Return compute node stats from this cell."""
@@ -1212,8 +1201,8 @@ class _BroadcastMessageMethods(_BaseMessageMethods):
             if vol_id and instance_bdm['volume_id'] == vol_id:
                 break
         else:
-            LOG.warn(_("No match when trying to update BDM: %(bdm)s"),
-                     dict(bdm=bdm))
+            LOG.warning(_LW("No match when trying to update BDM: %(bdm)s"),
+                        dict(bdm=bdm))
             return
         self.db.block_device_mapping_update(message.ctxt,
                                             instance_bdm['id'], bdm,
@@ -1693,8 +1682,8 @@ class MessageRunner(object):
         """Call instance_<method> in correct cell for instance."""
         cell_name = instance.cell_name
         if not cell_name:
-            LOG.warn(_("No cell_name for %(method)s() from API"),
-                     dict(method=method), instance=instance)
+            LOG.warning(_LW("No cell_name for %(method)s() from API"),
+                        dict(method=method), instance=instance)
             return
         method_kwargs = {'instance': instance}
         if extra_kwargs:
@@ -1710,8 +1699,8 @@ class MessageRunner(object):
         """Update an instance object in its cell."""
         cell_name = instance.cell_name
         if not cell_name:
-            LOG.warn(_("No cell_name for instance update from API"),
-                     instance=instance)
+            LOG.warning(_LW("No cell_name for instance update from API"),
+                        instance=instance)
             return
         method_kwargs = {'instance': instance,
                          'expected_vm_state': expected_vm_state,
@@ -1726,12 +1715,15 @@ class MessageRunner(object):
         """Start an instance in its cell."""
         self._instance_action(ctxt, instance, 'start_instance')
 
-    def stop_instance(self, ctxt, instance, do_cast=True):
+    def stop_instance(self, ctxt, instance, do_cast=True, clean_shutdown=True):
         """Stop an instance in its cell."""
+        extra_kwargs = dict(clean_shutdown=clean_shutdown)
         if do_cast:
-            self._instance_action(ctxt, instance, 'stop_instance')
+            self._instance_action(ctxt, instance, 'stop_instance',
+                                  extra_kwargs=extra_kwargs)
         else:
             return self._instance_action(ctxt, instance, 'stop_instance',
+                                         extra_kwargs=extra_kwargs,
                                          need_response=True)
 
     def reboot_instance(self, ctxt, instance, reboot_type):
@@ -1763,10 +1755,12 @@ class MessageRunner(object):
         self._instance_action(ctxt, instance, 'unpause_instance')
 
     def resize_instance(self, ctxt, instance, flavor,
-                       extra_instance_updates):
+                       extra_instance_updates,
+                       clean_shutdown=True):
         """Resize an instance in its cell."""
         extra_kwargs = dict(flavor=flavor,
-                            extra_instance_updates=extra_instance_updates)
+                            extra_instance_updates=extra_instance_updates,
+                            clean_shutdown=clean_shutdown)
         self._instance_action(ctxt, instance, 'resize_instance',
                               extra_kwargs=extra_kwargs)
 
@@ -1832,13 +1826,15 @@ class Response(object):
     """Holds a response from a cell.  If there was a failure, 'failure'
     will be True and 'response' will contain an encoded Exception.
     """
-    def __init__(self, cell_name, value, failure):
+    def __init__(self, ctxt, cell_name, value, failure):
         self.failure = failure
         self.cell_name = cell_name
         self.value = value
+        self.ctxt = ctxt
+        self.serializer = objects_base.NovaObjectSerializer()
 
     def to_json(self):
-        resp_value = self.value
+        resp_value = self.serializer.serialize_entity(self.ctxt, self.value)
         if self.failure:
             resp_value = serialize_remote_exception(resp_value,
                                                     log_failure=False)
@@ -1848,13 +1844,16 @@ class Response(object):
         return jsonutils.dumps(_dict)
 
     @classmethod
-    def from_json(cls, json_message):
+    def from_json(cls, ctxt, json_message):
         _dict = jsonutils.loads(json_message)
         if _dict['failure']:
             resp_value = deserialize_remote_exception(_dict['value'],
                                                       rpc.get_allowed_exmods())
             _dict['value'] = resp_value
-        return cls(**_dict)
+        response = cls(ctxt, **_dict)
+        response.value = response.serializer.deserialize_entity(
+            response.ctxt, response.value)
+        return response
 
     def value_or_raise(self):
         if self.failure:

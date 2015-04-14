@@ -21,19 +21,20 @@ import datetime
 import functools
 import time
 
-from oslo.config import cfg
-from oslo.db import exception as db_exc
-from oslo.serialization import jsonutils
-from oslo.utils import timeutils
-from oslo.utils import units
+from oslo_config import cfg
+from oslo_db import exception as db_exc
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
+from oslo_utils import units
 
 from nova.cells import rpc_driver
 from nova import context
 from nova.db import base
 from nova import exception
-from nova.i18n import _, _LE
+from nova.i18n import _LE
+from nova import objects
 from nova.openstack.common import fileutils
-from nova.openstack.common import log as logging
 from nova import rpc
 from nova import utils
 
@@ -74,9 +75,8 @@ class CellState(object):
 
     def update_db_info(self, cell_db_info):
         """Update cell credentials from db."""
-        self.db_info = dict(
-                [(k, v) for k, v in cell_db_info.iteritems()
-                        if k != 'name'])
+        self.db_info = {k: v for k, v in cell_db_info.iteritems()
+                        if k != 'name'}
 
     def update_capabilities(self, cell_metadata):
         """Update cell capabilities for a cell."""
@@ -172,11 +172,11 @@ class CellStateManager(base.Base):
             try:
                 self._cell_data_sync(force=True)
                 break
-            except db_exc.DBError as e:
+            except db_exc.DBError:
                 attempts += 1
                 if attempts > 120:
                     raise
-                LOG.exception(_('DB error: %s') % e)
+                LOG.exception(_LE('DB error'))
                 time.sleep(30)
 
         my_cell_capabs = {}
@@ -262,12 +262,17 @@ class CellStateManager(base.Base):
         compute_hosts = {}
 
         def _get_compute_hosts():
-            compute_nodes = self.db.compute_node_get_all(ctxt)
+            service_refs = {service.host: service
+                            for service in objects.ServiceList.get_by_binary(
+                                ctxt, 'nova-compute')}
+
+            compute_nodes = objects.ComputeNodeList.get_all(ctxt)
             for compute in compute_nodes:
-                service = compute['service']
+                host = compute.host
+                service = service_refs.get(host)
                 if not service or service['disabled']:
                     continue
-                host = service['host']
+
                 compute_hosts[host] = {
                         'free_ram_mb': compute['free_ram_mb'],
                         'free_disk_mb': compute['free_disk_gb'] * 1024,
@@ -440,7 +445,7 @@ class CellStateManagerDB(CellStateManager):
             self.last_cell_db_check = timeutils.utcnow()
             ctxt = context.get_admin_context()
             db_cells = self.db.cell_get_all(ctxt)
-            db_cells_dict = dict((cell['name'], cell) for cell in db_cells)
+            db_cells_dict = {cell['name']: cell for cell in db_cells}
             self._refresh_cells_from_dict(db_cells_dict)
             self._update_our_capacity(ctxt)
 

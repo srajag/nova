@@ -26,13 +26,13 @@ from nova import compute
 from nova import exception
 
 ALIAS = "os-create-backup"
-authorize = extensions.extension_authorizer('compute', "v3:" + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class CreateBackupController(wsgi.Controller):
     def __init__(self, *args, **kwargs):
         super(CreateBackupController, self).__init__(*args, **kwargs)
-        self.compute_api = compute.API()
+        self.compute_api = compute.API(skip_policy_check=True)
 
     @extensions.expected_errors((400, 403, 404, 409))
     @wsgi.action('createBackup')
@@ -61,8 +61,7 @@ class CreateBackupController(wsgi.Controller):
         common.check_img_metadata_properties_quota(context, metadata)
         props.update(metadata)
 
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
 
         try:
             image = self.compute_api.backup(context, instance, image_name,
@@ -70,6 +69,8 @@ class CreateBackupController(wsgi.Controller):
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'createBackup', id)
+        except exception.InvalidRequest as e:
+            raise webob.exc.HTTPBadRequest(explanation=e.format_message())
 
         resp = webob.Response(status_int=202)
 

@@ -20,21 +20,20 @@ the system.
 
 import datetime
 
-from oslo.config import cfg
-from oslo.utils import excutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_context import context as common_context
+from oslo_log import log
+from oslo_utils import excutils
+from oslo_utils import timeutils
 import six
 
-from nova.compute import flavors
 import nova.context
-from nova import db
-from nova.i18n import _
+from nova.i18n import _LE
 from nova.image import glance
 from nova import network
 from nova.network import model as network_model
+from nova import objects
 from nova.objects import base as obj_base
-from nova.openstack.common import context as common_context
-from nova.openstack.common import log
 from nova import rpc
 from nova import utils
 
@@ -66,8 +65,8 @@ def notify_decorator(name, fn):
     """Decorator for notify which is used from utils.monkey_patch().
 
         :param name: name of the function
-        :param function: - object of the function
-        :returns: function -- decorated function
+        :param fn: - object of the function
+        :returns: fn -- decorated function
 
     """
     def wrapped_func(*args, **kwarg):
@@ -82,7 +81,8 @@ def notify_decorator(name, fn):
         ctxt = common_context.get_context_from_function_and_args(
             fn, args, kwarg)
 
-        notifier = rpc.get_notifier(publisher_id=(CONF.default_publisher_id
+        notifier = rpc.get_notifier('api',
+                                    publisher_id=(CONF.default_publisher_id
                                                   or CONF.host))
         method = notifier.getattr(CONF.default_notification_level.lower(),
                                   'info')
@@ -101,10 +101,14 @@ def send_api_fault(url, status, exception):
     payload = {'url': url, 'exception': six.text_type(exception),
                'status': status}
 
-    rpc.get_notifier('api').error(None, 'api.fault', payload)
+    rpc.get_notifier('api').error(common_context.get_current() or
+                                  nova.context.get_admin_context(),
+                                  'api.fault',
+                                  payload)
 
 
-def send_update(context, old_instance, new_instance, service=None, host=None):
+def send_update(context, old_instance, new_instance, service="compute",
+                host=None):
     """Send compute.instance.update notification to report any changes occurred
     in that instance
     """
@@ -146,7 +150,7 @@ def send_update(context, old_instance, new_instance, service=None, host=None):
                     service=service, host=host,
                     old_display_name=old_display_name)
         except Exception:
-            LOG.exception(_("Failed to send state update notification"),
+            LOG.exception(_LE("Failed to send state update notification"),
                     instance=new_instance)
 
 
@@ -185,7 +189,7 @@ def send_update_with_states(context, instance, old_vm_state, new_vm_state,
                     new_vm_state=new_vm_state, new_task_state=new_task_state,
                     service=service, host=host)
         except Exception:
-            LOG.exception(_("Failed to send state update notification"),
+            LOG.exception(_LE("Failed to send state update notification"),
                     instance=instance)
 
 
@@ -289,7 +293,7 @@ def bandwidth_usage(instance_ref, audit_start,
         except Exception:
             try:
                 with excutils.save_and_reraise_exception():
-                    LOG.exception(_('Failed to get nw_info'),
+                    LOG.exception(_LE('Failed to get nw_info'),
                                   instance=instance_ref)
             except Exception:
                 if ignore_missing_network_data:
@@ -307,19 +311,19 @@ def bandwidth_usage(instance_ref, audit_start,
     macs = [vif['address'] for vif in nw_info]
     uuids = [instance_ref["uuid"]]
 
-    bw_usages = db.bw_usage_get_by_uuids(admin_context, uuids, audit_start)
-    bw_usages = [b for b in bw_usages if b.mac in macs]
-
+    bw_usages = objects.BandwidthUsageList.get_by_uuids(admin_context, uuids,
+                                                        audit_start)
     bw = {}
 
     for b in bw_usages:
-        label = 'net-name-not-found-%s' % b['mac']
-        for vif in nw_info:
-            if vif['address'] == b['mac']:
-                label = vif['network']['label']
-                break
+        if b.mac in macs:
+            label = 'net-name-not-found-%s' % b.mac
+            for vif in nw_info:
+                if vif['address'] == b.mac:
+                    label = vif['network']['label']
+                    break
 
-        bw[label] = dict(bw_in=b.bw_in, bw_out=b.bw_out)
+            bw[label] = dict(bw_in=b.bw_in, bw_out=b.bw_out)
 
     return bw
 
@@ -336,11 +340,12 @@ def image_meta(system_metadata):
     return image_meta
 
 
-def info_from_instance(context, instance_ref, network_info,
+def info_from_instance(context, instance, network_info,
                 system_metadata, **kw):
     """Get detailed instance information for an instance which is common to all
     notifications.
 
+    :param:instance: nova.objects.Instance
     :param:network_info: network_info provided if not None
     :param:system_metadata: system_metadata DB entries for the instance,
     if not None
@@ -364,71 +369,68 @@ def info_from_instance(context, instance_ref, network_info,
         else:
             return str(s) if s else ''
 
-    image_ref_url = glance.generate_image_url(instance_ref['image_ref'])
+    image_ref_url = glance.generate_image_url(instance.image_ref)
 
-    instance_type = flavors.extract_flavor(instance_ref)
+    instance_type = instance.get_flavor()
     instance_type_name = instance_type.get('name', '')
     instance_flavorid = instance_type.get('flavorid', '')
 
-    if system_metadata is None:
-        system_metadata = utils.instance_sys_meta(instance_ref)
-
     instance_info = dict(
         # Owner properties
-        tenant_id=instance_ref['project_id'],
-        user_id=instance_ref['user_id'],
+        tenant_id=instance.project_id,
+        user_id=instance.user_id,
 
         # Identity properties
-        instance_id=instance_ref['uuid'],
-        display_name=instance_ref['display_name'],
-        reservation_id=instance_ref['reservation_id'],
-        hostname=instance_ref['hostname'],
+        instance_id=instance.uuid,
+        display_name=instance.display_name,
+        reservation_id=instance.reservation_id,
+        hostname=instance.hostname,
 
         # Type properties
         instance_type=instance_type_name,
-        instance_type_id=instance_ref['instance_type_id'],
+        instance_type_id=instance.instance_type_id,
         instance_flavor_id=instance_flavorid,
-        architecture=instance_ref['architecture'],
+        architecture=instance.architecture,
 
         # Capacity properties
-        memory_mb=instance_ref['memory_mb'],
-        disk_gb=instance_ref['root_gb'] + instance_ref['ephemeral_gb'],
-        vcpus=instance_ref['vcpus'],
+        memory_mb=instance.memory_mb,
+        disk_gb=instance.root_gb + instance.ephemeral_gb,
+        vcpus=instance.vcpus,
         # Note(dhellmann): This makes the disk_gb value redundant, but
         # we are keeping it for backwards-compatibility with existing
         # users of notifications.
-        root_gb=instance_ref['root_gb'],
-        ephemeral_gb=instance_ref['ephemeral_gb'],
+        root_gb=instance.root_gb,
+        ephemeral_gb=instance.ephemeral_gb,
 
         # Location properties
-        host=instance_ref['host'],
-        node=instance_ref['node'],
-        availability_zone=instance_ref['availability_zone'],
-        cell_name=null_safe_str(instance_ref['cell_name']),
+        host=instance.host,
+        node=instance.node,
+        availability_zone=instance.availability_zone,
+        cell_name=null_safe_str(instance.cell_name),
 
         # Date properties
-        created_at=str(instance_ref['created_at']),
+        created_at=str(instance.created_at),
         # Terminated and Deleted are slightly different (although being
         # terminated and not deleted is a transient state), so include
         # both and let the recipient decide which they want to use.
-        terminated_at=null_safe_isotime(instance_ref.get('terminated_at')),
-        deleted_at=null_safe_isotime(instance_ref.get('deleted_at')),
-        launched_at=null_safe_isotime(instance_ref.get('launched_at')),
+        terminated_at=null_safe_isotime(instance.get('terminated_at', None)),
+        deleted_at=null_safe_isotime(instance.get('deleted_at', None)),
+        launched_at=null_safe_isotime(instance.get('launched_at', None)),
 
         # Image properties
         image_ref_url=image_ref_url,
-        os_type=instance_ref['os_type'],
-        kernel_id=instance_ref['kernel_id'],
-        ramdisk_id=instance_ref['ramdisk_id'],
+        os_type=instance.os_type,
+        kernel_id=instance.kernel_id,
+        ramdisk_id=instance.ramdisk_id,
 
         # Status properties
-        state=instance_ref['vm_state'],
-        state_description=null_safe_str(instance_ref.get('task_state')),
-        progress=null_safe_int(instance_ref['progress']),
+        state=instance.vm_state,
+        state_description=null_safe_str(instance.task_state),
+        progress=null_safe_int(instance.progress),
 
         # accessIPs
-        access_ip_v4=instance_ref['access_ip_v4'],
-        access_ip_v6=instance_ref['access_ip_v6'],
+        access_ip_v4=instance.access_ip_v4,
+        access_ip_v6=instance.access_ip_v6,
         )
 
     if network_info is not None:
@@ -441,11 +443,11 @@ def info_from_instance(context, instance_ref, network_info,
         instance_info['fixed_ips'] = fixed_ips
 
     # add image metadata
-    image_meta_props = image_meta(system_metadata)
+    image_meta_props = image_meta(instance.system_metadata)
     instance_info["image_meta"] = image_meta_props
 
     # add instance metadata
-    instance_info['metadata'] = utils.instance_meta(instance_ref)
+    instance_info['metadata'] = instance.metadata
 
     instance_info.update(kw)
     return instance_info

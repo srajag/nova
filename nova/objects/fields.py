@@ -15,9 +15,10 @@
 import abc
 import datetime
 
+import copy
 import iso8601
 import netaddr
-from oslo.utils import timeutils
+from oslo_utils import timeutils
 import six
 
 from nova.i18n import _
@@ -46,7 +47,8 @@ class ElementTypeError(TypeError):
                    })
 
 
-class AbstractFieldType(six.with_metaclass(abc.ABCMeta, object)):
+@six.add_metaclass(abc.ABCMeta)
+class AbstractFieldType(object):
     @abc.abstractmethod
     def coerce(self, obj, attr, value):
         """This is called to coerce (if possible) a value on assignment.
@@ -160,7 +162,7 @@ class Field(object):
             # NOTE(danms): We coerce the default value each time the field
             # is set to None as our contract states that we'll let the type
             # examine the object and attribute name at that time.
-            return self._type.coerce(obj, attr, self._default)
+            return self._type.coerce(obj, attr, copy.deepcopy(self._default))
         else:
             raise ValueError(_("Field `%s' cannot be None") % attr)
 
@@ -249,6 +251,31 @@ class String(FieldType):
     @staticmethod
     def stringify(value):
         return '\'%s\'' % value
+
+
+class Enum(String):
+    def __init__(self, valid_values, **kwargs):
+        try:
+            length = len(valid_values)
+        except TypeError:
+            raise ValueError('valid_values is not a sequence'
+                             ' of permitted values')
+        if length == 0:
+            raise ValueError('valid_values may not be empty')
+        self._valid_values = valid_values
+        super(Enum, self).__init__(**kwargs)
+
+    def coerce(self, obj, attr, value):
+        if value not in self._valid_values:
+            msg = _("Field value %s is invalid") % value
+            raise ValueError(msg)
+        return super(Enum, self).coerce(obj, attr, value)
+
+    def stringify(self, value):
+        if value not in self._valid_values:
+            msg = _("Field value %s is invalid") % value
+            raise ValueError(msg)
+        return super(Enum, self).stringify(value)
 
 
 class UUID(FieldType):
@@ -434,6 +461,38 @@ class Dict(CompoundFieldType):
                       for key, val in sorted(value.items())]))
 
 
+class DictProxyField(object):
+    """Descriptor allowing us to assign pinning data as a dict of key_types
+
+    This allows us to have an object field that will be a dict of key_type
+    keys, allowing that will convert back to string-keyed dict.
+
+    This will take care of the conversion while the dict field will make sure
+    that we store the raw json-serializable data on the object.
+
+    key_type should return a type that unambiguously responds to six.text_type
+    so that calling key_type on it yields the same thing.
+    """
+    def __init__(self, dict_field_name, key_type=int):
+        self._fld_name = dict_field_name
+        self._key_type = key_type
+
+    def __get__(self, obj, obj_type=None):
+        if obj is None:
+            return self
+        if getattr(obj, self._fld_name) is None:
+            return
+        return {self._key_type(k): v
+                for k, v in six.iteritems(getattr(obj, self._fld_name))}
+
+    def __set__(self, obj, val):
+        if val is None:
+            setattr(obj, self._fld_name, val)
+        else:
+            setattr(obj, self._fld_name, {six.text_type(k): v
+                                          for k, v in six.iteritems(val)})
+
+
 class Set(CompoundFieldType):
     def coerce(self, obj, attr, value):
         if not isinstance(value, set):
@@ -539,6 +598,24 @@ class StringField(AutoTypedField):
     AUTO_TYPE = String()
 
 
+class EnumField(AutoTypedField):
+    def __init__(self, valid_values, **kwargs):
+        self.AUTO_TYPE = Enum(valid_values=valid_values)
+        super(EnumField, self).__init__(**kwargs)
+
+    def __repr__(self):
+        valid_values = self._type._valid_values
+        args = {
+            'nullable': self._nullable,
+            'default': self._default,
+            }
+        if valid_values:
+            args.update({'valid_values': valid_values})
+        return '%s(%s)' % (self._type.__class__.__name__,
+                           ','.join(['%s=%s' % (k, v)
+                                     for k, v in args.items()]))
+
+
 class UUIDField(AutoTypedField):
     AUTO_TYPE = UUID()
 
@@ -595,12 +672,38 @@ class DictOfNullableStringsField(AutoTypedField):
     AUTO_TYPE = Dict(String(), nullable=True)
 
 
+class DictOfIntegersField(AutoTypedField):
+    AUTO_TYPE = Dict(Integer())
+
+
 class ListOfStringsField(AutoTypedField):
     AUTO_TYPE = List(String())
 
 
+class ListOfEnumField(AutoTypedField):
+    def __init__(self, valid_values, **kwargs):
+        self.AUTO_TYPE = List(Enum(valid_values=valid_values))
+        super(ListOfEnumField, self).__init__(**kwargs)
+
+    def __repr__(self):
+        valid_values = self._type._element_type._type._valid_values
+        args = {
+            'nullable': self._nullable,
+            'default': self._default,
+            }
+        if valid_values:
+            args.update({'valid_values': valid_values})
+        return '%s(%s)' % (self._type.__class__.__name__,
+                           ','.join(['%s=%s' % (k, v)
+                                     for k, v in args.items()]))
+
+
 class SetOfIntegersField(AutoTypedField):
     AUTO_TYPE = Set(Integer())
+
+
+class ListOfSetsOfIntegersField(AutoTypedField):
+    AUTO_TYPE = List(Set(Integer()))
 
 
 class ListOfDictOfNullableStringsField(AutoTypedField):

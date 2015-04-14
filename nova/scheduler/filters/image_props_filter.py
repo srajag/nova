@@ -16,10 +16,11 @@
 #    under the License.
 from distutils import versionpredicate
 
+from oslo_log import log as logging
+
 from nova.compute import arch
-from nova.compute import hvtype
+from nova.compute import hv_type
 from nova.compute import vm_mode
-from nova.openstack.common import log as logging
 from nova.scheduler import filters
 from nova import utils
 
@@ -47,7 +48,7 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
         img_vm_mode = image_props.get('vm_mode', None)
         checked_img_props = (
             arch.canonicalize(img_arch),
-            hvtype.canonicalize(img_h_type),
+            hv_type.canonicalize(img_h_type),
             vm_mode.canonicalize(img_vm_mode)
         )
 

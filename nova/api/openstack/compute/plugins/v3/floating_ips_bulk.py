@@ -13,12 +13,13 @@
 #    under the License.
 
 import netaddr
-from oslo.config import cfg
+from oslo_config import cfg
 import six
 import webob.exc
 
 from nova.api.openstack.compute.schemas.v3 import floating_ips_bulk
 from nova.api.openstack import extensions
+from nova.api.openstack import wsgi
 from nova.api import validation
 from nova import exception
 from nova.i18n import _
@@ -30,10 +31,10 @@ CONF.import_opt('public_interface', 'nova.network.linux_net')
 
 
 ALIAS = 'os-floating-ips-bulk'
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
-class FloatingIPBulkController(object):
+class FloatingIPBulkController(wsgi.Controller):
 
     @extensions.expected_errors(404)
     def index(self, req):
@@ -68,19 +69,22 @@ class FloatingIPBulkController(object):
 
         for floating_ip in floating_ips:
             instance_uuid = None
+            fixed_ip = None
             if floating_ip.fixed_ip:
                 instance_uuid = floating_ip.fixed_ip.instance_uuid
+                fixed_ip = str(floating_ip.fixed_ip.address)
 
-            result = {'address': str(floating_ip['address']),
-                      'pool': floating_ip['pool'],
-                      'interface': floating_ip['interface'],
-                      'project_id': floating_ip['project_id'],
-                      'instance_uuid': instance_uuid}
+            result = {'address': str(floating_ip.address),
+                      'pool': floating_ip.pool,
+                      'interface': floating_ip.interface,
+                      'project_id': floating_ip.project_id,
+                      'instance_uuid': instance_uuid,
+                      'fixed_ip': fixed_ip}
             floating_ip_info['floating_ip_info'].append(result)
 
         return floating_ip_info
 
-    @extensions.expected_errors(400)
+    @extensions.expected_errors((400, 409))
     @validation.schema(floating_ips_bulk.create)
     def create(self, req, body):
         """Bulk create floating ips."""
@@ -102,7 +106,7 @@ class FloatingIPBulkController(object):
         try:
             objects.FloatingIPList.create(context, ips)
         except exception.FloatingIpExists as exc:
-            raise webob.exc.HTTPBadRequest(explanation=exc.format_message())
+            raise webob.exc.HTTPConflict(explanation=exc.format_message())
 
         return {"floating_ips_bulk_create": {"ip_range": ip_range,
                                                "pool": pool,

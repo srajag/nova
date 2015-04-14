@@ -14,27 +14,42 @@
 
 """Bench of utility methods used by filters."""
 
+import collections
+
+from oslo_log import log as logging
+import six
 
 from nova.i18n import _LI
-from nova.objects import aggregate
-from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
 
-def aggregate_values_from_db(context, host, key_name):
+def aggregate_values_from_key(host_state, key_name):
     """Returns a set of values based on a metadata key for a specific host."""
-    # TODO(sahid): DB query in filter is a performance hit, especially for
-    # system with lots of hosts. Will need a general solution here to fix
-    # all filters with aggregate DB call things.
-    aggrlist = aggregate.AggregateList.get_by_host(
-        context.elevated(), host, key=key_name)
-    aggregate_vals = set(aggr.metadata[key_name] for aggr in aggrlist)
+    aggrlist = host_state.aggregates
+    aggregate_vals = set()
+    for aggr in aggrlist:
+        if key_name in aggr.metadata:
+            aggregate_vals.add(aggr.metadata[key_name])
     return aggregate_vals
 
 
+def aggregate_metadata_get_by_host(host_state, key=None):
+    """Returns a dict of all metadata for a specific host."""
+    aggrlist = host_state.aggregates
+    metadata = collections.defaultdict(set)
+    for aggr in aggrlist:
+        if key is not None and key not in aggr.metadata:
+            continue
+        for k, v in aggr.metadata.iteritems():
+            values = v.split(',')
+            for value in values:
+                metadata[k].add(value.strip())
+    return metadata
+
+
 def validate_num_values(vals, default=None, cast_to=int, based_on=min):
-    """Returns a corretly casted value based on a set of values.
+    """Returns a correctly casted value based on a set of values.
 
     This method is useful to work with per-aggregate filters, It takes
     a set of values then return the 'based_on'{min/max} converted to
@@ -51,4 +66,31 @@ def validate_num_values(vals, default=None, cast_to=int, based_on=min):
                      "of which the minimum value will be used."),
                  {'num_values': num_values})
 
-    return cast_to(based_on(vals))
+    return based_on([cast_to(val) for val in vals])
+
+
+def instance_uuids_overlap(host_state, uuids):
+    """Tests for overlap between a host_state and a list of uuids.
+
+    Returns True if any of the supplied uuids match any of the instance.uuid
+    values in the host_state.
+    """
+    if isinstance(uuids, six.string_types):
+        uuids = [uuids]
+    set_uuids = set(uuids)
+    # host_state.instances is a dict whose keys are the instance uuids
+    host_uuids = set(host_state.instances.keys())
+    return bool(host_uuids.intersection(set_uuids))
+
+
+def other_types_on_host(host_state, instance_type_id):
+    """Tests for overlap between a host_state's instances and an
+    instance_type_id.
+
+    Returns True if there are any instances in the host_state whose
+    instance_type_id is different than the supplied instance_type_id value.
+    """
+    host_instances = host_state.instances.values()
+    host_types = set([inst.instance_type_id for inst in host_instances])
+    inst_set = set([instance_type_id])
+    return bool(host_types - inst_set)

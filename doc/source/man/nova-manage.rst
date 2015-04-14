@@ -44,11 +44,30 @@ Nova Db
 
 ``nova-manage db version``
 
-    Print the current database version.
+    Print the current main database version.
 
 ``nova-manage db sync``
 
-    Sync the database up to the most recent version. This is the standard way to create the db as well.
+    Sync the main database up to the most recent version. This is the standard way to create the db as well.
+
+``nova-manage db archive_deleted_rows [--max_rows <number>]``
+
+    Move deleted rows from production tables to shadow tables.
+
+``nova-manage db null_instance_uuid_scan [--delete]``
+
+    Lists and optionally deletes database records where instance_uuid is NULL.
+
+Nova ApiDb
+~~~~~~~~~~
+
+``nova-manage api_db version``
+
+    Print the current cells api database version.
+
+``nova-manage api_db sync``
+
+    Sync the api cells database up to the most recent version. This is the standard way to create the db as well.
 
 Nova Logs
 ~~~~~~~~~

@@ -30,8 +30,7 @@ from nova import network
 
 
 ALIAS = 'os-attach-interfaces'
-authorize = extensions.extension_authorizer('compute',
-                                            'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 def _translate_interface_attachment_view(port_info):
@@ -45,12 +44,12 @@ def _translate_interface_attachment_view(port_info):
         }
 
 
-class InterfaceAttachmentController(object):
+class InterfaceAttachmentController(wsgi.Controller):
     """The interface attachment API controller for the OpenStack API."""
 
     def __init__(self):
-        self.compute_api = compute.API()
-        self.network_api = network.API()
+        self.compute_api = compute.API(skip_policy_check=True)
+        self.network_api = network.API(skip_policy_check=True)
         super(InterfaceAttachmentController, self).__init__()
 
     @extensions.expected_errors((404, 501))
@@ -73,7 +72,7 @@ class InterfaceAttachmentController(object):
 
         try:
             port_info = self.network_api.show_port(context, port_id)
-        except exception.NotFound as e:
+        except exception.PortNotFound as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
         except exception.Forbidden as e:
             raise exc.HTTPForbidden(explanation=e.format_message())
@@ -112,22 +111,25 @@ class InterfaceAttachmentController(object):
             msg = _("Must input network_id when request IP address")
             raise exc.HTTPBadRequest(explanation=msg)
 
-        instance = common.get_instance(self.compute_api, context,
-                                       server_id, want_objects=True)
+        instance = common.get_instance(self.compute_api, context, server_id)
         try:
             vif = self.compute_api.attach_interface(context,
                 instance, network_id, port_id, req_ip)
-        except (exception.PortNotFound,
-                exception.FixedIpAlreadyInUse,
-                exception.PortInUse,
-                exception.NetworkDuplicated,
+        except (exception.NetworkDuplicated,
                 exception.NetworkAmbiguous,
-                exception.NetworkNotFound) as e:
+                exception.NoMoreFixedIps,
+                exception.PortNotUsable) as e:
             raise exc.HTTPBadRequest(explanation=e.format_message())
-        except exception.InstanceIsLocked as e:
+        except (exception.InstanceIsLocked,
+                exception.FixedIpAlreadyInUse,
+                exception.PortInUse) as e:
             raise exc.HTTPConflict(explanation=e.format_message())
-        except NotImplementedError as e:
-            raise webob.exc.HTTPNotImplemented(explanation=e.format_message())
+        except (exception.PortNotFound,
+                exception.NetworkNotFound) as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
+        except NotImplementedError:
+            msg = _("The requested functionality is not supported.")
+            raise webob.exc.HTTPNotImplemented(explanation=msg)
         except exception.InterfaceAttachFailed as e:
             raise webob.exc.HTTPInternalServerError(
                 explanation=e.format_message())
@@ -145,8 +147,7 @@ class InterfaceAttachmentController(object):
         authorize(context)
         port_id = id
 
-        instance = common.get_instance(self.compute_api, context, server_id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, server_id)
         try:
             self.compute_api.detach_interface(context,
                 instance, port_id=port_id)
@@ -154,8 +155,9 @@ class InterfaceAttachmentController(object):
             raise exc.HTTPNotFound(explanation=e.format_message())
         except exception.InstanceIsLocked as e:
             raise exc.HTTPConflict(explanation=e.format_message())
-        except NotImplementedError as e:
-            raise webob.exc.HTTPNotImplemented(explanation=e.format_message())
+        except NotImplementedError:
+            msg = _("The requested functionality is not supported.")
+            raise webob.exc.HTTPNotImplemented(explanation=msg)
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'detach_interface', server_id)
@@ -165,8 +167,7 @@ class InterfaceAttachmentController(object):
         context = req.environ['nova.context']
         authorize(context)
 
-        instance = common.get_instance(self.compute_api, context, server_id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, server_id)
         results = []
         search_opts = {'device_id': instance.uuid}
 

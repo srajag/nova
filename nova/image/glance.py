@@ -25,65 +25,51 @@ import time
 
 import glanceclient
 import glanceclient.exc
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import netutils
+from oslo_utils import timeutils
 import six
 import six.moves.urllib.parse as urlparse
 
 from nova import exception
 from nova.i18n import _, _LE
 import nova.image.download as image_xfers
-from nova.openstack.common import log as logging
-from nova import utils
 
 
 glance_opts = [
     cfg.StrOpt('host',
                default='$my_ip',
-               help='Default glance hostname or IP address',
-               deprecated_group='DEFAULT',
-               deprecated_name='glance_host'),
+               help='Default glance hostname or IP address'),
     cfg.IntOpt('port',
                default=9292,
-               help='Default glance port',
-               deprecated_group='DEFAULT',
-               deprecated_name='glance_port'),
+               help='Default glance port'),
     cfg.StrOpt('protocol',
                 default='http',
                 help='Default protocol to use when connecting to glance. '
-                     'Set to https for SSL.',
-               deprecated_group='DEFAULT',
-               deprecated_name='glance_protocol'),
+                     'Set to https for SSL.'),
     cfg.ListOpt('api_servers',
                 help='A list of the glance api servers available to nova. '
                      'Prefix with https:// for ssl-based glance api servers. '
-                     '([hostname|ip]:port)',
-               deprecated_group='DEFAULT',
-               deprecated_name='glance_api_servers'),
+                     '([hostname|ip]:port)'),
     cfg.BoolOpt('api_insecure',
                 default=False,
                 help='Allow to perform insecure SSL (https) requests to '
-                     'glance',
-               deprecated_group='DEFAULT',
-               deprecated_name='glance_api_insecure'),
+                     'glance'),
     cfg.IntOpt('num_retries',
                default=0,
                help='Number of retries when uploading / downloading an image '
-                    'to / from glance.',
-               deprecated_group='DEFAULT',
-               deprecated_name='glance_num_retries'),
+                    'to / from glance.'),
     cfg.ListOpt('allowed_direct_url_schemes',
                 default=[],
                 help='A list of url scheme that can be downloaded directly '
                      'via the direct_url.  Currently supported schemes: '
-                     '[file].',
-               deprecated_group='DEFAULT'),
+                     '[file].'),
     ]
 
 LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
-# glance_opts options in the DEFAULT group were deprecated in Juno
 CONF.register_opts(glance_opts, 'glance')
 CONF.import_opt('auth_strategy', 'nova.api.auth')
 CONF.import_opt('my_ip', 'nova.netconf')
@@ -93,7 +79,7 @@ CONF.import_group('ssl', 'nova.openstack.common.sslutils')
 def generate_glance_url():
     """Generate the URL to glance."""
     glance_host = CONF.glance.host
-    if utils.is_valid_ipv6(glance_host):
+    if netutils.is_valid_ipv6(glance_host):
         glance_host = '[%s]' % glance_host
     return "%s://%s:%d" % (CONF.glance.protocol, glance_host,
                            CONF.glance.port)
@@ -154,7 +140,7 @@ def _create_glance_client(context, host, port, use_ssl, version=1):
         # header 'X-Auth-Token' and 'token'
         params['token'] = context.auth_token
         params['identity_headers'] = generate_identity_headers(context)
-    if utils.is_valid_ipv6(host):
+    if netutils.is_valid_ipv6(host):
         # if so, it is ipv6 address, need to wrap it with '[]'
         host = '[%s]' % host
     endpoint = '%s://%s:%s' % (scheme, host, port)
@@ -357,8 +343,8 @@ class GlanceImageService(object):
                                 "using %s") % o.scheme
                         LOG.info(msg)
                         return
-                    except Exception as ex:
-                        LOG.exception(ex)
+                    except Exception:
+                        LOG.exception(_LE("Download image error"))
 
         try:
             image_chunks = self._client.call(context, 1, 'data', image_id)

@@ -23,36 +23,34 @@ from nova.api.openstack import wsgi
 from nova.i18n import _
 
 ALIAS = 'ips'
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class IPsController(wsgi.Controller):
     """The servers addresses API controller for the OpenStack API."""
-
-    _view_builder_class = views_addresses.ViewBuilderV3
+    # Note(gmann): here using V2 view builder instead of V3 to have V2.1
+    # server ips response same as V2 which does not include "OS-EXT-IPS:type"
+    # & "OS-EXT-IPS-MAC:mac_addr". If needed those can be added with
+    # microversion by using V3 view builder.
+    _view_builder_class = views_addresses.ViewBuilder
 
     def __init__(self, **kwargs):
         super(IPsController, self).__init__(**kwargs)
-        self._compute_api = nova.compute.API()
-
-    def _get_instance(self, context, server_id):
-        try:
-            instance = self._compute_api.get(context, server_id)
-        except nova.exception.NotFound:
-            msg = _("Instance does not exist")
-            raise exc.HTTPNotFound(explanation=msg)
-        return instance
+        self._compute_api = nova.compute.API(skip_policy_check=True)
 
     @extensions.expected_errors(404)
     def index(self, req, server_id):
         context = req.environ["nova.context"]
-        instance = self._get_instance(context, server_id)
+        authorize(context, action='index')
+        instance = common.get_instance(self._compute_api, context, server_id)
         networks = common.get_networks_for_instance(context, instance)
         return self._view_builder.index(networks)
 
     @extensions.expected_errors(404)
     def show(self, req, server_id, id):
         context = req.environ["nova.context"]
-        instance = self._get_instance(context, server_id)
+        authorize(context, action='show')
+        instance = common.get_instance(self._compute_api, context, server_id)
         networks = common.get_networks_for_instance(context, instance)
         if id not in networks:
             msg = _("Instance is not a member of specified network")

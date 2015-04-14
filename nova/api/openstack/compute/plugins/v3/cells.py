@@ -16,18 +16,18 @@
 
 """The cells extension."""
 
-from oslo.config import cfg
-from oslo import messaging
-from oslo.utils import strutils
+from oslo_config import cfg
+import oslo_messaging as messaging
+from oslo_utils import strutils
 import six
 from webob import exc
 
 from nova.api.openstack import common
 from nova.api.openstack.compute.schemas.v3 import cells
 from nova.api.openstack import extensions
+from nova.api.openstack import wsgi
 from nova.api import validation
 from nova.cells import rpcapi as cells_rpcapi
-from nova.compute import api as compute
 from nova import exception
 from nova.i18n import _
 from nova import rpc
@@ -38,14 +38,14 @@ CONF.import_opt('name', 'nova.cells.opts', group='cells')
 CONF.import_opt('capabilities', 'nova.cells.opts', group='cells')
 
 ALIAS = "os-cells"
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 def _filter_keys(item, keys):
     """Filters all model attributes except for keys
     item is a dict
     """
-    return dict((k, v) for k, v in item.iteritems() if k in keys)
+    return {k: v for k, v in item.iteritems() if k in keys}
 
 
 def _fixup_cell_info(cell_info, keys):
@@ -91,11 +91,10 @@ def _scrub_cell(cell, detail=False):
     return cell_info
 
 
-class CellsController(object):
+class CellsController(wsgi.Controller):
     """Controller for Cell resources."""
 
     def __init__(self):
-        self.compute_api = compute.API()
         self.cells_rpcapi = cells_rpcapi.CellsAPI()
 
     def _get_cells(self, ctxt, req, detail=False):
@@ -216,7 +215,8 @@ class CellsController(object):
         if not transport_url.hosts:
             transport_url.hosts.append(messaging.TransportHost())
         transport_host = transport_url.hosts[0]
-
+        if 'rpc_port' in cell:
+            cell['rpc_port'] = int(cell['rpc_port'])
         # Copy over the input fields
         transport_field_map = {
             'username': 'username',

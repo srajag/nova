@@ -16,6 +16,7 @@
 
 from nova.api.openstack.compute.views import limits as limits_views
 from nova.api.openstack import extensions
+from nova.api.openstack import wsgi
 from nova import quota
 
 
@@ -23,7 +24,7 @@ QUOTAS = quota.QUOTAS
 ALIAS = 'limits'
 
 
-class LimitsController(object):
+class LimitsController(wsgi.Controller):
     """Controller for accessing limits in the OpenStack API."""
 
     @extensions.expected_errors(())
@@ -33,7 +34,7 @@ class LimitsController(object):
         project_id = req.params.get('tenant_id', context.project_id)
         quotas = QUOTAS.get_project_quotas(context, project_id,
                                            usages=False)
-        abs_limits = dict((k, v['limit']) for k, v in quotas.items())
+        abs_limits = {k: v['limit'] for k, v in quotas.items()}
         rate_limits = req.environ.get("nova.limits", [])
 
         builder = self._get_view_builder(req)

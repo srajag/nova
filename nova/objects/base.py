@@ -15,35 +15,37 @@
 """Nova common internal object model"""
 
 import collections
+import contextlib
 import copy
 import datetime
 import functools
 import traceback
 
 import netaddr
-from oslo import messaging
-from oslo.utils import timeutils
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_utils import timeutils
 import six
 
 from nova import context
 from nova import exception
 from nova.i18n import _, _LE
 from nova import objects
-from nova.objects import fields
-from nova.openstack.common import log as logging
+from nova.objects import fields as obj_fields
 from nova.openstack.common import versionutils
+from nova import utils
 
 
 LOG = logging.getLogger('object')
 
 
-class NotSpecifiedSentinel:
+class NotSpecifiedSentinel(object):
     pass
 
 
 def get_attrname(name):
     """Return the mangled name of the attribute's underlying storage."""
-    return '_%s' % name
+    return '_' + name
 
 
 def make_class_properties(cls):
@@ -60,7 +62,7 @@ def make_class_properties(cls):
             if name not in cls.fields:
                 cls.fields[name] = field
     for name, field in cls.fields.iteritems():
-        if not isinstance(field, fields.Field):
+        if not isinstance(field, obj_fields.Field):
             raise exception.ObjectFieldInvalid(
                 field=name, objname=cls.obj_name())
 
@@ -89,7 +91,13 @@ def make_class_properties(cls):
                 LOG.exception(_LE('Error setting %(attr)s'), {'attr': attr})
                 raise
 
-        setattr(cls, name, property(getter, setter))
+        def deleter(self, name=name):
+            attrname = get_attrname(name)
+            if not hasattr(self, attrname):
+                raise AttributeError('No such attribute `%s' % name)
+            delattr(self, get_attrname(name))
+
+        setattr(cls, name, property(getter, setter, deleter))
 
 
 class NovaObjectMetaclass(type):
@@ -172,21 +180,16 @@ def remotable(fn):
     """Decorator for remotable object methods."""
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
-        ctxt = self._context
-        try:
-            if isinstance(args[0], (context.RequestContext)):
-                ctxt = args[0]
-                args = args[1:]
-        except IndexError:
-            pass
-        if ctxt is None:
+        if args and isinstance(args[0], context.RequestContext):
+            raise exception.ObjectActionError(
+                action=fn.__name__,
+                reason='Calling remotables with context is deprecated')
+        if self._context is None:
             raise exception.OrphanedObjectError(method=fn.__name__,
                                                 objtype=self.obj_name())
-        # Force this to be set if it wasn't before.
-        self._context = ctxt
         if NovaObject.indirection_api:
             updates, result = NovaObject.indirection_api.object_action(
-                ctxt, self, fn.__name__, args, kwargs)
+                self._context, self, fn.__name__, args, kwargs)
             for key, value in updates.iteritems():
                 if key in self.fields:
                     field = self.fields[key]
@@ -194,14 +197,15 @@ def remotable(fn):
                     # deserialized any object fields into objects already,
                     # we do not try to deserialize them again here.
                     if isinstance(value, NovaObject):
-                        self[key] = value
+                        setattr(self, key, value)
                     else:
-                        self[key] = field.from_primitive(self, key, value)
+                        setattr(self, key,
+                                field.from_primitive(self, key, value))
             self.obj_reset_changes()
             self._changed_fields = set(updates.get('obj_what_changed', []))
             return result
         else:
-            return fn(self, ctxt, *args, **kwargs)
+            return fn(self, *args, **kwargs)
 
     wrapper.remotable = True
     wrapper.original_fn = fn
@@ -225,6 +229,12 @@ class NovaObject(object):
     # a client attempts to call an object method, the server checks to see if
     # the version of that object matches (in a compatible way) its object
     # implementation. If so, cool, and if not, fail.
+    #
+    # This version is allowed to have three parts, X.Y.Z, where the .Z element
+    # is reserved for stable branch backports. The .Z is ignored for the
+    # purposes of triggering a backport, which means anything changed under
+    # a .Z must be additive and non-destructive such that a node that knows
+    # about X.Y can consider X.Y.Z equivalent.
     VERSION = '1.0'
 
     # The fields present in this object as key:field pairs. For example:
@@ -235,11 +245,37 @@ class NovaObject(object):
     fields = {}
     obj_extra_fields = []
 
+    # Table of sub-object versioning information
+    #
+    # This contains a list of version mappings, by the field name of
+    # the subobject. The mappings must be in order of oldest to
+    # newest, and are tuples of (my_version, subobject_version). A
+    # request to backport this object to $my_version will cause the
+    # subobject to be backported to $subobject_version.
+    #
+    # obj_relationships = {
+    #     'subobject1': [('1.2', '1.1'), ('1.4', '1.2')],
+    #     'subobject2': [('1.2', '1.0')],
+    # }
+    #
+    # In the above example:
+    #
+    # - If we are asked to backport our object to version 1.3,
+    #   subobject1 will be backported to version 1.1, since it was
+    #   bumped to version 1.2 when our version was 1.4.
+    # - If we are asked to backport our object to version 1.5,
+    #   no changes will be made to subobject1 or subobject2, since
+    #   they have not changed since version 1.4.
+    # - If we are asked to backlevel our object to version 1.1, we
+    #   will remove both subobject1 and subobject2 from the primitive,
+    #   since they were not added until version 1.2.
+    obj_relationships = {}
+
     def __init__(self, context=None, **kwargs):
         self._changed_fields = set()
         self._context = context
         for key in kwargs.keys():
-            self[key] = kwargs[key]
+            setattr(self, key, kwargs[key])
 
     def __repr__(self):
         return '%s(%s)' % (
@@ -337,6 +373,80 @@ class NovaObject(object):
         """Create a copy."""
         return copy.deepcopy(self)
 
+    def obj_calculate_child_version(self, target_version, child):
+        """Calculate the appropriate version for a child object.
+
+        This is to be used when backporting an object for an older client.
+        A sub-object will need to be backported to a suitable version for
+        the client as well, and this method will calculate what that
+        version should be, based on obj_relationships.
+
+        :param target_version: Version this object is being backported to
+        :param child: The child field for which the appropriate version
+                      is to be calculated
+        :returns: None if the child should be omitted from the backport,
+                  otherwise, the version to which the child should be
+                  backported
+        """
+        target_version = utils.convert_version_to_tuple(target_version)
+        for index, versions in enumerate(self.obj_relationships[child]):
+            my_version, child_version = versions
+            my_version = utils.convert_version_to_tuple(my_version)
+            if target_version < my_version:
+                if index == 0:
+                    # We're backporting to a version from before this
+                    # subobject was added: delete it from the primitive.
+                    return None
+                else:
+                    # We're in the gap between index-1 and index, so
+                    # backport to the older version
+                    return self.obj_relationships[child][index - 1][1]
+            elif target_version == my_version:
+                # This is the first mapping that satisfies the
+                # target_version request: backport the object.
+                return child_version
+        # No need to backport, as far as we know, so return the latest
+        # version of the sub-object we know about
+        return self.obj_relationships[child][-1][1]
+
+    def _obj_make_obj_compatible(self, primitive, target_version, field):
+        """Backlevel a sub-object based on our versioning rules.
+
+        This is responsible for backporting objects contained within
+        this object's primitive according to a set of rules we
+        maintain about version dependencies between objects. This
+        requires that the obj_relationships table in this object is
+        correct and up-to-date.
+
+        :param:primitive: The primitive version of this object
+        :param:target_version: The version string requested for this object
+        :param:field: The name of the field in this object containing the
+                      sub-object to be backported
+        """
+
+        def _do_backport(to_version):
+            obj = getattr(self, field)
+            if obj is None:
+                return
+            if isinstance(obj, NovaObject):
+                if to_version != primitive[field]['nova_object.version']:
+                    obj.obj_make_compatible(
+                        primitive[field]['nova_object.data'],
+                        to_version)
+                primitive[field]['nova_object.version'] = to_version
+            elif isinstance(obj, list):
+                for i, element in enumerate(obj):
+                    element.obj_make_compatible(
+                        primitive[field][i]['nova_object.data'],
+                        to_version)
+                    primitive[field][i]['nova_object.version'] = to_version
+
+        child_version = self.obj_calculate_child_version(target_version, field)
+        if child_version is None:
+            del primitive[field]
+        else:
+            _do_backport(child_version)
+
     def obj_make_compatible(self, primitive, target_version):
         """Make an object representation compatible with a target version.
 
@@ -363,7 +473,19 @@ class NovaObject(object):
         :raises: nova.exception.UnsupportedObjectError if conversion
         is not possible for some reason
         """
-        pass
+        for key, field in self.fields.items():
+            if not isinstance(field, (obj_fields.ObjectField,
+                                      obj_fields.ListOfObjectsField)):
+                continue
+            if not self.obj_attr_is_set(key):
+                continue
+            if key not in self.obj_relationships:
+                # NOTE(danms): This is really a coding error and shouldn't
+                # happen unless we miss something
+                raise exception.ObjectActionError(
+                    action='obj_make_compatible',
+                    reason='No rule for %s' % key)
+            self._obj_make_obj_compatible(primitive, target_version, key)
 
     def obj_to_primitive(self, target_version=None):
         """Simple base-case dehydration.
@@ -385,6 +507,20 @@ class NovaObject(object):
             obj['nova_object.changes'] = list(self.obj_what_changed())
         return obj
 
+    def obj_set_defaults(self, *attrs):
+        if not attrs:
+            attrs = [name for name, field in self.fields.items()
+                     if field.default != obj_fields.UnspecifiedDefault]
+
+        for attr in attrs:
+            default = copy.deepcopy(self.fields[attr].default)
+            if default is obj_fields.UnspecifiedDefault:
+                raise exception.ObjectActionError(
+                    action='set_defaults',
+                    reason='No default set for field %s' % attr)
+            if not self.obj_attr_is_set(attr):
+                setattr(self, attr, default)
+
     def obj_load_attr(self, attrname):
         """Load an additional attribute from the real object.
 
@@ -400,15 +536,15 @@ class NovaObject(object):
         This is optional for subclasses, but is presented here in the base
         class for consistency among those that do.
         """
-        raise NotImplementedError('Cannot save anything in the base class')
+        raise NotImplementedError(_('Cannot save anything in the base class'))
 
     def obj_what_changed(self):
         """Returns a set of fields that have been modified."""
         changes = set(self._changed_fields)
         for field in self.fields:
             if (self.obj_attr_is_set(field) and
-                    isinstance(self[field], NovaObject) and
-                    self[field].obj_what_changed()):
+                    isinstance(getattr(self, field), NovaObject) and
+                    getattr(self, field).obj_what_changed()):
                 changes.add(field)
         return changes
 
@@ -416,14 +552,47 @@ class NovaObject(object):
         """Returns a dict of changed fields and their new values."""
         changes = {}
         for key in self.obj_what_changed():
-            changes[key] = self[key]
+            changes[key] = getattr(self, key)
         return changes
 
-    def obj_reset_changes(self, fields=None):
+    def obj_reset_changes(self, fields=None, recursive=False):
         """Reset the list of fields that have been changed.
 
-        Note that this is NOT "revert to previous values"
+        :param fields: List of fields to reset, or "all" if None.
+        :param recursive: Call obj_reset_changes(recursive=True) on
+                          any sub-objects within the list of fields
+                          being reset.
+
+        NOTE: This is NOT "revert to previous values"
+        NOTE: Specifying fields on recursive resets will only be
+              honored at the top level. Everything below the top
+              will reset all.
         """
+        if recursive:
+            for field in self.obj_get_changes():
+
+                # Ignore fields not in requested set (if applicable)
+                if fields and field not in fields:
+                    continue
+
+                # Skip any fields that are unset
+                if not self.obj_attr_is_set(field):
+                    continue
+
+                value = getattr(self, field)
+
+                # Don't reset nulled fields
+                if value is None:
+                    continue
+
+                # Reset straight Object and ListOfObjects fields
+                if isinstance(self.fields[field], obj_fields.ObjectField):
+                    value.obj_reset_changes(recursive=True)
+                elif isinstance(self.fields[field],
+                                obj_fields.ListOfObjectsField):
+                    for thing in value:
+                        thing.obj_reset_changes(recursive=True)
+
         if fields:
             self._changed_fields -= set(fields)
         else:
@@ -445,6 +614,52 @@ class NovaObject(object):
     @property
     def obj_fields(self):
         return self.fields.keys() + self.obj_extra_fields
+
+    # NOTE(danms): This is nova-specific, so don't copy this to o.vo
+    @contextlib.contextmanager
+    def obj_alternate_context(self, context):
+        original_context = self._context
+        self._context = context
+        try:
+            yield
+        finally:
+            self._context = original_context
+
+    @contextlib.contextmanager
+    def obj_as_admin(self):
+        """Context manager to make an object call as an admin.
+
+        This temporarily modifies the context embedded in an object to
+        be elevated() and restores it after the call completes. Example
+        usage:
+
+           with obj.obj_as_admin():
+               obj.save()
+
+        """
+        if self._context is None:
+            raise exception.OrphanedObjectError(method='obj_as_admin',
+                                                objtype=self.obj_name())
+
+        original_context = self._context
+        self._context = self._context.elevated()
+        try:
+            yield
+        finally:
+            self._context = original_context
+
+
+class NovaObjectDictCompat(object):
+    """Mix-in to provide dictionary key access compat
+
+    If an object needs to support attribute access using
+    dictionary items instead of object attributes, inherit
+    from this class. This should only be used as a temporary
+    measure until all callers are converted to use modern
+    attribute access.
+
+    NOTE(berrange) This class will eventually be deleted.
+    """
 
     # dictish syntactic sugar
     def iteritems(self):
@@ -494,7 +709,7 @@ class NovaObject(object):
         if value != NotSpecifiedSentinel and not self.obj_attr_is_set(key):
             return value
         else:
-            return self[key]
+            return getattr(self, key)
 
     def update(self, updates):
         """For backwards-compatibility with dict-base objects.
@@ -502,18 +717,31 @@ class NovaObject(object):
         NOTE(danms): May be removed in the future.
         """
         for key, value in updates.items():
-            self[key] = value
+            setattr(self, key, value)
+
+
+class NovaTimestampObject(object):
+    """Mixin class for db backed objects with timestamp fields.
+
+    Sqlalchemy models that inherit from the oslo_db TimestampMixin will include
+    these fields and the corresponding objects will benefit from this mixin.
+    """
+    fields = {
+        'created_at': obj_fields.DateTimeField(nullable=True),
+        'updated_at': obj_fields.DateTimeField(nullable=True),
+        }
 
 
 class NovaPersistentObject(object):
     """Mixin class for Persistent objects.
-    This adds the fields that we use in common for all persisent objects.
+
+    This adds the fields that we use in common for most persistent objects.
     """
     fields = {
-        'created_at': fields.DateTimeField(nullable=True),
-        'updated_at': fields.DateTimeField(nullable=True),
-        'deleted_at': fields.DateTimeField(nullable=True),
-        'deleted': fields.BooleanField(default=False),
+        'created_at': obj_fields.DateTimeField(nullable=True),
+        'updated_at': obj_fields.DateTimeField(nullable=True),
+        'deleted_at': obj_fields.DateTimeField(nullable=True),
+        'deleted': obj_fields.BooleanField(default=False),
         }
 
 
@@ -526,7 +754,7 @@ class ObjectListBase(object):
     serialization of the list of objects automatically.
     """
     fields = {
-        'objects': fields.ListOfObjectsField('NovaObject'),
+        'objects': obj_fields.ListOfObjectsField('NovaObject'),
         }
 
     # This is a dictionary of my_version:child_version mappings so that
@@ -611,6 +839,13 @@ class NovaObjectSerializer(messaging.NoOpSerializer):
         try:
             objinst = NovaObject.obj_from_primitive(objprim, context=context)
         except exception.IncompatibleObjectVersion as e:
+            objver = objprim['nova_object.version']
+            if objver.count('.') == 2:
+                # NOTE(danms): For our purposes, the .z part of the version
+                # should be safe to accept without requiring a backport
+                objprim['nova_object.version'] = \
+                    '.'.join(objver.split('.')[:2])
+                return self._process_object(context, objprim)
             objinst = self.conductor.object_backport(context, objprim,
                                                      e.kwargs['supported'])
         return objinst
@@ -625,14 +860,16 @@ class NovaObjectSerializer(messaging.NoOpSerializer):
         """
         iterable = values.__class__
         if issubclass(iterable, dict):
-            return iterable(**dict((k, action_fn(context, v))
-                            for k, v in six.iteritems(values)))
+            return iterable(**{k: action_fn(context, v)
+                            for k, v in six.iteritems(values)})
         else:
-            # NOTE(danms): A set can't have an unhashable value inside, such as
-            # a dict. Convert sets to tuples, which is fine, since we can't
-            # send them over RPC anyway.
+            # NOTE(danms, gibi) A set can't have an unhashable value inside,
+            # such as a dict. Convert the set to list, which is fine, since we
+            # can't send them over RPC anyway. We convert it to list as this
+            # way there will be no semantic change between the fake rpc driver
+            # used in functional test and a normal rpc driver.
             if iterable == set:
-                iterable = tuple
+                iterable = list
             return iterable([action_fn(context, value) for value in values])
 
     def serialize_entity(self, context, entity):
@@ -663,8 +900,9 @@ def obj_to_primitive(obj):
         return [obj_to_primitive(x) for x in obj]
     elif isinstance(obj, NovaObject):
         result = {}
-        for key, value in obj.iteritems():
-            result[key] = obj_to_primitive(value)
+        for key in obj.obj_fields:
+            if obj.obj_attr_is_set(key) or key in obj.obj_extra_fields:
+                result[key] = obj_to_primitive(getattr(obj, key))
         return result
     elif isinstance(obj, netaddr.IPAddress):
         return str(obj)
@@ -680,7 +918,7 @@ def obj_make_list(context, list_obj, item_cls, db_list, **extra_args):
     This calls item_cls._from_db_object() on each item of db_list, and
     adds the resulting object to list_obj.
 
-    :param:context: Request contextr
+    :param:context: Request context
     :param:list_obj: An ObjectListBase object
     :param:item_cls: The NovaObject class of the objects within the list
     :param:db_list: The list of primitives to convert to objects

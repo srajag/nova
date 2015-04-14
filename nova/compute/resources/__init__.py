@@ -13,23 +13,23 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
 import stevedore
 
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
 RESOURCE_NAMESPACE = 'nova.compute.resources'
 
 
-class ResourceHandler():
+class ResourceHandler(object):
 
     def _log_missing_plugins(self, names):
         for name in names:
             if name not in self._mgr.names():
-                LOG.warn(_LW('Compute resource plugin %s was not loaded') %
-                         name)
+                LOG.warning(_LW('Compute resource plugin %s was not loaded'),
+                            name)
 
     def __init__(self, names, propagate_map_exceptions=False):
         """Initialise the resource handler by loading the plugins.

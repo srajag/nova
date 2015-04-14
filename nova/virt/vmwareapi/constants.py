@@ -22,14 +22,29 @@ DISK_FORMAT_ISO = 'iso'
 DISK_FORMAT_VMDK = 'vmdk'
 DISK_FORMATS_ALL = [DISK_FORMAT_ISO, DISK_FORMAT_VMDK]
 
+DISK_TYPE_THIN = 'thin'
+CONTAINER_FORMAT_BARE = 'bare'
+CONTAINER_FORMAT_OVA = 'ova'
+CONTAINER_FORMATS_ALL = [CONTAINER_FORMAT_BARE, DISK_FORMAT_VMDK]
+
 DISK_TYPE_SPARSE = 'sparse'
 DISK_TYPE_PREALLOCATED = 'preallocated'
+DISK_TYPE_STREAM_OPTIMIZED = 'streamOptimized'
+DISK_TYPE_EAGER_ZEROED_THICK = 'eagerZeroedThick'
+
+DATASTORE_TYPE_VMFS = 'VMFS'
+DATASTORE_TYPE_NFS = 'NFS'
+DATASTORE_TYPE_VSAN = 'vsan'
 
 DEFAULT_VIF_MODEL = network_model.VIF_MODEL_E1000
 DEFAULT_OS_TYPE = "otherGuest"
 DEFAULT_ADAPTER_TYPE = "lsiLogic"
 DEFAULT_DISK_TYPE = DISK_TYPE_PREALLOCATED
 DEFAULT_DISK_FORMAT = DISK_FORMAT_VMDK
+DEFAULT_CONTAINER_FORMAT = CONTAINER_FORMAT_BARE
+
+IMAGE_VM_PREFIX = "OSTACK_IMG"
+SNAPSHOT_VM_PREFIX = "OSTACK_SNAP"
 
 ADAPTER_TYPE_BUSLOGIC = "busLogic"
 ADAPTER_TYPE_IDE = "ide"
@@ -40,6 +55,10 @@ SUPPORTED_FLAT_VARIANTS = ["thin", "preallocated", "thick", "eagerZeroedThick"]
 
 EXTENSION_KEY = 'org.openstack.compute'
 EXTENSION_TYPE_INSTANCE = 'instance'
+
+# The max number of devices that can be connnected to one adapter
+# One adapter has 16 slots but one reserved for controller
+SCSI_MAX_CONNECT_NUMBER = 15
 
 # This list was extracted from the installation iso image for ESX 5.5 Update 1.
 # It is contained in s.v00, which is gzipped. The list was obtained by

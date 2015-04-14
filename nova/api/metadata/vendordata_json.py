@@ -17,12 +17,12 @@
 
 import errno
 
-from oslo.config import cfg
-from oslo.serialization import jsonutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
 
 from nova.api.metadata import base
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 
 file_opt = cfg.StrOpt('vendordata_jsonfile_path',
                       help='File to load JSON formatted vendor data from')
@@ -44,15 +44,15 @@ class JsonFileVendorData(base.VendorDataDriver):
                     data = jsonutils.load(fp)
             except IOError as e:
                 if e.errno == errno.ENOENT:
-                    LOG.warn(_LW("%(logprefix)sfile does not exist"),
-                             {'logprefix': logprefix})
+                    LOG.warning(_LW("%(logprefix)sfile does not exist"),
+                                {'logprefix': logprefix})
                 else:
-                    LOG.warn(_LW("%(logprefix)unexpected IOError when "
-                                 "reading"), {'logprefix': logprefix})
+                    LOG.warning(_LW("%(logprefix)unexpected IOError when "
+                                    "reading"), {'logprefix': logprefix})
                 raise e
             except ValueError:
-                LOG.warn(_LW("%(logprefix)sfailed to load json"),
-                         {'logprefix': logprefix})
+                LOG.warning(_LW("%(logprefix)sfailed to load json"),
+                            {'logprefix': logprefix})
                 raise
 
         self._data = data

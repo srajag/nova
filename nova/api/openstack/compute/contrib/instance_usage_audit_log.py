@@ -16,11 +16,12 @@
 
 import datetime
 
-from oslo.config import cfg
+from oslo_config import cfg
 import webob.exc
 
 from nova.api.openstack import extensions
 from nova import compute
+from nova import context as nova_context
 from nova.i18n import _
 from nova import utils
 
@@ -74,6 +75,9 @@ class InstanceUsageAuditLogController(object):
             completed before this datetime. Has no effect if both begin and end
             are specified.
         """
+        # NOTE(alex_xu): back-compatible with db layer hard-code admin
+        # permission checks.
+        nova_context.require_admin_context(context)
         defbegin, defend = utils.last_completed_audit_period(before=before)
         if begin is None:
             begin = defbegin
@@ -100,11 +104,11 @@ class InstanceUsageAuditLogController(object):
                 running_hosts.add(tlog['host'])
             total_errors += tlog['errors']
             total_items += tlog['task_items']
-        log = dict((tl['host'], dict(state=tl['state'],
-                                  instances=tl['task_items'],
-                                  errors=tl['errors'],
-                                  message=tl['message']))
-                  for tl in task_logs)
+        log = {tl['host']: dict(state=tl['state'],
+                                instances=tl['task_items'],
+                                errors=tl['errors'],
+                                message=tl['message'])
+               for tl in task_logs}
         missing_hosts = hosts - seen_hosts
         overall_status = "%s hosts done. %s errors." % (
                     'ALL' if len(done_hosts) == len(hosts)

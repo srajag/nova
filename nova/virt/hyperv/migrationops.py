@@ -18,12 +18,12 @@ Management class for migration / resize operations.
 """
 import os
 
-from oslo.utils import excutils
-from oslo.utils import units
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import units
 
 from nova import exception
 from nova.i18n import _, _LE
-from nova.openstack.common import log as logging
 from nova.virt import configdrive
 from nova.virt.hyperv import imagecache
 from nova.virt.hyperv import utilsfactory
@@ -101,7 +101,7 @@ class MigrationOps(object):
 
     def _check_target_flavor(self, instance, flavor):
         new_root_gb = flavor['root_gb']
-        curr_root_gb = instance['root_gb']
+        curr_root_gb = instance.root_gb
 
         if new_root_gb < curr_root_gb:
             raise exception.InstanceFaultRollback(
@@ -122,13 +122,11 @@ class MigrationOps(object):
 
         self._vmops.power_off(instance, timeout, retry_interval)
 
-        instance_name = instance["name"]
-
         (disk_files,
-         volume_drives) = self._vmutils.get_vm_storage_paths(instance_name)
+         volume_drives) = self._vmutils.get_vm_storage_paths(instance.name)
 
         if disk_files:
-            self._migrate_disk_files(instance_name, disk_files, dest)
+            self._migrate_disk_files(instance.name, disk_files, dest)
 
         self._vmops.destroy(instance, destroy_disks=False)
 
@@ -138,7 +136,7 @@ class MigrationOps(object):
     def confirm_migration(self, migration, instance, network_info):
         LOG.debug("confirm_migration called", instance=instance)
 
-        self._pathutils.get_instance_migr_revert_dir(instance['name'],
+        self._pathutils.get_instance_migr_revert_dir(instance.name,
                                                      remove_dir=True)
 
     def _revert_migration_files(self, instance_name):
@@ -149,12 +147,13 @@ class MigrationOps(object):
             instance_name)
         self._pathutils.rename(revert_path, instance_path)
 
-    def _check_and_attach_config_drive(self, instance):
+    def _check_and_attach_config_drive(self, instance, vm_gen):
         if configdrive.required_by(instance):
             configdrive_path = self._pathutils.lookup_configdrive_path(
                 instance.name)
             if configdrive_path:
-                self._vmops.attach_config_drive(instance, configdrive_path)
+                self._vmops.attach_config_drive(instance, configdrive_path,
+                                                vm_gen)
             else:
                 raise vmutils.HyperVException(
                     _("Config drive is required by instance: %s, "
@@ -164,7 +163,7 @@ class MigrationOps(object):
                                 block_device_info=None, power_on=True):
         LOG.debug("finish_revert_migration called", instance=instance)
 
-        instance_name = instance['name']
+        instance_name = instance.name
         self._revert_migration_files(instance_name)
 
         if self._volumeops.ebs_root_in_block_devices(block_device_info):
@@ -174,10 +173,12 @@ class MigrationOps(object):
 
         eph_vhd_path = self._pathutils.lookup_ephemeral_vhd_path(instance_name)
 
+        image_meta = self._imagecache.get_image_details(context, instance)
+        vm_gen = self._vmops.get_image_vm_generation(root_vhd_path, image_meta)
         self._vmops.create_instance(instance, network_info, block_device_info,
-                                    root_vhd_path, eph_vhd_path)
+                                    root_vhd_path, eph_vhd_path, vm_gen)
 
-        self._check_and_attach_config_drive(instance)
+        self._check_and_attach_config_drive(instance, vm_gen)
 
         if power_on:
             self._vmops.power_on(instance)
@@ -254,7 +255,7 @@ class MigrationOps(object):
                          block_device_info=None, power_on=True):
         LOG.debug("finish_migration called", instance=instance)
 
-        instance_name = instance['name']
+        instance_name = instance.name
 
         if self._volumeops.ebs_root_in_block_devices(block_device_info):
             root_vhd_path = None
@@ -272,7 +273,7 @@ class MigrationOps(object):
                                       src_base_disk_path)
 
             if resize_instance:
-                new_size = instance['root_gb'] * units.Gi
+                new_size = instance.root_gb * units.Gi
                 self._check_resize_vhd(root_vhd_path, root_vhd_info, new_size)
 
         eph_vhd_path = self._pathutils.lookup_ephemeral_vhd_path(instance_name)
@@ -285,10 +286,11 @@ class MigrationOps(object):
                 eph_vhd_info = self._vhdutils.get_vhd_info(eph_vhd_path)
                 self._check_resize_vhd(eph_vhd_path, eph_vhd_info, new_size)
 
+        vm_gen = self._vmops.get_image_vm_generation(root_vhd_path, image_meta)
         self._vmops.create_instance(instance, network_info, block_device_info,
-                                    root_vhd_path, eph_vhd_path)
+                                    root_vhd_path, eph_vhd_path, vm_gen)
 
-        self._check_and_attach_config_drive(instance)
+        self._check_and_attach_config_drive(instance, vm_gen)
 
         if power_on:
             self._vmops.power_on(instance)

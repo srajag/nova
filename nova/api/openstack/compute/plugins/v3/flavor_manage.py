@@ -20,9 +20,9 @@ from nova.api import validation
 from nova.compute import flavors
 from nova import exception
 
-ALIAS = "flavor-manage"
+ALIAS = "os-flavor-manage"
 
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class FlavorManageController(wsgi.Controller):

@@ -14,10 +14,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from nova import db
-from nova.openstack.common import log as logging
+from oslo_log import log as logging
+
 from nova.scheduler import filters
 from nova.scheduler.filters import extra_specs_ops
+from nova.scheduler.filters import utils
 
 
 LOG = logging.getLogger(__name__)
@@ -41,8 +42,7 @@ class AggregateInstanceExtraSpecsFilter(filters.BaseHostFilter):
         if 'extra_specs' not in instance_type:
             return True
 
-        context = filter_properties['context']
-        metadata = db.aggregate_metadata_get_by_host(context, host_state.host)
+        metadata = utils.aggregate_metadata_get_by_host(host_state)
 
         for key, req in instance_type['extra_specs'].iteritems():
             # Either not scope format, or aggregate_instance_extra_specs scope

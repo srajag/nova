@@ -16,8 +16,8 @@
 
 """Base class for classes that need modular database access."""
 
-from oslo.config import cfg
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_utils import importutils
 
 db_driver_opt = cfg.StrOpt('db_driver',
                            default='nova.db',
@@ -34,4 +34,4 @@ class Base(object):
         super(Base, self).__init__()
         if not db_driver:
             db_driver = CONF.db_driver
-        self.db = importutils.import_module(db_driver)  # pylint: disable=C0103
+        self.db = importutils.import_module(db_driver)

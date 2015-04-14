@@ -25,12 +25,12 @@ from nova.i18n import _
 
 
 ALIAS = "os-remote-consoles"
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class RemoteConsolesController(wsgi.Controller):
     def __init__(self, *args, **kwargs):
-        self.compute_api = compute.API()
+        self.compute_api = compute.API(skip_policy_check=True)
         super(RemoteConsolesController, self).__init__(*args, **kwargs)
 
     @extensions.expected_errors((400, 404, 409, 501))
@@ -45,8 +45,7 @@ class RemoteConsolesController(wsgi.Controller):
         console_type = body['os-getVNCConsole'].get('type')
 
         try:
-            instance = common.get_instance(self.compute_api, context, id,
-                                           want_objects=True)
+            instance = common.get_instance(self.compute_api, context, id)
             output = self.compute_api.get_vnc_console(context,
                                                       instance,
                                                       console_type)
@@ -74,8 +73,7 @@ class RemoteConsolesController(wsgi.Controller):
         console_type = body['os-getSPICEConsole'].get('type')
 
         try:
-            instance = common.get_instance(self.compute_api, context, id,
-                                           want_objects=True)
+            instance = common.get_instance(self.compute_api, context, id)
             output = self.compute_api.get_spice_console(context,
                                                         instance,
                                                         console_type)
@@ -103,8 +101,7 @@ class RemoteConsolesController(wsgi.Controller):
         # If type is not supplied or unknown, get_rdp_console below will cope
         console_type = body['os-getRDPConsole'].get('type')
 
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         try:
             # NOTE(mikal): get_rdp_console() can raise InstanceNotFound, so
             # we still need to catch it here.
@@ -123,7 +120,7 @@ class RemoteConsolesController(wsgi.Controller):
 
         return {'console': {'type': console_type, 'url': output['url']}}
 
-    @extensions.expected_errors((404, 409, 501))
+    @extensions.expected_errors((400, 404, 409, 501))
     @wsgi.action('os-getSerialConsole')
     @validation.schema(remote_consoles.get_serial_console)
     def get_serial_console(self, req, id, body):
@@ -134,7 +131,7 @@ class RemoteConsolesController(wsgi.Controller):
         # If type is not supplied or unknown get_serial_console below will cope
         console_type = body['os-getSerialConsole'].get('type')
         try:
-            instance = self.compute_api.get(context, id, want_objects=True)
+            instance = common.get_instance(self.compute_api, context, id)
             output = self.compute_api.get_serial_console(context,
                                                          instance,
                                                          console_type)
@@ -142,6 +139,11 @@ class RemoteConsolesController(wsgi.Controller):
             raise webob.exc.HTTPNotFound(explanation=e.format_message())
         except exception.InstanceNotReady as e:
             raise webob.exc.HTTPConflict(explanation=e.format_message())
+        except (exception.ConsoleTypeUnavailable,
+                exception.ImageSerialPortNumberInvalid,
+                exception.ImageSerialPortNumberExceedFlavorValue,
+                exception.SocketPortRangeExhaustedException) as e:
+            raise webob.exc.HTTPBadRequest(explanation=e.format_message())
         except NotImplementedError:
             msg = _("Unable to get serial console, "
                     "functionality not implemented")
@@ -152,7 +154,7 @@ class RemoteConsolesController(wsgi.Controller):
 
 class RemoteConsoles(extensions.V3APIExtensionBase):
     """Interactive Console support."""
-    name = "RemoteConsoles"
+    name = "Consoles"
     alias = ALIAS
     version = 1
 

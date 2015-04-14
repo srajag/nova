@@ -18,10 +18,10 @@ import random
 import re
 import time
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
-from nova.i18n import _, _LE
-from nova.openstack.common import log as logging
+from nova.i18n import _, _LE, _LI, _LW
 from nova import utils
 from nova.virt.disk.mount import api
 
@@ -56,7 +56,7 @@ class NbdMount(api.Mount):
                 else:
                     LOG.error(_LE('NBD error - previous umount did not '
                                   'cleanup /var/lock/qemu-nbd-%s.'), device)
-        LOG.warn(_('No free nbd devices'))
+        LOG.warning(_LW('No free nbd devices'))
         return None
 
     def _allocate_nbd(self):
@@ -88,7 +88,7 @@ class NbdMount(api.Mount):
                                  run_as_root=True)
         if err:
             self.error = _('qemu-nbd error: %s') % err
-            LOG.info(_('NBD mount error: %s'), self.error)
+            LOG.info(_LI('NBD mount error: %s'), self.error)
             return False
 
         # NOTE(vish): this forks into another process, so give it a chance
@@ -101,14 +101,14 @@ class NbdMount(api.Mount):
             time.sleep(1)
         else:
             self.error = _('nbd device %s did not show up') % device
-            LOG.info(_('NBD mount error: %s'), self.error)
+            LOG.info(_LI('NBD mount error: %s'), self.error)
 
             # Cleanup
             _out, err = utils.trycmd('qemu-nbd', '-d', device,
                                      run_as_root=True)
             if err:
-                LOG.warn(_('Detaching from erroneous nbd device returned '
-                           'error: %s'), err)
+                LOG.warning(_LW('Detaching from erroneous nbd device returned '
+                                'error: %s'), err)
             return False
 
         self.error = ''

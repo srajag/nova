@@ -15,13 +15,14 @@
 import webob.exc
 
 from nova.api.openstack import extensions
+from nova.api.openstack import wsgi
 import nova.cert.rpcapi
 from nova import exception
 from nova.i18n import _
 from nova import network
 
 ALIAS = "os-certificates"
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 def _translate_certificate_view(certificate, private_key=None):
@@ -31,7 +32,7 @@ def _translate_certificate_view(certificate, private_key=None):
     }
 
 
-class CertificatesController(object):
+class CertificatesController(wsgi.Controller):
     """The x509 Certificates API controller for the OpenStack API."""
 
     def __init__(self):
@@ -76,7 +77,7 @@ class Certificates(extensions.V3APIExtensionBase):
 
     def get_resources(self):
         resources = [
-            extensions.ResourceExtension('os-certificates',
+            extensions.ResourceExtension(ALIAS,
                                          CertificatesController(),
                                          member_actions={})]
         return resources

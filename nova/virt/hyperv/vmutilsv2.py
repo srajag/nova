@@ -24,9 +24,9 @@ import uuid
 if sys.platform == 'win32':
     import wmi
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
-from nova.openstack.common import log as logging
 from nova.virt.hyperv import constants
 from nova.virt.hyperv import vmutils
 
@@ -37,20 +37,22 @@ LOG = logging.getLogger(__name__)
 class VMUtilsV2(vmutils.VMUtils):
 
     _PHYS_DISK_RES_SUB_TYPE = 'Microsoft:Hyper-V:Physical Disk Drive'
-    _DISK_RES_SUB_TYPE = 'Microsoft:Hyper-V:Synthetic Disk Drive'
-    _DVD_RES_SUB_TYPE = 'Microsoft:Hyper-V:Synthetic DVD Drive'
+    _DISK_DRIVE_RES_SUB_TYPE = 'Microsoft:Hyper-V:Synthetic Disk Drive'
+    _DVD_DRIVE_RES_SUB_TYPE = 'Microsoft:Hyper-V:Synthetic DVD Drive'
     _SCSI_RES_SUBTYPE = 'Microsoft:Hyper-V:Synthetic SCSI Controller'
-    _IDE_DISK_RES_SUB_TYPE = 'Microsoft:Hyper-V:Virtual Hard Disk'
-    _IDE_DVD_RES_SUB_TYPE = 'Microsoft:Hyper-V:Virtual CD/DVD Disk'
+    _HARD_DISK_RES_SUB_TYPE = 'Microsoft:Hyper-V:Virtual Hard Disk'
+    _DVD_DISK_RES_SUB_TYPE = 'Microsoft:Hyper-V:Virtual CD/DVD Disk'
     _IDE_CTRL_RES_SUB_TYPE = 'Microsoft:Hyper-V:Emulated IDE Controller'
     _SCSI_CTRL_RES_SUB_TYPE = 'Microsoft:Hyper-V:Synthetic SCSI Controller'
     _SERIAL_PORT_RES_SUB_TYPE = 'Microsoft:Hyper-V:Serial Port'
 
     _VIRTUAL_SYSTEM_TYPE_REALIZED = 'Microsoft:Hyper-V:System:Realized'
+    _VIRTUAL_SYSTEM_SUBTYPE_GEN2 = 'Microsoft:Hyper-V:SubType:2'
 
     _SNAPSHOT_FULL = 2
 
     _METRIC_AGGR_CPU_AVG = 'Aggregated Average CPU Utilization'
+    _METRIC_AGGR_MEMORY_AVG = 'Aggregated Average Memory Utilization'
     _METRIC_ENABLED = 2
 
     _STORAGE_ALLOC_SETTING_DATA_CLASS = 'Msvm_StorageAllocationSettingData'
@@ -89,7 +91,8 @@ class VMUtilsV2(vmutils.VMUtils):
                     ['ElementName'],
                     VirtualSystemType=self._VIRTUAL_SYSTEM_TYPE_REALIZED)]
 
-    def _create_vm_obj(self, vs_man_svc, vm_name, notes, dynamic_memory_ratio):
+    def _create_vm_obj(self, vs_man_svc, vm_name, vm_gen, notes,
+                       dynamic_memory_ratio, instance_path):
         vs_data = self._conn.Msvm_VirtualSystemSettingData.new()
         vs_data.ElementName = vm_name
         vs_data.Notes = notes
@@ -99,6 +102,18 @@ class VMUtilsV2(vmutils.VMUtils):
         # vNUMA and dynamic memory are mutually exclusive
         if dynamic_memory_ratio > 1:
             vs_data.VirtualNumaEnabled = False
+
+        if vm_gen == constants.VM_GEN_2:
+            vs_data.VirtualSystemSubType = self._VIRTUAL_SYSTEM_SUBTYPE_GEN2
+            vs_data.SecureBootEnabled = False
+
+        # Created VMs must have their *DataRoot paths in the same location as
+        # the instances' path.
+        vs_data.ConfigurationDataRoot = instance_path
+        vs_data.LogDataRoot = instance_path
+        vs_data.SnapshotDataRoot = instance_path
+        vs_data.SuspendDataRoot = instance_path
+        vs_data.SwapFileDataRoot = instance_path
 
         (job_path,
          vm_path,
@@ -117,22 +132,32 @@ class VMUtilsV2(vmutils.VMUtils):
         return [s for s in vmsettings if
                 s.VirtualSystemType == self._VIRTUAL_SYSTEM_TYPE_REALIZED][0]
 
-    def attach_ide_drive(self, vm_name, path, ctrller_addr, drive_addr,
-                         drive_type=constants.IDE_DISK):
-        """Create an IDE drive and attach it to the vm."""
+    def _get_attached_disks_query_string(self, scsi_controller_path):
+        # DVD Drives can be attached to SCSI as well, if the VM Generation is 2
+        return ("SELECT * FROM Msvm_ResourceAllocationSettingData WHERE ("
+                "ResourceSubType='%(res_sub_type)s' OR "
+                "ResourceSubType='%(res_sub_type_virt)s' OR "
+                "ResourceSubType='%(res_sub_type_dvd)s') AND "
+                "Parent = '%(parent)s'" % {
+                    'res_sub_type': self._PHYS_DISK_RES_SUB_TYPE,
+                    'res_sub_type_virt': self._DISK_DRIVE_RES_SUB_TYPE,
+                    'res_sub_type_dvd': self._DVD_DRIVE_RES_SUB_TYPE,
+                    'parent': scsi_controller_path.replace("'", "''")})
+
+    def attach_drive(self, vm_name, path, ctrller_path, drive_addr,
+                     drive_type=constants.DISK):
+        """Create a drive and attach it to the vm."""
 
         vm = self._lookup_vm_check(vm_name)
 
-        ctrller_path = self._get_vm_ide_controller(vm, ctrller_addr)
-
-        if drive_type == constants.IDE_DISK:
-            res_sub_type = self._DISK_RES_SUB_TYPE
-        elif drive_type == constants.IDE_DVD:
-            res_sub_type = self._DVD_RES_SUB_TYPE
+        if drive_type == constants.DISK:
+            res_sub_type = self._DISK_DRIVE_RES_SUB_TYPE
+        elif drive_type == constants.DVD:
+            res_sub_type = self._DVD_DRIVE_RES_SUB_TYPE
 
         drive = self._get_new_resource_setting_data(res_sub_type)
 
-        # Set the IDE ctrller as parent.
+        # Set the ctrller as parent.
         drive.Parent = ctrller_path
         drive.Address = drive_addr
         drive.AddressOnParent = drive_addr
@@ -140,10 +165,10 @@ class VMUtilsV2(vmutils.VMUtils):
         new_resources = self._add_virt_resource(drive, vm.path_())
         drive_path = new_resources[0]
 
-        if drive_type == constants.IDE_DISK:
-            res_sub_type = self._IDE_DISK_RES_SUB_TYPE
-        elif drive_type == constants.IDE_DVD:
-            res_sub_type = self._IDE_DVD_RES_SUB_TYPE
+        if drive_type == constants.DISK:
+            res_sub_type = self._HARD_DISK_RES_SUB_TYPE
+        elif drive_type == constants.DVD:
+            res_sub_type = self._DVD_DISK_RES_SUB_TYPE
 
         res = self._get_new_resource_setting_data(
             res_sub_type, self._STORAGE_ALLOC_SETTING_DATA_CLASS)
@@ -256,13 +281,14 @@ class VMUtilsV2(vmutils.VMUtils):
         self._add_virt_resource(eth_port_data, vm.path_())
 
     def enable_vm_metrics_collection(self, vm_name):
-        metric_names = [self._METRIC_AGGR_CPU_AVG]
+        metric_names = [self._METRIC_AGGR_CPU_AVG,
+                        self._METRIC_AGGR_MEMORY_AVG]
 
         vm = self._lookup_vm_check(vm_name)
         metric_svc = self._conn.Msvm_MetricService()[0]
         (disks, volumes) = self._get_vm_disks(vm)
         filtered_disks = [d for d in disks if
-                          d.ResourceSubType is not self._IDE_DVD_RES_SUB_TYPE]
+                          d.ResourceSubType is not self._DVD_DISK_RES_SUB_TYPE]
 
         # enable metrics for disk.
         for disk in filtered_disks:
@@ -280,3 +306,16 @@ class VMUtilsV2(vmutils.VMUtils):
             Subject=element.path_(),
             Definition=definition_path,
             MetricCollectionEnabled=self._METRIC_ENABLED)
+
+    def get_vm_dvd_disk_paths(self, vm_name):
+        vm = self._lookup_vm_check(vm_name)
+
+        settings = vm.associators(
+            wmi_result_class=self._VIRTUAL_SYSTEM_SETTING_DATA_CLASS)[0]
+        sasds = settings.associators(
+            wmi_result_class=self._STORAGE_ALLOC_SETTING_DATA_CLASS)
+
+        dvd_paths = [sasd.HostResource[0] for sasd in sasds
+                     if sasd.ResourceSubType == self._DVD_DISK_RES_SUB_TYPE]
+
+        return dvd_paths

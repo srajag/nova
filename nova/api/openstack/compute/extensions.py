@@ -13,11 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from nova.api.openstack import extensions as base_extensions
-from nova.i18n import _
-from nova.openstack.common import log as logging
 
 ext_opts = [
     cfg.MultiStrOpt('osapi_compute_extension',
@@ -34,7 +33,6 @@ LOG = logging.getLogger(__name__)
 
 class ExtensionManager(base_extensions.ExtensionManager):
     def __init__(self):
-        LOG.audit(_('Initializing extension manager.'))
         self.cls_list = CONF.osapi_compute_extension
         self.extensions = {}
         self.sorted_ext_list = []

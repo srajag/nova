@@ -17,12 +17,13 @@ from nova import exception
 from nova import objects
 from nova.objects import base as obj_base
 from nova.objects import fields
-from nova import utils
 
 FLOATING_IP_OPTIONAL_ATTRS = ['fixed_ip']
 
 
-class FloatingIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+class FloatingIP(obj_base.NovaPersistentObject, obj_base.NovaObject,
+                 obj_base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Added _get_addresses_by_instance_uuid()
     # Version 1.2: FixedIP <= version 1.2
@@ -43,28 +44,10 @@ class FloatingIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
         'fixed_ip': fields.ObjectField('FixedIP', nullable=True),
         }
 
-    def obj_make_compatible(self, primitive, target_version):
-        target_version = utils.convert_version_to_tuple(target_version)
-        if target_version < (1, 2) and 'fixed_ip' in primitive:
-            self.fixed_ip.obj_make_compatible(
-                    primitive['fixed_ip']['nova_object.data'], '1.1')
-            primitive['fixed_ip']['nova_object.version'] = '1.1'
-        elif target_version < (1, 3) and self.obj_attr_is_set('fixed_ip'):
-            self.fixed_ip.obj_make_compatible(
-                    primitive['fixed_ip']['nova_object.data'], '1.2')
-            primitive['fixed_ip']['nova_object.version'] = '1.2'
-        elif target_version < (1, 4) and self.obj_attr_is_set('fixed_ip'):
-            self.fixed_ip.obj_make_compatible(
-                    primitive['fixed_ip']['nova_object.data'], '1.3')
-            primitive['fixed_ip']['nova_object.version'] = '1.3'
-        elif target_version < (1, 5) and self.obj_attr_is_set('fixed_ip'):
-            self.fixed_ip.obj_make_compatible(
-                    primitive['fixed_ip']['nova_object.data'], '1.4')
-            primitive['fixed_ip']['nova_object.version'] = '1.4'
-        elif target_version < (1, 6) and self.obj_attr_is_set('fixed_ip'):
-            self.fixed_ip.obj_make_compatible(
-                    primitive['fixed_ip']['nova_object.data'], '1.5')
-            primitive['fixed_ip']['nova_object.version'] = '1.5'
+    obj_relationships = {
+        'fixed_ip': [('1.0', '1.1'), ('1.2', '1.2'), ('1.3', '1.3'),
+                     ('1.4', '1.4'), ('1.5', '1.5'), ('1.6', '1.6')],
+    }
 
     @staticmethod
     def _from_db_object(context, floatingip, db_floatingip,
@@ -161,7 +144,7 @@ class FloatingIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
         return cls._get_addresses_by_instance_uuid(context, instance['uuid'])
 
     @obj_base.remotable
-    def save(self, context):
+    def save(self):
         updates = self.obj_get_changes()
         if 'address' in updates:
             raise exception.ObjectActionError(action='save',
@@ -174,9 +157,9 @@ class FloatingIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
         # relationship to the DB update method
         updates.pop('fixed_ip', None)
 
-        db_floatingip = db.floating_ip_update(context, str(self.address),
+        db_floatingip = db.floating_ip_update(self._context, str(self.address),
                                               updates)
-        self._from_db_object(context, self, db_floatingip)
+        self._from_db_object(self._context, self, db_floatingip)
 
 
 class FloatingIPList(obj_base.ObjectListBase, obj_base.NovaObject):
@@ -240,7 +223,8 @@ class FloatingIPList(obj_base.ObjectListBase, obj_base.NovaObject):
 
     @obj_base.remotable_classmethod
     def create(cls, context, ip_info, want_result=False):
-        db_floatingips = db.floating_ip_bulk_create(context, ip_info)
+        db_floatingips = db.floating_ip_bulk_create(context, ip_info,
+                                                    want_result=want_result)
         if want_result:
             return obj_base.obj_make_list(context, cls(), FloatingIP,
                                           db_floatingips)

@@ -21,19 +21,18 @@ A connection to the VMware vCenter platform.
 
 import re
 
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.vmware import api
-from oslo.vmware import exceptions as vexc
-from oslo.vmware import pbm
-from oslo.vmware import vim
-from oslo.vmware import vim_util
-import suds
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_vmware import api
+from oslo_vmware import exceptions as vexc
+from oslo_vmware import pbm
+from oslo_vmware import vim
+from oslo_vmware import vim_util
 
 from nova import exception
-from nova.i18n import _, _LW
-from nova.openstack.common import log as logging
-from nova.openstack.common import uuidutils
+from nova.i18n import _, _LI, _LW
+from nova.openstack.common import versionutils
 from nova.virt import driver
 from nova.virt.vmwareapi import constants
 from nova.virt.vmwareapi import error_util
@@ -148,6 +147,14 @@ class VMwareVCDriver(driver.ComputeDriver):
 
         # Get the list of clusters to be used
         self._cluster_names = CONF.vmware.cluster_name
+        if len(self._cluster_names) > 1:
+            versionutils.report_deprecated_feature(
+                LOG,
+                _LW('The "cluster_name" setting should have only one '
+                    'cluster name. The capability of allowing '
+                    'multiple clusters may be dropped in the '
+                    'Liberty release.'))
+
         self.dict_mors = vm_util.get_all_cluster_refs_by_name(self._session,
                                           self._cluster_names)
         if not self.dict_mors:
@@ -160,8 +167,8 @@ class VMwareVCDriver(driver.ComputeDriver):
         clusters_found = [v.get('name') for k, v in self.dict_mors.iteritems()]
         missing_clusters = set(self._cluster_names) - set(clusters_found)
         if missing_clusters:
-            LOG.warn(_LW("The following clusters could not be found in the "
-                         "vCenter %s") % list(missing_clusters))
+            LOG.warning(_LW("The following clusters could not be found in the "
+                            "vCenter %s"), list(missing_clusters))
 
         # The _resources is used to maintain the vmops, volumeops and vcstate
         # objects per cluster
@@ -180,16 +187,17 @@ class VMwareVCDriver(driver.ComputeDriver):
         # Register the OpenStack extension
         self._register_openstack_extension()
 
+    @property
+    def need_legacy_block_device_info(self):
+        return False
+
     def _update_pbm_location(self):
         if CONF.vmware.pbm_wsdl_location:
             pbm_wsdl_loc = CONF.vmware.pbm_wsdl_location
         else:
             version = vim_util.get_vc_version(self._session)
             pbm_wsdl_loc = pbm.get_pbm_wsdl_location(version)
-        # TODO(garyk): Update this with oslo.vmware method. The session.pbm
-        # is lazy loaded so this enables us to update this entry on the fly
-        self._session._pbm_wsdl_loc = pbm_wsdl_loc
-        self._session._pbm = None
+        self._session.pbm_wsdl_loc_set(pbm_wsdl_loc)
 
     def _validate_configuration(self):
         if CONF.vmware.use_linked_clone is None:
@@ -213,15 +221,7 @@ class VMwareVCDriver(driver.ComputeDriver):
             self._session._create_session()
 
     def cleanup_host(self, host):
-        # NOTE(hartsocks): we lean on the init_host to force the vim object
-        # to not be None.
-        vim = self._session.vim
-        service_content = vim.service_content
-        session_manager = service_content.sessionManager
-        try:
-            vim.client.service.Logout(session_manager)
-        except suds.WebFault:
-            LOG.debug("No vSphere session was open during cleanup_host.")
+        self._session.logout()
 
     def _register_openstack_extension(self):
         # Register an 'OpenStack' extension in vCenter
@@ -246,17 +246,10 @@ class VMwareVCDriver(driver.ComputeDriver):
         """resume guest state when a host is booted."""
         # Check if the instance is running already and avoid doing
         # anything if it is.
-        instances = self.list_instances()
-        if instance['uuid'] not in instances:
-            LOG.warn(_LW('Instance cannot be found in host, or in an unknown'
-                         'state.'), instance=instance)
-        else:
-            state = vm_util.get_vm_state_from_name(self._session,
-                                                   instance['uuid'])
-            ignored_states = ['poweredon', 'suspended']
-
-            if state.lower() in ignored_states:
-                return
+        state = vm_util.get_vm_state(self._session, instance)
+        ignored_states = ['poweredon', 'suspended']
+        if state.lower() in ignored_states:
+            return
         # Instance is not up and could be in an unknown state.
         # Be as absolute as possible about getting it back into
         # a known and running state.
@@ -265,8 +258,7 @@ class VMwareVCDriver(driver.ComputeDriver):
 
     def list_instance_uuids(self):
         """List VM instance UUIDs."""
-        uuids = self._vmops.list_instances()
-        return [uuid for uuid in uuids if uuidutils.is_uuid_like(uuid)]
+        return self._vmops.list_instances()
 
     def list_instances(self):
         """List VM instances from all nodes."""
@@ -285,30 +277,26 @@ class VMwareVCDriver(driver.ComputeDriver):
         off the instance before the end.
         """
         # TODO(PhilDay): Add support for timeout (clean shutdown)
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        return _vmops.migrate_disk_and_power_off(context, instance,
-                                                 dest, flavor)
+        return self._vmops.migrate_disk_and_power_off(context, instance,
+                                                      dest, flavor)
 
     def confirm_migration(self, migration, instance, network_info):
         """Confirms a resize, destroying the source VM."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.confirm_migration(migration, instance, network_info)
+        self._vmops.confirm_migration(migration, instance, network_info)
 
     def finish_revert_migration(self, context, instance, network_info,
                                 block_device_info=None, power_on=True):
         """Finish reverting a resize, powering back on the instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.finish_revert_migration(context, instance, network_info,
-                                       block_device_info, power_on)
+        self._vmops.finish_revert_migration(context, instance, network_info,
+                                            block_device_info, power_on)
 
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance,
                          block_device_info=None, power_on=True):
         """Completes a resize, turning on the migrated instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.finish_migration(context, migration, instance, disk_info,
-                                network_info, image_meta, resize_instance,
-                                block_device_info, power_on)
+        self._vmops.finish_migration(context, migration, instance, disk_info,
+                                     network_info, image_meta, resize_instance,
+                                     block_device_info, power_on)
 
     def live_migration(self, context, instance, dest,
                        post_method, recover_method, block_migration=False,
@@ -326,15 +314,14 @@ class VMwareVCDriver(driver.ComputeDriver):
         """Clean up destination node after a failed live migration."""
         self.destroy(context, instance, network_info, block_device_info)
 
-    def get_instance_disk_info(self, instance_name, block_device_info=None):
+    def get_instance_disk_info(self, instance, block_device_info=None):
         pass
 
     def get_vnc_console(self, context, instance):
         """Return link to instance's VNC console using vCenter logic."""
         # vCenter does not actually run the VNC service
         # itself. You must talk to the VNC host underneath vCenter.
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        return _vmops.get_vnc_console(instance)
+        return self._vmops.get_vnc_console(instance)
 
     def _update_resources(self):
         """This method creates a dictionary of VMOps, VolumeOps and VCState.
@@ -363,7 +350,8 @@ class VMwareVCDriver(driver.ComputeDriver):
             name = self.dict_mors.get(node)['name']
             nodename = self._create_nodename(node, name)
             _vc_state = host.VCState(self._session, nodename,
-                                     self.dict_mors.get(node)['cluster_mor'])
+                                     self.dict_mors.get(node)['cluster_mor'],
+                                     self._datastore_regex)
             self._resources[nodename] = {'vmops': _vmops,
                                          'volumeops': _volumeops,
                                          'vcstate': _vc_state,
@@ -431,7 +419,11 @@ class VMwareVCDriver(driver.ComputeDriver):
                'hypervisor_type': host_stats['hypervisor_type'],
                'hypervisor_version': host_stats['hypervisor_version'],
                'hypervisor_hostname': host_stats['hypervisor_hostname'],
-               'cpu_info': jsonutils.dumps(host_stats['cpu_info']),
+                # The VMWare driver manages multiple hosts, so there are
+                # likely many different CPU models in use. As such it is
+                # impossible to provide any meaningful info on the CPU
+                # model of the "host"
+               'cpu_info': None,
                'supported_instances': jsonutils.dumps(
                    host_stats['supported_instances']),
                'numa_topology': None,
@@ -455,8 +447,8 @@ class VMwareVCDriver(driver.ComputeDriver):
             stats_dict = self._get_available_resources(host_stats)
 
         else:
-            LOG.info(_("Invalid cluster or resource pool"
-                       " name : %s") % nodename)
+            LOG.info(_LI("Invalid cluster or resource pool"
+                         " name : %s"), nodename)
 
         return stats_dict
 
@@ -483,30 +475,27 @@ class VMwareVCDriver(driver.ComputeDriver):
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, network_info=None, block_device_info=None):
         """Create VM instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
+        _vmops = self._get_vmops_for_compute_node(instance.node)
         _vmops.spawn(context, instance, image_meta, injected_files,
               admin_password, network_info, block_device_info)
 
     def attach_volume(self, context, connection_info, instance, mountpoint,
                       disk_bus=None, device_type=None, encryption=None):
         """Attach volume storage to VM instance."""
-        _volumeops = self._get_volumeops_for_compute_node(instance['node'])
+        _volumeops = self._get_volumeops_for_compute_node(instance.node)
         return _volumeops.attach_volume(connection_info,
-                                             instance,
-                                             mountpoint)
+                                        instance)
 
     def detach_volume(self, connection_info, instance, mountpoint,
                       encryption=None):
         """Detach volume storage to VM instance."""
-        _volumeops = self._get_volumeops_for_compute_node(instance['node'])
+        _volumeops = self._get_volumeops_for_compute_node(instance.node)
         return _volumeops.detach_volume(connection_info,
-                                             instance,
-                                             mountpoint)
+                                        instance)
 
     def get_volume_connector(self, instance):
         """Return volume connector information."""
-        _volumeops = self._get_volumeops_for_compute_node(instance['node'])
-        return _volumeops.get_volume_connector(instance)
+        return self._volumeops.get_volume_connector(instance)
 
     def get_host_ip_addr(self):
         """Returns the IP address of the vCenter host."""
@@ -514,14 +503,12 @@ class VMwareVCDriver(driver.ComputeDriver):
 
     def snapshot(self, context, instance, image_id, update_task_state):
         """Create snapshot from a running VM instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.snapshot(context, instance, image_id, update_task_state)
+        self._vmops.snapshot(context, instance, image_id, update_task_state)
 
     def reboot(self, context, instance, network_info, reboot_type,
                block_device_info=None, bad_volumes_callback=None):
         """Reboot VM instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.reboot(instance, network_info)
+        self._vmops.reboot(instance, network_info, reboot_type)
 
     def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True, migrate_data=None):
@@ -530,79 +517,63 @@ class VMwareVCDriver(driver.ComputeDriver):
         # Destroy gets triggered when Resource Claim in resource_tracker
         # is not successful. When resource claim is not successful,
         # node is not set in instance. Perform destroy only if node is set
-        if not instance['node']:
+        if not instance.node:
             return
 
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.destroy(instance, destroy_disks)
+        self._vmops.destroy(instance, destroy_disks)
 
     def pause(self, instance):
         """Pause VM instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.pause(instance)
+        self._vmops.pause(instance)
 
     def unpause(self, instance):
         """Unpause paused VM instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.unpause(instance)
+        self._vmops.unpause(instance)
 
-    def suspend(self, instance):
+    def suspend(self, context, instance):
         """Suspend the specified instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.suspend(instance)
+        self._vmops.suspend(instance)
 
     def resume(self, context, instance, network_info, block_device_info=None):
         """Resume the suspended VM instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.resume(instance)
+        self._vmops.resume(instance)
 
     def rescue(self, context, instance, network_info, image_meta,
                rescue_password):
         """Rescue the specified instance."""
-        _vmops = self._get_vmops_for_compute_node(instance.node)
-        _vmops.rescue(context, instance, network_info, image_meta)
+        self._vmops.rescue(context, instance, network_info, image_meta)
 
     def unrescue(self, instance, network_info):
         """Unrescue the specified instance."""
-        _vmops = self._get_vmops_for_compute_node(instance.node)
-        _vmops.unrescue(instance)
+        self._vmops.unrescue(instance)
 
     def power_off(self, instance, timeout=0, retry_interval=0):
         """Power off the specified instance."""
         # TODO(PhilDay): Add support for timeout (clean shutdown)
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.power_off(instance)
+        self._vmops.power_off(instance)
 
     def power_on(self, context, instance, network_info,
                  block_device_info=None):
         """Power on the specified instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.power_on(instance)
+        self._vmops.power_on(instance)
 
     def poll_rebooting_instances(self, timeout, instances):
         """Poll for rebooting instances."""
-        for instance in instances:
-            _vmops = self._get_vmops_for_compute_node(instance['node'])
-            _vmops.poll_rebooting_instances(timeout, [instance])
+        self._vmops.poll_rebooting_instances(timeout, instances)
 
     def get_info(self, instance):
         """Return info about the VM instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        return _vmops.get_info(instance)
+        return self._vmops.get_info(instance)
 
     def get_diagnostics(self, instance):
         """Return data about VM diagnostics."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        data = _vmops.get_diagnostics(instance)
-        return data
+        return self._vmops.get_diagnostics(instance)
 
     def get_instance_diagnostics(self, instance):
         """Return data about VM diagnostics."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        data = _vmops.get_instance_diagnostics(instance)
-        return data
+        return self._vmops.get_instance_diagnostics(instance)
 
-    def host_power_action(self, host, action):
+    def host_power_action(self, action):
         """Host operations not supported by VC driver.
 
         This needs to override the ESX driver implementation.
@@ -616,14 +587,14 @@ class VMwareVCDriver(driver.ComputeDriver):
         """
         raise NotImplementedError()
 
-    def set_host_enabled(self, host, enabled):
+    def set_host_enabled(self, enabled):
         """Host operations not supported by VC driver.
 
         This needs to override the ESX driver implementation.
         """
         raise NotImplementedError()
 
-    def get_host_uptime(self, host):
+    def get_host_uptime(self):
         """Host uptime operation not supported by VC driver."""
 
         msg = _("Multiple hosts may be managed by the VMWare "
@@ -633,8 +604,7 @@ class VMwareVCDriver(driver.ComputeDriver):
 
     def inject_network_info(self, instance, nw_info):
         """inject network info for specified instance."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops.inject_network_info(instance, nw_info)
+        self._vmops.inject_network_info(instance, nw_info)
 
     def manage_image_cache(self, context, all_instances):
         """Manage the local cache of images."""
@@ -642,12 +612,12 @@ class VMwareVCDriver(driver.ComputeDriver):
         # Running instances per cluster
         cluster_instances = {}
         for instance in all_instances:
-            instances = cluster_instances.get(instance['node'])
+            instances = cluster_instances.get(instance.node)
             if instances:
                 instances.append(instance)
             else:
                 instances = [instance]
-            cluster_instances[instance['node']] = instances
+            cluster_instances[instance.node] = instances
 
         # Invoke the image aging per cluster
         for resource in self._resources.keys():
@@ -657,18 +627,15 @@ class VMwareVCDriver(driver.ComputeDriver):
 
     def instance_exists(self, instance):
         """Efficient override of base instance_exists method."""
-        _vmops = self._get_vmops_for_compute_node(instance['node'])
-        return _vmops.instance_exists(instance)
+        return self._vmops.instance_exists(instance)
 
     def attach_interface(self, instance, image_meta, vif):
         """Attach an interface to the instance."""
-        _vmops = self._get_vmops_for_compute_node(instance.node)
-        _vmops.attach_interface(instance, image_meta, vif)
+        self._vmops.attach_interface(instance, image_meta, vif)
 
     def detach_interface(self, instance, vif):
         """Detach an interface from the instance."""
-        _vmops = self._get_vmops_for_compute_node(instance.node)
-        _vmops.detach_interface(instance, vif)
+        self._vmops.detach_interface(instance, vif)
 
 
 class VMwareAPISession(api.VMwareAPISession):

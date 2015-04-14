@@ -13,8 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-
-from oslo.serialization import jsonutils
 import webob.exc
 
 from nova.api.openstack import extensions
@@ -25,10 +23,8 @@ from nova import objects
 
 
 ALIAS = 'os-pci'
-instance_authorize = extensions.soft_extension_authorizer(
-    'compute', 'v3:' + ALIAS + ':pci_servers')
-
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+soft_authorize = extensions.os_compute_soft_authorizer(ALIAS + ':pci_servers')
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 PCI_ADMIN_KEYS = ['id', 'address', 'vendor_id', 'product_id', 'status',
                   'compute_node_id']
@@ -46,7 +42,7 @@ class PciServerController(wsgi.Controller):
     @wsgi.extends
     def show(self, req, resp_obj, id):
         context = req.environ['nova.context']
-        if instance_authorize(context):
+        if soft_authorize(context):
             server = resp_obj.obj['server']
             instance = req.get_db_instance(server['id'])
             self._extend_server(server, instance)
@@ -54,7 +50,7 @@ class PciServerController(wsgi.Controller):
     @wsgi.extends
     def detail(self, req, resp_obj):
         context = req.environ['nova.context']
-        if instance_authorize(context):
+        if soft_authorize(context):
             servers = list(resp_obj.obj['servers'])
             for server in servers:
                 instance = req.get_db_instance(server['id'])
@@ -63,8 +59,12 @@ class PciServerController(wsgi.Controller):
 
 class PciHypervisorController(wsgi.Controller):
     def _extend_hypervisor(self, hypervisor, compute_node):
-        hypervisor['%s:pci_stats' % Pci.alias] = jsonutils.loads(
-            compute_node['pci_stats'])
+        if compute_node.pci_device_pools is not None:
+            pci_pools = [pci_pool.to_dict()
+                         for pci_pool in compute_node.pci_device_pools]
+        else:
+            pci_pools = []
+        hypervisor['%s:pci_stats' % Pci.alias] = pci_pools
 
     @wsgi.extends
     def show(self, req, resp_obj, id):
@@ -80,7 +80,7 @@ class PciHypervisorController(wsgi.Controller):
             self._extend_hypervisor(hypervisor, compute_node)
 
 
-class PciController(object):
+class PciController(wsgi.Controller):
 
     def __init__(self):
         self.host_api = compute.HostAPI()

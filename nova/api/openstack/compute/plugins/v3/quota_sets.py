@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.utils import strutils
+from oslo_utils import strutils
 import six.moves.urllib.parse as urlparse
 import webob
 
@@ -30,33 +30,41 @@ from nova import quota
 
 ALIAS = "os-quota-sets"
 QUOTAS = quota.QUOTAS
-authorize_update = extensions.extension_authorizer('compute',
-                                                   'v3:%s:update' % ALIAS)
-authorize_show = extensions.extension_authorizer('compute',
-                                                 'v3:%s:show' % ALIAS)
-authorize_delete = extensions.extension_authorizer('compute',
-                                                   'v3:%s:delete' % ALIAS)
-authorize_detail = extensions.extension_authorizer('compute',
-                                                   'v3:%s:detail' % ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class QuotaSetsController(wsgi.Controller):
 
     def _format_quota_set(self, project_id, quota_set):
         """Convert the quota object to a result dict."""
-        quota_set.update(id=str(project_id))
-        return dict(quota_set=quota_set)
+        if project_id:
+            result = dict(id=str(project_id))
+        else:
+            result = {}
+
+        for resource in QUOTAS.resources:
+            if resource in quota_set:
+                result[resource] = quota_set[resource]
+        return dict(quota_set=result)
 
     def _validate_quota_limit(self, resource, limit, minimum, maximum):
         # NOTE: -1 is a flag value for unlimited
-        if ((limit < minimum) and
-           (maximum != -1 or (maximum == -1 and limit != -1))):
+        if limit < -1:
+            msg = (_("Quota limit %(limit)s for %(resource)s "
+                     "must be -1 or greater.") %
+                   {'limit': limit, 'resource': resource})
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        def conv_inf(value):
+            return float("inf") if value == -1 else value
+
+        if conv_inf(limit) < conv_inf(minimum):
             msg = (_("Quota limit %(limit)s for %(resource)s must "
                      "be greater than or equal to already used and "
                      "reserved %(minimum)s.") %
                    {'limit': limit, 'resource': resource, 'minimum': minimum})
             raise webob.exc.HTTPBadRequest(explanation=msg)
-        if maximum != -1 and limit > maximum:
+        if conv_inf(limit) > conv_inf(maximum):
             msg = (_("Quota limit %(limit)s for %(resource)s must be "
                      "less than or equal to %(maximum)s.") %
                    {'limit': limit, 'resource': resource, 'maximum': maximum})
@@ -72,12 +80,12 @@ class QuotaSetsController(wsgi.Controller):
         if usages:
             return values
         else:
-            return dict((k, v['limit']) for k, v in values.items())
+            return {k: v['limit'] for k, v in values.items()}
 
     @extensions.expected_errors(403)
     def show(self, req, id):
         context = req.environ['nova.context']
-        authorize_show(context)
+        authorize(context, action='show')
         params = urlparse.parse_qs(req.environ.get('QUERY_STRING', ''))
         user_id = params.get('user_id', [None])[0]
         try:
@@ -90,7 +98,7 @@ class QuotaSetsController(wsgi.Controller):
     @extensions.expected_errors(403)
     def detail(self, req, id):
         context = req.environ['nova.context']
-        authorize_detail(context)
+        authorize(context, action='detail')
         user_id = req.GET.get('user_id', None)
         try:
             nova.context.authorize_project_context(context, id)
@@ -104,7 +112,7 @@ class QuotaSetsController(wsgi.Controller):
     @validation.schema(quota_sets.update)
     def update(self, req, id, body):
         context = req.environ['nova.context']
-        authorize_update(context)
+        authorize(context, action='update')
         project_id = id
         params = urlparse.parse_qs(req.environ.get('QUERY_STRING', ''))
         user_id = params.get('user_id', [None])[0]
@@ -119,6 +127,9 @@ class QuotaSetsController(wsgi.Controller):
         except exception.Forbidden:
             raise webob.exc.HTTPForbidden()
 
+        # NOTE(dims): Pass #1 - In this loop for quota_set.items(), we validate
+        # min/max values and bail out if any of the items in the set is bad.
+        valid_quotas = {}
         for key, value in body['quota_set'].iteritems():
             if key == 'force' or (not value and value != 0):
                 continue
@@ -130,7 +141,13 @@ class QuotaSetsController(wsgi.Controller):
                 minimum = settable_quotas[key]['minimum']
                 maximum = settable_quotas[key]['maximum']
                 self._validate_quota_limit(key, value, minimum, maximum)
+            valid_quotas[key] = value
 
+        # NOTE(dims): Pass #2 - At this point we know that all the
+        # values are correct and we can iterate and update them all in one
+        # shot without having to worry about rolling back etc as we have done
+        # the validation up front in the loop above.
+        for key, value in valid_quotas.items():
             try:
                 objects.Quotas.create_limit(context, project_id,
                                             key, value, user_id=user_id)
@@ -139,13 +156,15 @@ class QuotaSetsController(wsgi.Controller):
                                             key, value, user_id=user_id)
             except exception.AdminRequired:
                 raise webob.exc.HTTPForbidden()
-        return self._format_quota_set(id, self._get_quotas(context, id,
-                                                           user_id=user_id))
+        # Note(gmann): Removed 'id' from update's response to make it same
+        # as V2. If needed it can be added with microversion.
+        return self._format_quota_set(None, self._get_quotas(context, id,
+                                                             user_id=user_id))
 
     @extensions.expected_errors(())
     def defaults(self, req, id):
         context = req.environ['nova.context']
-        authorize_show(context)
+        authorize(context, action='show')
         values = QUOTAS.get_defaults(context)
         return self._format_quota_set(id, values)
 
@@ -156,7 +175,7 @@ class QuotaSetsController(wsgi.Controller):
     @wsgi.response(202)
     def delete(self, req, id):
         context = req.environ['nova.context']
-        authorize_delete(context)
+        authorize(context, action='delete')
         params = urlparse.parse_qs(req.environ.get('QUERY_STRING', ''))
         user_id = params.get('user_id', [None])[0]
         try:

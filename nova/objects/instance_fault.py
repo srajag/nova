@@ -14,6 +14,8 @@
 
 import itertools
 
+from oslo_log import log as logging
+
 from nova.cells import opts as cells_opts
 from nova.cells import rpcapi as cells_rpcapi
 from nova import db
@@ -22,13 +24,14 @@ from nova.i18n import _LE
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
-from nova.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
 
 
-class InstanceFault(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+class InstanceFault(base.NovaPersistentObject, base.NovaObject,
+                    base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: String attributes updated to support unicode
     # Version 1.2: Added create()
@@ -61,7 +64,7 @@ class InstanceFault(base.NovaPersistentObject, base.NovaObject):
                                        db_faults[instance_uuid][0])
 
     @base.remotable
-    def create(self, context):
+    def create(self):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
@@ -72,8 +75,8 @@ class InstanceFault(base.NovaPersistentObject, base.NovaObject):
             'details': self.details,
             'host': self.host,
             }
-        db_fault = db.instance_fault_create(context, values)
-        self._from_db_object(context, self, db_fault)
+        db_fault = db.instance_fault_create(self._context, values)
+        self._from_db_object(self._context, self, db_fault)
         self.obj_reset_changes()
         # Cells should only try sending a message over to nova-cells
         # if cells is enabled and we're not the API cell. Otherwise,
@@ -82,7 +85,7 @@ class InstanceFault(base.NovaPersistentObject, base.NovaObject):
         if cells_opts.get_cell_type() == 'compute':
             try:
                 cells_rpcapi.CellsAPI().instance_fault_create_at_top(
-                    context, db_fault)
+                    self._context, db_fault)
             except Exception:
                 LOG.exception(_LE("Failed to notify cells of instance fault"))
 

@@ -13,12 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import logging
-
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from nova import exception
-from nova.i18n import _
+from nova.i18n import _, _LI
 import nova.image.download.base as xfer_base
 import nova.virt.libvirt.utils as lv_utils
 
@@ -161,7 +160,7 @@ class FileTransfer(xfer_base.TransferBase):
                                                   glance_mountpoint,
                                                   url_parts.path)
         lv_utils.copy_image(source_file, dst_file)
-        LOG.info(_('Copied %(source_file)s using %(module_str)s') %
+        LOG.info(_LI('Copied %(source_file)s using %(module_str)s'),
                  {'source_file': source_file, 'module_str': str(self)})
 
 

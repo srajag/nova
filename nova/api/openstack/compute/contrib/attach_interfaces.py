@@ -15,6 +15,9 @@
 
 """The instance interfaces extension."""
 
+import netaddr
+from oslo_log import log as logging
+import six
 import webob
 from webob import exc
 
@@ -23,8 +26,8 @@ from nova.api.openstack import extensions
 from nova import compute
 from nova import exception
 from nova.i18n import _
+from nova.i18n import _LI
 from nova import network
-from nova.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
@@ -74,7 +77,7 @@ class InterfaceAttachmentController(object):
             raise exc.HTTPForbidden(explanation=e.format_message())
 
         if port_info['port']['device_id'] != server_id:
-            msg = _("Instance %(instance)s does not have a port with id"
+            msg = _("Instance %(instance)s does not have a port with id "
                     "%(port)s") % {'instance': server_id, 'port': port_id}
             raise exc.HTTPNotFound(explanation=msg)
 
@@ -105,19 +108,27 @@ class InterfaceAttachmentController(object):
             msg = _("Must input network_id when request IP address")
             raise exc.HTTPBadRequest(explanation=msg)
 
+        if req_ip:
+            try:
+                netaddr.IPAddress(req_ip)
+            except netaddr.AddrFormatError as e:
+                raise exc.HTTPBadRequest(explanation=six.text_type(e))
+
         try:
             instance = common.get_instance(self.compute_api,
-                                           context, server_id,
-                                           want_objects=True)
-            LOG.audit(_("Attach interface"), instance=instance)
+                                           context, server_id)
+            LOG.info(_LI("Attach interface"), instance=instance)
             vif = self.compute_api.attach_interface(context,
                 instance, network_id, port_id, req_ip)
         except (exception.PortNotFound,
-                exception.FixedIpAlreadyInUse,
+                exception.NetworkNotFound) as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
+        except (exception.FixedIpAlreadyInUse,
+                exception.NoMoreFixedIps,
                 exception.PortInUse,
                 exception.NetworkDuplicated,
                 exception.NetworkAmbiguous,
-                exception.NetworkNotFound) as e:
+                exception.PortNotUsable) as e:
             raise exc.HTTPBadRequest(explanation=e.format_message())
         except exception.InstanceIsLocked as e:
             raise exc.HTTPConflict(explanation=e.format_message())
@@ -125,7 +136,6 @@ class InterfaceAttachmentController(object):
             msg = _("Network driver does not support this function.")
             raise webob.exc.HTTPNotImplemented(explanation=msg)
         except exception.InterfaceAttachFailed as e:
-            LOG.exception(e)
             msg = _("Failed to attach interface")
             raise webob.exc.HTTPInternalServerError(explanation=msg)
         except exception.InstanceInvalidState as state_error:
@@ -140,9 +150,8 @@ class InterfaceAttachmentController(object):
         authorize(context)
         port_id = id
         instance = common.get_instance(self.compute_api,
-                                       context, server_id,
-                                       want_objects=True)
-        LOG.audit(_("Detach interface %s"), port_id, instance=instance)
+                                       context, server_id)
+        LOG.info(_LI("Detach interface %s"), port_id, instance=instance)
         try:
             self.compute_api.detach_interface(context,
                 instance, port_id=port_id)
@@ -163,8 +172,7 @@ class InterfaceAttachmentController(object):
         """Returns a list of attachments, transformed through entity_maker."""
         context = req.environ['nova.context']
         authorize(context)
-        instance = common.get_instance(self.compute_api, context, server_id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, server_id)
         results = []
         search_opts = {'device_id': instance.uuid}
 

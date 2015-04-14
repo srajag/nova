@@ -24,20 +24,20 @@ import os
 import sys
 import traceback
 
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
 
 from nova.conductor import rpcapi as conductor_rpcapi
 from nova import config
 from nova import context
 import nova.db.api
 from nova import exception
-from nova.i18n import _, _LE
+from nova.i18n import _LE
 from nova.network import rpcapi as network_rpcapi
 from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common import log as logging
 from nova import rpc
 
 CONF = cfg.CONF
@@ -117,7 +117,7 @@ def main():
     config.parse_args(sys.argv,
         default_config_files=jsonutils.loads(os.environ['CONFIG_FILE']))
 
-    logging.setup("nova")
+    logging.setup(CONF, "nova")
     global LOG
     LOG = logging.getLogger('nova.dhcpbridge')
     objects.register_all()
@@ -128,11 +128,10 @@ def main():
             conductor_rpcapi.ConductorAPI()
 
     if CONF.action.name in ['add', 'del', 'old']:
-        msg = (_("Called '%(action)s' for mac '%(mac)s' with ip '%(ip)s'") %
-               {"action": CONF.action.name,
-                "mac": CONF.action.mac,
-                "ip": CONF.action.ip})
-        LOG.debug(msg)
+        LOG.debug("Called '%(action)s' for mac '%(mac)s' with ip '%(ip)s'",
+                  {"action": CONF.action.name,
+                   "mac": CONF.action.mac,
+                   "ip": CONF.action.ip})
         CONF.action.func(CONF.action.mac, CONF.action.ip)
     else:
         try:

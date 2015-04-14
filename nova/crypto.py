@@ -28,19 +28,19 @@ import re
 import string
 import struct
 
-from oslo.concurrency import processutils
-from oslo.config import cfg
-from oslo.utils import excutils
-from oslo.utils import timeutils
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import timeutils
 from pyasn1.codec.der import encoder as der_encoder
 from pyasn1.type import univ
 
 from nova import context
 from nova import db
 from nova import exception
-from nova.i18n import _
+from nova.i18n import _, _LE
 from nova.openstack.common import fileutils
-from nova.openstack.common import log as logging
 from nova import paths
 from nova import utils
 
@@ -120,8 +120,10 @@ def ensure_ca_filesystem():
         start = os.getcwd()
         fileutils.ensure_tree(ca_dir)
         os.chdir(ca_dir)
-        utils.execute("sh", genrootca_sh_path)
-        os.chdir(start)
+        try:
+            utils.execute("sh", genrootca_sh_path)
+        finally:
+            os.chdir(start)
 
 
 def _generate_fingerprint(public_key_file):
@@ -140,6 +142,19 @@ def generate_fingerprint(public_key):
         except processutils.ProcessExecutionError:
             raise exception.InvalidKeypair(
                 reason=_('failed to generate fingerprint'))
+
+
+def generate_x509_fingerprint(pem_key):
+    try:
+        (out, _err) = utils.execute('openssl', 'x509', '-inform', 'PEM',
+                                    '-fingerprint', '-noout',
+                                    process_input=pem_key)
+        fingerprint = string.strip(out.rpartition('=')[2])
+        return fingerprint.lower()
+    except processutils.ProcessExecutionError as ex:
+        raise exception.InvalidKeypair(
+            reason=_('failed to generate X509 fingerprint. '
+                     'Error message: %s') % ex)
 
 
 def generate_key_pair(bits=None):
@@ -350,6 +365,44 @@ def generate_x509_cert(user_id, project_id, bits=2048):
     return (private_key, signed_csr)
 
 
+def generate_winrm_x509_cert(user_id, project_id, bits=2048):
+    """Generate a cert for passwordless auth for user in project."""
+    subject = '/CN=%s-%s' % (project_id, user_id)
+    upn = '%s@localhost' % user_id
+
+    with utils.tempdir() as tmpdir:
+        keyfile = os.path.abspath(os.path.join(tmpdir, 'temp.key'))
+        conffile = os.path.abspath(os.path.join(tmpdir, 'temp.conf'))
+
+        _create_x509_openssl_config(conffile, upn)
+
+        (certificate, _err) = utils.execute(
+             'openssl', 'req', '-x509', '-nodes', '-days', '3650',
+             '-config', conffile, '-newkey', 'rsa:%s' % bits,
+             '-outform', 'PEM', '-keyout', keyfile, '-subj', subject,
+             '-extensions', 'v3_req_client')
+
+        (out, _err) = utils.execute('openssl', 'pkcs12', '-export',
+                                    '-inkey', keyfile, '-password', 'pass:',
+                                    process_input=certificate)
+
+        private_key = out.encode('base64')
+        fingerprint = generate_x509_fingerprint(certificate)
+
+    return (private_key, certificate, fingerprint)
+
+
+def _create_x509_openssl_config(conffile, upn):
+    content = ("distinguished_name  = req_distinguished_name\n"
+               "[req_distinguished_name]\n"
+               "[v3_req_client]\n"
+               "extendedKeyUsage = clientAuth\n"
+               "subjectAltName = otherName:""1.3.6.1.4.1.311.20.2.3;UTF8:%s\n")
+
+    with open(conffile, 'w') as file:
+        file.write(content % upn)
+
+
 def _ensure_project_folder(project_id):
     if not os.path.exists(ca_path(project_id)):
         geninter_sh_path = os.path.abspath(
@@ -399,7 +452,7 @@ def _sign_csr(csr_text, ca_folder):
                 csrfile.write(csr_text)
         except IOError:
             with excutils.save_and_reraise_exception():
-                LOG.exception(_('Failed to write inbound.csr'))
+                LOG.exception(_LE('Failed to write inbound.csr'))
 
         LOG.debug('Flags path: %s', ca_folder)
         start = os.getcwd()

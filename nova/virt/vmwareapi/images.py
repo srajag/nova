@@ -18,17 +18,21 @@ Utility functions for Image transfer and manipulation.
 """
 
 import os
+import tarfile
+import tempfile
 
-from oslo.config import cfg
-from oslo.utils import strutils
-from oslo.utils import units
+from lxml import etree
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import strutils
+from oslo_utils import units
+from oslo_vmware import rw_handles
 
 from nova import exception
+from nova.i18n import _, _LE, _LI
 from nova import image
-from nova.openstack.common import log as logging
 from nova.virt.vmwareapi import constants
 from nova.virt.vmwareapi import io_util
-from nova.virt.vmwareapi import read_write_util
 
 # NOTE(mdbooth): We use use_linked_clone below, but don't have to import it
 # because nova.virt.vmwareapi.driver is imported first. In fact, it is not
@@ -51,6 +55,7 @@ class VMwareImage(object):
                  os_type=constants.DEFAULT_OS_TYPE,
                  adapter_type=constants.DEFAULT_ADAPTER_TYPE,
                  disk_type=constants.DEFAULT_DISK_TYPE,
+                 container_format=constants.CONTAINER_FORMAT_BARE,
                  file_type=constants.DEFAULT_DISK_FORMAT,
                  linked_clone=None,
                  vif_model=constants.DEFAULT_VIF_MODEL):
@@ -61,6 +66,7 @@ class VMwareImage(object):
             os_type (str): name of guest os (use vSphere names only)
             adapter_type (str): name of the adapter's type
             disk_type (str): type of disk in thin, thick, etc
+            container_format (str): container format (bare or ova)
             file_type (str): vmdk or iso
             linked_clone(bool): use linked clone, or don't
         """
@@ -68,6 +74,7 @@ class VMwareImage(object):
         self.file_size = file_size
         self.os_type = os_type
         self.adapter_type = adapter_type
+        self.container_format = container_format
         self.disk_type = disk_type
         self.file_type = file_type
 
@@ -95,6 +102,10 @@ class VMwareImage(object):
     def is_iso(self):
         return self.file_type == constants.DISK_FORMAT_ISO
 
+    @property
+    def is_ova(self):
+        return self.container_format == constants.CONTAINER_FORMAT_OVA
+
     @classmethod
     def from_image(cls, image_id, image_meta=None):
         """Returns VMwareImage, the subset of properties the driver uses.
@@ -119,7 +130,8 @@ class VMwareImage(object):
 
         props = {
             'image_id': image_id,
-            'linked_clone': linked_clone
+            'linked_clone': linked_clone,
+            'container_format': image_meta.get('container_format')
         }
 
         if 'size' in image_meta:
@@ -187,7 +199,7 @@ def start_transfer(context, read_file_handle, data_size,
         write_thread.stop()
 
         # Log and raise the exception.
-        LOG.exception(exc)
+        LOG.exception(_LE('Transfer data failed'))
         raise exception.NovaException(exc)
     finally:
         # No matter what, try closing the read and write handles, if it so
@@ -201,8 +213,9 @@ def upload_iso_to_datastore(iso_path, instance, **kwargs):
     LOG.debug("Uploading iso %s to datastore", iso_path,
               instance=instance)
     with open(iso_path, 'r') as iso_file:
-        write_file_handle = read_write_util.VMwareHTTPWriteFile(
+        write_file_handle = rw_handles.FileWriteHandle(
             kwargs.get("host"),
+            kwargs.get("port"),
             kwargs.get("data_center_name"),
             kwargs.get("datastore_name"),
             kwargs.get("cookies"),
@@ -222,10 +235,10 @@ def upload_iso_to_datastore(iso_path, instance, **kwargs):
               instance=instance)
 
 
-def fetch_image(context, instance, host, dc_name, ds_name, file_path,
+def fetch_image(context, instance, host, port, dc_name, ds_name, file_path,
                 cookies=None):
     """Download image from the glance image server."""
-    image_ref = instance['image_ref']
+    image_ref = instance.image_ref
     LOG.debug("Downloading image file data %(image_ref)s to the "
               "data store %(data_store_name)s",
               {'image_ref': image_ref,
@@ -235,9 +248,9 @@ def fetch_image(context, instance, host, dc_name, ds_name, file_path,
     metadata = IMAGE_API.get(context, image_ref)
     file_size = int(metadata['size'])
     read_iter = IMAGE_API.download(context, image_ref)
-    read_file_handle = read_write_util.GlanceFileRead(read_iter)
-    write_file_handle = read_write_util.VMwareHTTPWriteFile(
-        host, dc_name, ds_name, cookies, file_path, file_size)
+    read_file_handle = rw_handles.ImageReadHandle(read_iter)
+    write_file_handle = rw_handles.FileWriteHandle(
+        host, port, dc_name, ds_name, cookies, file_path, file_size)
     start_transfer(context, read_file_handle, file_size,
                    write_file_handle=write_file_handle)
     LOG.debug("Downloaded image file data %(image_ref)s to "
@@ -249,35 +262,221 @@ def fetch_image(context, instance, host, dc_name, ds_name, file_path,
               instance=instance)
 
 
-def upload_image(context, image, instance, **kwargs):
-    """Upload the snapshotted vm disk file to Glance image server."""
-    LOG.debug("Uploading image %s to the Glance image server", image,
-              instance=instance)
-    read_file_handle = read_write_util.VMwareHTTPReadFile(
-                                kwargs.get("host"),
-                                kwargs.get("data_center_name"),
-                                kwargs.get("datastore_name"),
-                                kwargs.get("cookies"),
-                                kwargs.get("file_path"))
-    file_size = read_file_handle.get_size()
-    metadata = IMAGE_API.get(context, image)
+def _build_shadow_vm_config_spec(session, name, size_kb, disk_type, ds_name):
+    """Return spec for creating a shadow VM for image disk.
 
-    # The properties and other fields that we need to set for the image.
-    image_metadata = {"disk_format": "vmdk",
-                      "is_public": "false",
-                      "name": metadata['name'],
-                      "status": "active",
-                      "container_format": "bare",
-                      "size": file_size,
-                      "properties": {"vmware_adaptertype":
-                                            kwargs.get("adapter_type"),
-                                     "vmware_disktype":
-                                            kwargs.get("disk_type"),
-                                     "vmware_ostype": kwargs.get("os_type"),
-                                     "vmware_image_version":
-                                            kwargs.get("image_version"),
-                                     "owner_id": instance['project_id']}}
-    start_transfer(context, read_file_handle, file_size,
-                   image_id=metadata['id'], image_meta=image_metadata)
-    LOG.debug("Uploaded image %s to the Glance image server", image,
+    The VM is never meant to be powered on. When used in importing
+    a disk it governs the directory name created for the VM
+    and the disk type of the disk image to convert to.
+
+    :param name: Name of the backing
+    :param size_kb: Size in KB of the backing
+    :param disk_type: VMDK type for the disk
+    :param ds_name: Datastore name where the disk is to be provisioned
+    :return: Spec for creation
+    """
+    cf = session.vim.client.factory
+    controller_device = cf.create('ns0:VirtualLsiLogicController')
+    controller_device.key = -100
+    controller_device.busNumber = 0
+    controller_device.sharedBus = 'noSharing'
+    controller_spec = cf.create('ns0:VirtualDeviceConfigSpec')
+    controller_spec.operation = 'add'
+    controller_spec.device = controller_device
+
+    disk_device = cf.create('ns0:VirtualDisk')
+    # for very small disks allocate at least 1KB
+    disk_device.capacityInKB = max(1, int(size_kb))
+    disk_device.key = -101
+    disk_device.unitNumber = 0
+    disk_device.controllerKey = -100
+    disk_device_bkng = cf.create('ns0:VirtualDiskFlatVer2BackingInfo')
+    if disk_type == constants.DISK_TYPE_EAGER_ZEROED_THICK:
+        disk_device_bkng.eagerlyScrub = True
+    elif disk_type == constants.DISK_TYPE_THIN:
+        disk_device_bkng.thinProvisioned = True
+    disk_device_bkng.fileName = '[%s]' % ds_name
+    disk_device_bkng.diskMode = 'persistent'
+    disk_device.backing = disk_device_bkng
+    disk_spec = cf.create('ns0:VirtualDeviceConfigSpec')
+    disk_spec.operation = 'add'
+    disk_spec.fileOperation = 'create'
+    disk_spec.device = disk_device
+
+    vm_file_info = cf.create('ns0:VirtualMachineFileInfo')
+    vm_file_info.vmPathName = '[%s]' % ds_name
+
+    create_spec = cf.create('ns0:VirtualMachineConfigSpec')
+    create_spec.name = name
+    create_spec.guestId = 'otherGuest'
+    create_spec.numCPUs = 1
+    create_spec.memoryMB = 128
+    create_spec.deviceChange = [controller_spec, disk_spec]
+    create_spec.files = vm_file_info
+
+    return create_spec
+
+
+def _build_import_spec_for_import_vapp(session, vm_name, datastore_name):
+    vm_create_spec = _build_shadow_vm_config_spec(
+            session, vm_name, 0, constants.DISK_TYPE_THIN, datastore_name)
+
+    client_factory = session.vim.client.factory
+    vm_import_spec = client_factory.create('ns0:VirtualMachineImportSpec')
+    vm_import_spec.configSpec = vm_create_spec
+    return vm_import_spec
+
+
+def fetch_image_stream_optimized(context, instance, session, vm_name,
+                                 ds_name, vm_folder_ref, res_pool_ref):
+    """Fetch image from Glance to ESX datastore."""
+    image_ref = instance.image_ref
+    LOG.debug("Downloading image file data %(image_ref)s to the ESX "
+              "as VM named '%(vm_name)s'",
+              {'image_ref': image_ref, 'vm_name': vm_name},
+              instance=instance)
+
+    metadata = IMAGE_API.get(context, image_ref)
+    file_size = int(metadata['size'])
+
+    vm_import_spec = _build_import_spec_for_import_vapp(
+            session, vm_name, ds_name)
+
+    read_iter = IMAGE_API.download(context, image_ref)
+    read_handle = rw_handles.ImageReadHandle(read_iter)
+
+    write_handle = rw_handles.VmdkWriteHandle(session,
+                                              session._host,
+                                              session._port,
+                                              res_pool_ref,
+                                              vm_folder_ref,
+                                              vm_import_spec,
+                                              file_size)
+    start_transfer(context,
+                   read_handle,
+                   file_size,
+                   write_file_handle=write_handle)
+
+    imported_vm_ref = write_handle.get_imported_vm()
+
+    LOG.info(_LI("Downloaded image file data %(image_ref)s"),
+             {'image_ref': instance.image_ref}, instance=instance)
+    session._call_method(session.vim, "UnregisterVM", imported_vm_ref)
+    LOG.info(_LI("The imported VM was unregistered"), instance=instance)
+
+
+def get_vmdk_name_from_ovf(xmlstr):
+    """Parse the OVA descriptor to extract the vmdk name."""
+
+    ovf = etree.fromstring(xmlstr)
+    nsovf = "{%s}" % ovf.nsmap["ovf"]
+
+    disk = ovf.find("./%sDiskSection/%sDisk" % (nsovf, nsovf))
+    file_id = disk.get("%sfileRef" % nsovf)
+
+    file = ovf.find('./%sReferences/%sFile[@%sid="%s"]' % (nsovf, nsovf,
+                                                           nsovf, file_id))
+    vmdk_name = file.get("%shref" % nsovf)
+    return vmdk_name
+
+
+def fetch_image_ova(context, instance, session, vm_name, ds_name,
+                    vm_folder_ref, res_pool_ref):
+    """Download the OVA image from the glance image server to the
+    Nova compute node.
+    """
+    image_ref = instance.image_ref
+    LOG.debug("Downloading OVA image file %(image_ref)s to the ESX "
+              "as VM named '%(vm_name)s'",
+              {'image_ref': image_ref, 'vm_name': vm_name},
+              instance=instance)
+
+    metadata = IMAGE_API.get(context, image_ref)
+    file_size = int(metadata['size'])
+
+    vm_import_spec = _build_import_spec_for_import_vapp(
+        session, vm_name, ds_name)
+
+    read_iter = IMAGE_API.download(context, image_ref)
+    ova_fd, ova_path = tempfile.mkstemp()
+
+    try:
+        # NOTE(arnaud): Look to eliminate first writing OVA to file system
+        with os.fdopen(ova_fd, 'w') as fp:
+            for chunk in read_iter:
+                fp.write(chunk)
+        with tarfile.open(ova_path, mode="r") as tar:
+            vmdk_name = None
+            for tar_info in tar:
+                if tar_info and tar_info.name.endswith(".ovf"):
+                    extracted = tar.extractfile(tar_info.name)
+                    xmlstr = extracted.read()
+                    vmdk_name = get_vmdk_name_from_ovf(xmlstr)
+                elif vmdk_name and tar_info.name.startswith(vmdk_name):
+                    # Actual file name is <vmdk_name>.XXXXXXX
+                    extracted = tar.extractfile(tar_info.name)
+                    write_handle = rw_handles.VmdkWriteHandle(
+                        session,
+                        session._host,
+                        session._port,
+                        res_pool_ref,
+                        vm_folder_ref,
+                        vm_import_spec,
+                        file_size)
+                    start_transfer(context,
+                                   extracted,
+                                   file_size,
+                                   write_file_handle=write_handle)
+                    extracted.close()
+                    LOG.info(_LI("Downloaded OVA image file %(image_ref)s"),
+                        {'image_ref': instance.image_ref}, instance=instance)
+                    imported_vm_ref = write_handle.get_imported_vm()
+                    session._call_method(session.vim, "UnregisterVM",
+                                         imported_vm_ref)
+                    LOG.info(_LI("The imported VM was unregistered"),
+                             instance=instance)
+                    return
+            raise exception.ImageUnacceptable(
+                reason=_("Extracting vmdk from OVA failed."),
+                image_id=image_ref)
+    finally:
+        os.unlink(ova_path)
+
+
+def upload_image_stream_optimized(context, image_id, instance, session,
+                                  vm, vmdk_size):
+    """Upload the snapshotted vm disk file to Glance image server."""
+    LOG.debug("Uploading image %s", image_id, instance=instance)
+    metadata = IMAGE_API.get(context, image_id)
+
+    read_handle = rw_handles.VmdkReadHandle(session,
+                                            session._host,
+                                            session._port,
+                                            vm,
+                                            None,
+                                            vmdk_size)
+
+    # Set the image properties. It is important to set the 'size' to 0.
+    # Otherwise, the image service client will use the VM's disk capacity
+    # which will not be the image size after upload, since it is converted
+    # to a stream-optimized sparse disk.
+    image_metadata = {'disk_format': 'vmdk',
+                      'is_public': metadata['is_public'],
+                      'name': metadata['name'],
+                      'status': 'active',
+                      'container_format': 'bare',
+                      'size': 0,
+                      'properties': {'vmware_image_version': 1,
+                                     'vmware_disktype': 'streamOptimized',
+                                     'owner_id': instance.project_id}}
+
+    # Passing 0 as the file size since data size to be transferred cannot be
+    # predetermined.
+    start_transfer(context,
+                   read_handle,
+                   0,
+                   image_id=image_id,
+                   image_meta=image_metadata)
+
+    LOG.debug("Uploaded image %s to the Glance image server", image_id,
               instance=instance)

@@ -16,8 +16,7 @@
 import webob.exc
 
 from nova.api.openstack import extensions
-from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
+from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
 from nova import objects
@@ -25,21 +24,6 @@ from nova import utils
 
 
 authorize = extensions.extension_authorizer('compute', 'agents')
-
-
-class AgentsIndexTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('agents')
-        elem = xmlutil.SubTemplateElement(root, 'agent', selector='agents')
-        elem.set('hypervisor')
-        elem.set('os')
-        elem.set('architecture')
-        elem.set('version')
-        elem.set('md5hash')
-        elem.set('agent_id')
-        elem.set('url')
-
-        return xmlutil.MasterTemplate(root, 1)
 
 
 class AgentController(object):
@@ -64,11 +48,13 @@ class AgentController(object):
     http://wiki.openstack.org/GuestAgent
     http://wiki.openstack.org/GuestAgentXenStoreCommunication
     """
-    @wsgi.serializers(xml=AgentsIndexTemplate)
     def index(self, req):
         """Return a list of all agent builds. Filter by hypervisor."""
         context = req.environ['nova.context']
         authorize(context)
+        # NOTE(alex_xu): back-compatible with db layer hard-code admin
+        # permission checks.
+        nova_context.require_admin_context(context)
         hypervisor = None
         agents = []
         if 'hypervisor' in req.GET:
@@ -90,7 +76,9 @@ class AgentController(object):
         """Update an existing agent build."""
         context = req.environ['nova.context']
         authorize(context)
-
+        # NOTE(alex_xu): back-compatible with db layer hard-code admin
+        # permission checks.
+        nova_context.require_admin_context(context)
         try:
             para = body['para']
             url = para['url']
@@ -132,7 +120,9 @@ class AgentController(object):
         """Deletes an existing agent build."""
         context = req.environ['nova.context']
         authorize(context)
-
+        # NOTE(alex_xu): back-compatible with db layer hard-code admin
+        # permission checks.
+        nova_context.require_admin_context(context)
         try:
             agent = objects.Agent(context=context, id=id)
             agent.destroy()
@@ -143,7 +133,9 @@ class AgentController(object):
         """Creates a new agent build."""
         context = req.environ['nova.context']
         authorize(context)
-
+        # NOTE(alex_xu): back-compatible with db layer hard-code admin
+        # permission checks.
+        nova_context.require_admin_context(context)
         try:
             agent = body['agent']
             hypervisor = agent['hypervisor']

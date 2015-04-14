@@ -16,56 +16,14 @@ import webob.exc
 
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova import compute
+from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
 from nova import servicegroup
 from nova import utils
 
 authorize = extensions.extension_authorizer('compute', 'services')
-
-
-class ServicesIndexTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('services')
-        elem = xmlutil.SubTemplateElement(root, 'service', selector='services')
-        elem.set('id')
-        elem.set('binary')
-        elem.set('host')
-        elem.set('zone')
-        elem.set('status')
-        elem.set('state')
-        elem.set('updated_at')
-        elem.set('disabled_reason')
-
-        return xmlutil.MasterTemplate(root, 1)
-
-
-class ServiceUpdateTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('service', selector='service')
-        root.set('host')
-        root.set('binary')
-        root.set('status')
-        root.set('disabled_reason')
-
-        return xmlutil.MasterTemplate(root, 1)
-
-
-class ServiceUpdateDeserializer(wsgi.XMLDeserializer):
-    def default(self, string):
-        node = xmlutil.safe_minidom_parse_string(string)
-        service = {}
-        service_node = self.find_first_child_named(node, 'service')
-        if service_node is None:
-            return service
-        service['host'] = service_node.getAttribute('host')
-        service['binary'] = service_node.getAttribute('binary')
-        service['disabled_reason'] = service_node.getAttribute(
-                                                    'disabled_reason')
-
-        return dict(body=service)
 
 
 class ServiceController(object):
@@ -78,6 +36,11 @@ class ServiceController(object):
     def _get_services(self, req):
         context = req.environ['nova.context']
         authorize(context)
+
+        # NOTE(alex_xu): back-compatible with db layer hard-code admin
+        # permission checks
+        nova_context.require_admin_context(context)
+
         services = self.host_api.service_get_all(
             context, set_zones=True)
 
@@ -136,6 +99,9 @@ class ServiceController(object):
 
         context = req.environ['nova.context']
         authorize(context)
+        # NOTE(alex_xu): back-compatible with db layer hard-code admin
+        # permission checks
+        nova_context.require_admin_context(context)
 
         try:
             self.host_api.service_delete(context, id)
@@ -143,7 +109,6 @@ class ServiceController(object):
             explanation = _("Service %s not found.") % id
             raise webob.exc.HTTPNotFound(explanation=explanation)
 
-    @wsgi.serializers(xml=ServicesIndexTemplate)
     def index(self, req):
         """Return a list of all running services."""
         detailed = self.ext_mgr.is_loaded('os-extended-services')
@@ -151,13 +116,13 @@ class ServiceController(object):
 
         return {'services': services}
 
-    @wsgi.deserializers(xml=ServiceUpdateDeserializer)
-    @wsgi.serializers(xml=ServiceUpdateTemplate)
     def update(self, req, id, body):
         """Enable/Disable scheduling for a service."""
         context = req.environ['nova.context']
         authorize(context)
-
+        # NOTE(alex_xu): back-compatible with db layer hard-code admin
+        # permission checks
+        nova_context.require_admin_context(context)
         ext_loaded = self.ext_mgr.is_loaded('os-extended-services')
         if id == "enable":
             disabled = False

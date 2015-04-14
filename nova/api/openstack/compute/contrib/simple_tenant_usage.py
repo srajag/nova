@@ -16,18 +16,15 @@
 import datetime
 
 import iso8601
-from oslo.utils import timeutils
+from oslo_utils import timeutils
 import six
 import six.moves.urllib.parse as urlparse
 from webob import exc
 
 from nova.api.openstack import extensions
-from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova import exception
 from nova.i18n import _
 from nova import objects
-from nova.objects import instance as instance_obj
 
 authorize_show = extensions.extension_authorizer('compute',
                                                  'simple_tenant_usage:show')
@@ -35,44 +32,11 @@ authorize_list = extensions.extension_authorizer('compute',
                                                  'simple_tenant_usage:list')
 
 
-def make_usage(elem):
-    for subelem_tag in ('tenant_id', 'total_local_gb_usage',
-                        'total_vcpus_usage', 'total_memory_mb_usage',
-                        'total_hours', 'start', 'stop'):
-        subelem = xmlutil.SubTemplateElement(elem, subelem_tag)
-        subelem.text = subelem_tag
-
-    server_usages = xmlutil.SubTemplateElement(elem, 'server_usages')
-    server_usage = xmlutil.SubTemplateElement(server_usages, 'server_usage',
-                                              selector='server_usages')
-    for subelem_tag in ('instance_id', 'name', 'hours', 'memory_mb',
-                        'local_gb', 'vcpus', 'tenant_id', 'flavor',
-                        'started_at', 'ended_at', 'state', 'uptime'):
-        subelem = xmlutil.SubTemplateElement(server_usage, subelem_tag)
-        subelem.text = subelem_tag
-
-
 def parse_strtime(dstr, fmt):
     try:
         return timeutils.parse_strtime(dstr, fmt)
     except (TypeError, ValueError) as e:
         raise exception.InvalidStrTime(reason=six.text_type(e))
-
-
-class SimpleTenantUsageTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('tenant_usage', selector='tenant_usage')
-        make_usage(root)
-        return xmlutil.MasterTemplate(root, 1)
-
-
-class SimpleTenantUsagesTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('tenant_usages')
-        elem = xmlutil.SubTemplateElement(root, 'tenant_usage',
-                                          selector='tenant_usages')
-        make_usage(elem)
-        return xmlutil.MasterTemplate(root, 1)
 
 
 class SimpleTenantUsageController(object):
@@ -118,7 +82,7 @@ class SimpleTenantUsageController(object):
         """
         try:
             return instance.get_flavor()
-        except KeyError:
+        except exception.NotFound:
             if not instance.deleted:
                 # Only support the fallback mechanism for deleted instances
                 # that would have been skipped by migration #153
@@ -142,7 +106,7 @@ class SimpleTenantUsageController(object):
 
         instances = objects.InstanceList.get_active_by_window_joined(
                         context, period_start, period_stop, tenant_id,
-                        expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS)
+                        expected_attrs=['system_metadata'])
         rval = {}
         flavors = {}
 
@@ -255,7 +219,6 @@ class SimpleTenantUsageController(object):
         detailed = env.get('detailed', ['0'])[0] == '1'
         return (period_start, period_stop, detailed)
 
-    @wsgi.serializers(xml=SimpleTenantUsagesTemplate)
     def index(self, req):
         """Retrieve tenant_usage for all tenants."""
         context = req.environ['nova.context']
@@ -277,7 +240,6 @@ class SimpleTenantUsageController(object):
                                                 detailed=detailed)
         return {'tenant_usages': usages}
 
-    @wsgi.serializers(xml=SimpleTenantUsageTemplate)
     def show(self, req, id):
         """Retrieve tenant_usage for a specified tenant."""
         tenant_id = id

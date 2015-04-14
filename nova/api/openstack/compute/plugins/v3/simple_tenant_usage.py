@@ -16,22 +16,19 @@
 import datetime
 
 import iso8601
-from oslo.utils import timeutils
+from oslo_utils import timeutils
 import six
 import six.moves.urllib.parse as urlparse
 from webob import exc
 
 from nova.api.openstack import extensions
+from nova.api.openstack import wsgi
 from nova import exception
 from nova.i18n import _
 from nova import objects
-from nova.objects import instance as instance_obj
 
 ALIAS = "os-simple-tenant-usage"
-authorize_show = extensions.extension_authorizer('compute',
-                                                 'v3:%s:show' % ALIAS)
-authorize_list = extensions.extension_authorizer('compute',
-                                                 'v3:%s:list' % ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 def parse_strtime(dstr, fmt):
@@ -41,7 +38,7 @@ def parse_strtime(dstr, fmt):
         raise exception.InvalidStrTime(reason=six.text_type(e))
 
 
-class SimpleTenantUsageController(object):
+class SimpleTenantUsageController(wsgi.Controller):
     def _hours_for(self, instance, period_start, period_stop):
         launched_at = instance.launched_at
         terminated_at = instance.terminated_at
@@ -84,7 +81,7 @@ class SimpleTenantUsageController(object):
         """
         try:
             return instance.get_flavor()
-        except KeyError:
+        except exception.NotFound:
             if not instance.deleted:
                 # Only support the fallback mechanism for deleted instances
                 # that would have been skipped by migration #153
@@ -108,7 +105,7 @@ class SimpleTenantUsageController(object):
 
         instances = objects.InstanceList.get_active_by_window_joined(
                         context, period_start, period_stop, tenant_id,
-                        expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS)
+                        expected_attrs=['system_metadata'])
         rval = {}
         flavors = {}
 
@@ -226,7 +223,7 @@ class SimpleTenantUsageController(object):
         """Retrieve tenant_usage for all tenants."""
         context = req.environ['nova.context']
 
-        authorize_list(context)
+        authorize(context, action='list')
 
         try:
             (period_start, period_stop, detailed) = self._get_datetime_range(
@@ -249,7 +246,7 @@ class SimpleTenantUsageController(object):
         tenant_id = id
         context = req.environ['nova.context']
 
-        authorize_show(context, {'project_id': tenant_id})
+        authorize(context, action='show', target={'project_id': tenant_id})
 
         try:
             (period_start, period_stop, ignore) = self._get_datetime_range(

@@ -12,7 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.utils import timeutils
+from oslo_utils import timeutils
 
 from nova import db
 from nova import exception
@@ -26,7 +26,9 @@ FIXED_IP_OPTIONAL_ATTRS = ['instance', 'network', 'virtual_interface',
                            'floating_ips']
 
 
-class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject,
+              obj_base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Added virtual_interface field
     # Version 1.2: Instance version 1.14
@@ -34,7 +36,11 @@ class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
     # Version 1.4: Added default_route field
     # Version 1.5: Added floating_ips field
     # Version 1.6: Instance 1.16
-    VERSION = '1.6'
+    # Version 1.7: Instance 1.17
+    # Version 1.8: Instance 1.18
+    # Version 1.9: Instance 1.19
+    # Version 1.10: Instance 1.20
+    VERSION = '1.10'
 
     fields = {
         'id': fields.IntegerField(),
@@ -57,24 +63,20 @@ class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
         'floating_ips': fields.ObjectField('FloatingIPList'),
         }
 
+    obj_relationships = {
+        'instance': [('1.0', '1.13'), ('1.2', '1.14'), ('1.3', '1.15'),
+                     ('1.6', '1.16'), ('1.7', '1.17'), ('1.8', '1.18'),
+                     ('1.9', '1.19'), ('1.10', '1.20')],
+        'network': [('1.0', '1.2')],
+        'virtual_interface': [('1.1', '1.0')],
+        'floating_ips': [('1.5', '1.7')],
+    }
+
     def obj_make_compatible(self, primitive, target_version):
+        super(FixedIP, self).obj_make_compatible(primitive, target_version)
         target_version = utils.convert_version_to_tuple(target_version)
-        if target_version < (1, 5) and 'floating_ips' in primitive:
-            del primitive['floating_ips']
         if target_version < (1, 4) and 'default_route' in primitive:
             del primitive['default_route']
-        if target_version < (1, 4) and 'instance' in primitive:
-            self.instance.obj_make_compatible(
-                    primitive['instance']['nova_object.data'], '1.15')
-            primitive['instance']['nova_object.version'] = '1.15'
-        if target_version < (1, 3) and 'instance' in primitive:
-            self.instance.obj_make_compatible(
-                    primitive['instance']['nova_object.data'], '1.14')
-            primitive['instance']['nova_object.version'] = '1.14'
-        if target_version < (1, 2) and 'instance' in primitive:
-            self.instance.obj_make_compatible(
-                    primitive['instance']['nova_object.data'], '1.13')
-            primitive['instance']['nova_object.version'] = '1.13'
 
     @staticmethod
     def _from_db_object(context, fixedip, db_fixedip, expected_attrs=None):
@@ -174,28 +176,28 @@ class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
                                                 timeutils.isotime(time))
 
     @obj_base.remotable
-    def create(self, context):
+    def create(self):
         updates = self.obj_get_changes()
         if 'id' in updates:
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
         if 'address' in updates:
             updates['address'] = str(updates['address'])
-        db_fixedip = db.fixed_ip_create(context, updates)
-        self._from_db_object(context, self, db_fixedip)
+        db_fixedip = db.fixed_ip_create(self._context, updates)
+        self._from_db_object(self._context, self, db_fixedip)
 
     @obj_base.remotable
-    def save(self, context):
+    def save(self):
         updates = self.obj_get_changes()
         if 'address' in updates:
             raise exception.ObjectActionError(action='save',
                                               reason='address is not mutable')
-        db.fixed_ip_update(context, str(self.address), updates)
+        db.fixed_ip_update(self._context, str(self.address), updates)
         self.obj_reset_changes()
 
     @obj_base.remotable
-    def disassociate(self, context):
-        db.fixed_ip_disassociate(context, str(self.address))
+    def disassociate(self):
+        db.fixed_ip_disassociate(self._context, str(self.address))
         self.instance_uuid = None
         self.instance = None
         self.obj_reset_changes(['instance_uuid', 'instance'])
@@ -209,7 +211,11 @@ class FixedIPList(obj_base.ObjectListBase, obj_base.NovaObject):
     # Version 1.4: FixedIP <= version 1.4
     # Version 1.5: FixedIP <= version 1.5, added expected attrs to gets
     # Version 1.6: FixedIP <= version 1.6
-    VERSION = '1.6'
+    # Version 1.7: FixedIP <= version 1.7
+    # Version 1.8: FixedIP <= version 1.8
+    # Version 1.9: FixedIP <= version 1.9
+    # Version 1.10: FixedIP <= version 1.10
+    VERSION = '1.10'
 
     fields = {
         'objects': fields.ListOfObjectsField('FixedIP'),
@@ -222,6 +228,10 @@ class FixedIPList(obj_base.ObjectListBase, obj_base.NovaObject):
         '1.4': '1.4',
         '1.5': '1.5',
         '1.6': '1.6',
+        '1.7': '1.7',
+        '1.8': '1.8',
+        '1.9': '1.9',
+        '1.10': '1.10',
         }
 
     @obj_base.remotable_classmethod

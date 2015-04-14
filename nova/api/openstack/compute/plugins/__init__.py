@@ -12,10 +12,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
 
 from nova import exception
-from nova.i18n import _
-from nova.openstack.common import log as logging
+from nova.i18n import _LE
 
 LOG = logging.getLogger(__name__)
 
@@ -31,7 +31,6 @@ class LoadedExtensionInfo(object):
             return False
 
         alias = ext.alias
-        LOG.audit(_("Loaded extension %s"), alias)
 
         if alias in self.extensions:
             raise exception.NovaException("Found duplicate extension: %s"
@@ -42,13 +41,9 @@ class LoadedExtensionInfo(object):
     def _check_extension(self, extension):
         """Checks for required methods in extension objects."""
         try:
-            LOG.debug('Ext name: %s', extension.name)
-            LOG.debug('Ext alias: %s', extension.alias)
-            LOG.debug('Ext description: %s',
-                      ' '.join(extension.__doc__.strip().split()))
-            LOG.debug('Ext version: %i', extension.version)
-        except AttributeError as ex:
-            LOG.exception(_("Exception loading extension: %s"), ex)
+            extension.is_valid()
+        except AttributeError:
+            LOG.exception(_LE("Exception loading extension"))
             return False
 
         return True

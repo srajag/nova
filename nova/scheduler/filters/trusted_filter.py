@@ -43,14 +43,14 @@ the Open Attestation project at:
     https://github.com/OpenAttestation/OpenAttestation
 """
 
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
 import requests
 
 from nova import context
-from nova import db
-from nova.openstack.common import log as logging
+from nova import objects
 from nova.scheduler import filters
 
 LOG = logging.getLogger(__name__)
@@ -105,21 +105,20 @@ class AttestationService(object):
         # :returns: result data
         # :raises: IOError if the request fails
 
-        action_url = "https://%s:%d%s/%s" % (self.host, self.port,
+        action_url = "https://%s:%s%s/%s" % (self.host, self.port,
                                              self.api_url, action_url)
         try:
             res = requests.request(method, action_url, data=body,
                                    headers=headers, cert=self.cert,
                                    verify=self.verify)
             status_code = res.status_code
-            # pylint: disable=E1101
             if status_code in (requests.codes.OK,
                                requests.codes.CREATED,
                                requests.codes.ACCEPTED,
                                requests.codes.NO_CONTENT):
                 try:
                     return requests.codes.OK, jsonutils.loads(res.text)
-                except ValueError:
+                except (TypeError, ValueError):
                     return requests.codes.OK, res.text
             return status_code, None
 
@@ -173,9 +172,9 @@ class ComputeAttestationCache(object):
         # Fetch compute node list to initialize the compute_nodes,
         # so that we don't need poll OAT service one by one for each
         # host in the first round that scheduler invokes us.
-        computes = db.compute_node_get_all(admin)
+        computes = objects.ComputeNodeList.get_all(admin)
         for compute in computes:
-            host = compute['hypervisor_hostname']
+            host = compute.hypervisor_hostname
             self._init_cache_entry(host)
 
     def _cache_valid(self, host):
@@ -254,6 +253,9 @@ class TrustedFilter(filters.BaseHostFilter):
 
     def __init__(self):
         self.compute_attestation = ComputeAttestation()
+
+    # The hosts the instances are running on doesn't change within a request
+    run_filter_once_per_request = True
 
     def host_passes(self, host_state, filter_properties):
         instance_type = filter_properties.get('instance_type', {})

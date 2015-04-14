@@ -35,13 +35,13 @@ the timestamp folder will be locked  and the timestamps will be purged.
 This will ensure that a image is not deleted during the spawn.
 """
 
-from oslo.concurrency import lockutils
-from oslo.config import cfg
-from oslo.utils import timeutils
-from oslo.vmware import exceptions as vexc
+from oslo_concurrency import lockutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
+from oslo_vmware import exceptions as vexc
 
-from nova.i18n import _
-from nova.openstack.common import log as logging
+from nova.i18n import _LI, _LW
 from nova.virt import imagecache
 from nova.virt.vmwareapi import ds_util
 from nova.virt.vmwareapi import vim_util
@@ -71,7 +71,7 @@ class ImageCacheManager(imagecache.ImageCacheManager):
                 vexc.FileLockedException) as e:
             # There may be more than one process or thread that tries
             # to delete the file.
-            LOG.warning(_("Unable to delete %(file)s. Exception: %(ex)s"),
+            LOG.warning(_LW("Unable to delete %(file)s. Exception: %(ex)s"),
                         {'file': ds_path, 'ex': e})
         except vexc.FileNotFoundException:
             LOG.debug("File not found: %s", ds_path)
@@ -159,13 +159,13 @@ class ImageCacheManager(imagecache.ImageCacheManager):
                         ds_util.mkdir(self._session, ts_path, dc_info.ref)
                     except vexc.FileAlreadyExistsException:
                         LOG.debug("Timestamp already exists.")
-                    LOG.info(_("Image %s is no longer used by this node. "
-                               "Pending deletion!"), image)
+                    LOG.info(_LI("Image %s is no longer used by this node. "
+                                 "Pending deletion!"), image)
                 else:
                     dt = self._get_datetime_from_filename(str(ts))
                     if timeutils.is_older_than(dt, age_seconds):
-                        LOG.info(_("Image %s is no longer used. "
-                                   "Deleting!"), path)
+                        LOG.info(_LI("Image %s is no longer used. "
+                                     "Deleting!"), path)
                         # Image has aged - delete the image ID folder
                         self._folder_delete(path, dc_info.ref)
 

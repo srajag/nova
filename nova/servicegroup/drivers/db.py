@@ -13,15 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from oslo.config import cfg
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
 import six
 
 from nova import conductor
 from nova import context
 from nova.i18n import _, _LE
-from nova.openstack.common import log as logging
 from nova.servicegroup import api
+from nova.servicegroup.drivers import base
 
 
 CONF = cfg.CONF
@@ -30,20 +31,32 @@ CONF.import_opt('service_down_time', 'nova.service')
 LOG = logging.getLogger(__name__)
 
 
-class DbDriver(api.ServiceGroupDriver):
+class DbDriver(base.Driver):
 
     def __init__(self, *args, **kwargs):
+        """Creates an instance of the DB-based servicegroup driver.
+
+        Valid kwargs are:
+
+        db_allowed - Boolean. False if direct db access is not allowed and
+                     alternative data access (conductor) should be used
+                     instead.
+        """
         self.db_allowed = kwargs.get('db_allowed', True)
         self.conductor_api = conductor.API(use_local=self.db_allowed)
         self.service_down_time = CONF.service_down_time
 
-    def join(self, member_id, group_id, service=None):
-        """Join the given service with its group."""
+    def join(self, member, group, service=None):
+        """Add a new member to a service group.
 
-        msg = _('DB_Driver: join new ServiceGroup member %(member_id)s to '
-                    'the %(group_id)s group, service = %(service)s')
-        LOG.debug(msg, {'member_id': member_id, 'group_id': group_id,
-                        'service': service})
+        :param member: the joined member ID/name
+        :param group: the group ID/name, of the joined member
+        :param service: a `nova.service.Service` object
+        """
+        LOG.debug('DB_Driver: join new ServiceGroup member %(member)s to '
+                  'the %(group)s group, service = %(service)s',
+                  {'member': member, 'group': group,
+                   'service': service})
         if service is None:
             raise RuntimeError(_('service is a mandatory argument for DB based'
                                  ' ServiceGroup driver'))
@@ -70,9 +83,9 @@ class DbDriver(api.ServiceGroupDriver):
         elapsed = timeutils.delta_seconds(last_heartbeat, timeutils.utcnow())
         is_up = abs(elapsed) <= self.service_down_time
         if not is_up:
-            msg = _('Seems service is down. Last heartbeat was %(lhb)s. '
-                    'Elapsed time is %(el)s')
-            LOG.debug(msg, {'lhb': str(last_heartbeat), 'el': str(elapsed)})
+            LOG.debug('Seems service is down. Last heartbeat was %(lhb)s. '
+                      'Elapsed time is %(el)s',
+                      {'lhb': str(last_heartbeat), 'el': str(elapsed)})
         return is_up
 
     def get_all(self, group_id):
@@ -104,7 +117,7 @@ class DbDriver(api.ServiceGroupDriver):
                 LOG.error(_LE('Recovered model server connection!'))
 
         # TODO(vish): this should probably only catch connection errors
-        except Exception:  # pylint: disable=W0702
+        except Exception:
             if not getattr(service, 'model_disconnected', False):
                 service.model_disconnected = True
                 LOG.exception(_LE('model server went away'))

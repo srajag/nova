@@ -16,12 +16,12 @@
 
 import socket
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 import six.moves
 
 from nova import exception
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 from nova import utils
 
 LOG = logging.getLogger(__name__)
@@ -43,12 +43,12 @@ serial_opts = [
                help='Location of serial console proxy.'),
     cfg.StrOpt('listen',
                default='127.0.0.1',
-               help=('IP address on which instance serial console '
-                     'should listen')),
+               help='IP address on which instance serial console '
+                    'should listen'),
     cfg.StrOpt('proxyclient_address',
                default='127.0.0.1',
-               help=('The address to which proxy clients '
-                     '(like nova-serialproxy) should connect')),
+               help='The address to which proxy clients '
+                    '(like nova-serialproxy) should connect'),
     ]
 
 CONF = cfg.CONF
@@ -77,7 +77,7 @@ def acquire_port(host):
             ALLOCATED_PORTS.add((host, port))
             return port
         except exception.SocketPortInUseException as e:
-            LOG.warn(e)
+            LOG.warn(e.format_message())
 
     raise exception.SocketPortRangeExhaustedException(host=host)
 
@@ -95,11 +95,11 @@ def _get_port_range():
         if start >= stop:
             raise ValueError
     except ValueError:
-        LOG.warn(_LW("serial_console.port_range should be <num>:<num>. "
-                     "Given value %(port_range)s could not be parsed. "
-                     "Taking the default port range %(default)s."),
-                 {'port_range': config_range,
-                  'default': DEFAULT_PORT_RANGE})
+        LOG.warning(_LW("serial_console.port_range should be <num>:<num>. "
+                        "Given value %(port_range)s could not be parsed. "
+                        "Taking the default port range %(default)s."),
+                    {'port_range': config_range,
+                     'default': DEFAULT_PORT_RANGE})
         start, stop = map(int, DEFAULT_PORT_RANGE.split(':'))
     return start, stop
 

@@ -23,13 +23,13 @@ that needs to be implemented by Resource Monitor.
 import functools
 import types
 
-from oslo.config import cfg
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
 import six
 
-from nova.i18n import _
+from nova.i18n import _LW
 from nova import loadables
-from nova.openstack.common import log as logging
 
 compute_monitors_opts = [
     cfg.MultiStrOpt('compute_available_monitors',
@@ -152,8 +152,7 @@ class ResourceMonitorHandler(loadables.BaseLoader):
         """
         monitor_classes = self.get_matching_classes(
              CONF.compute_available_monitors)
-        monitor_class_map = dict((cls.__name__, cls)
-                                 for cls in monitor_classes)
+        monitor_class_map = {cls.__name__: cls for cls in monitor_classes}
         monitor_cls_names = CONF.compute_monitors
         good_monitors = []
         bad_monitors = []
@@ -173,22 +172,22 @@ class ResourceMonitorHandler(loadables.BaseLoader):
                     metric_names = metric_names | metric_names_tmp
                     good_monitors.append(monitor)
                 else:
-                    msg = (_("Excluding monitor %(monitor_name)s due to "
-                             "metric name overlap; overlapping "
-                             "metrics: %(overlap)s") %
-                             {'monitor_name': monitor_name,
-                              'overlap': ', '.join(overlap)})
+                    msg = (_LW("Excluding monitor %(monitor_name)s due to "
+                               "metric name overlap; overlapping "
+                               "metrics: %(overlap)s") %
+                               {'monitor_name': monitor_name,
+                                'overlap': ', '.join(overlap)})
                     LOG.warn(msg)
                     bad_monitors.append(monitor_name)
             except Exception as ex:
-                msg = (_("Monitor %(monitor_name)s cannot be used: %(ex)s") %
-                         {'monitor_name': monitor_name, 'ex': ex})
+                msg = (_LW("Monitor %(monitor_name)s cannot be used: %(ex)s") %
+                          {'monitor_name': monitor_name, 'ex': ex})
                 LOG.warn(msg)
                 bad_monitors.append(monitor_name)
 
         if bad_monitors:
-            LOG.warn(_("The following monitors have been disabled: %s"),
-                       ', '.join(bad_monitors))
+            LOG.warning(_LW("The following monitors have been disabled: %s"),
+                        ', '.join(bad_monitors))
 
         return good_monitors
 

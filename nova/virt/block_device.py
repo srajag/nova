@@ -13,17 +13,18 @@
 #    under the License.
 
 import functools
+import itertools
 import operator
 
-from oslo.serialization import jsonutils
-from oslo.utils import excutils
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import excutils
 
 from nova import block_device
-from nova.i18n import _
+from nova.i18n import _LE
 from nova.i18n import _LI
 from nova import objects
 from nova.objects import base as obj_base
-from nova.openstack.common import log as logging
 from nova.volume import encryptors
 
 LOG = logging.getLogger(__name__)
@@ -44,8 +45,10 @@ class _NoLegacy(Exception):
 def update_db(method):
     @functools.wraps(method)
     def wrapped(obj, context, *args, **kwargs):
-        ret_val = method(obj, context, *args, **kwargs)
-        obj.save(context)
+        try:
+            ret_val = method(obj, context, *args, **kwargs)
+        finally:
+            obj.save()
         return ret_val
     return wrapped
 
@@ -95,8 +98,7 @@ class DriverBlockDevice(dict):
         if self._bdm_obj.no_device:
             raise _NotTransformable()
 
-        self.update(dict((field, None)
-                    for field in self._fields))
+        self.update({field: None for field in self._fields})
         self._transform()
 
     def __getattr__(self, name):
@@ -121,7 +123,7 @@ class DriverBlockDevice(dict):
         Basic method will just drop the fields that are not in
         _legacy_fields set. Override this in subclass if needed.
         """
-        return dict((key, self.get(key)) for key in self._legacy_fields)
+        return {key: self.get(key) for key in self._legacy_fields}
 
     def attach(self, **kwargs):
         """Make the device available to be used by VMs.
@@ -131,14 +133,12 @@ class DriverBlockDevice(dict):
         """
         raise NotImplementedError()
 
-    def save(self, context=None):
+    def save(self):
         for attr_name, key_name in self._update_on_save.iteritems():
-            setattr(self._bdm_obj, attr_name, self[key_name or attr_name])
-
-        if context:
-            self._bdm_obj.save(context)
-        else:
-            self._bdm_obj.save()
+            lookup_name = key_name or attr_name
+            if self[lookup_name] != getattr(self._bdm_obj, attr_name):
+                setattr(self._bdm_obj, attr_name, self[lookup_name])
+        self._bdm_obj.save()
 
 
 class DriverSwapBlockDevice(DriverBlockDevice):
@@ -204,8 +204,8 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
             raise _InvalidType
 
         self.update(
-            dict((k, v) for k, v in self._bdm_obj.iteritems()
-                 if k in self._new_fields | set(['delete_on_termination']))
+            {k: v for k, v in self._bdm_obj.iteritems()
+             if k in self._new_fields | set(['delete_on_termination'])}
         )
         self['mount_device'] = self._bdm_obj.device_name
         try:
@@ -251,10 +251,10 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
                         context, connection_info, instance,
                         self['mount_device'], disk_bus=self['disk_bus'],
                         device_type=self['device_type'], encryption=encryption)
-            except Exception:  # pylint: disable=W0702
+            except Exception:
                 with excutils.save_and_reraise_exception():
-                    LOG.exception(_("Driver failed to attach volume "
-                                    "%(volume_id)s at %(mountpoint)s"),
+                    LOG.exception(_LE("Driver failed to attach volume "
+                                      "%(volume_id)s at %(mountpoint)s"),
                                   {'volume_id': volume_id,
                                    'mountpoint': self['mount_device']},
                                   context=context, instance=instance)
@@ -266,7 +266,12 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
         if 'data' in connection_info:
             mode = connection_info['data'].get('access_mode', 'rw')
         if volume['attach_status'] == "detached":
-            volume_api.attach(context, volume_id, instance['uuid'],
+            # NOTE(mriedem): save our current state so connection_info is in
+            # the database before the volume status goes to 'in-use' because
+            # after that we can detach and connection_info is required for
+            # detach.
+            self.save()
+            volume_api.attach(context, volume_id, instance.uuid,
                               self['mount_device'], mode=mode)
 
     @update_db
@@ -285,15 +290,17 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
         self._preserve_multipath_id(connection_info)
         self['connection_info'] = connection_info
 
-    def save(self, context=None):
+    def save(self):
         # NOTE(ndipanov): we might want to generalize this by adding it to the
         # _update_on_save and adding a transformation function.
         try:
-            self._bdm_obj.connection_info = jsonutils.dumps(
-                    self.get('connection_info'))
+            connection_info_string = jsonutils.dumps(
+                self.get('connection_info'))
+            if connection_info_string != self._bdm_obj.connection_info:
+                self._bdm_obj.connection_info = connection_info_string
         except TypeError:
             pass
-        super(DriverVolumeBlockDevice, self).save(context)
+        super(DriverVolumeBlockDevice, self).save()
 
 
 class DriverSnapshotBlockDevice(DriverVolumeBlockDevice):
@@ -305,10 +312,11 @@ class DriverSnapshotBlockDevice(DriverVolumeBlockDevice):
                virt_driver, wait_func=None, do_check_attach=True):
 
         if not self.volume_id:
+            av_zone = instance.availability_zone
             snapshot = volume_api.get_snapshot(context,
                                                self.snapshot_id)
-            vol = volume_api.create(context, self.volume_size,
-                                    '', '', snapshot)
+            vol = volume_api.create(context, self.volume_size, '', '',
+                                    snapshot, availability_zone=av_zone)
             if wait_func:
                 wait_func(context, vol['id'])
 
@@ -328,8 +336,10 @@ class DriverImageBlockDevice(DriverVolumeBlockDevice):
     def attach(self, context, instance, volume_api,
                virt_driver, wait_func=None, do_check_attach=True):
         if not self.volume_id:
+            av_zone = instance.availability_zone
             vol = volume_api.create(context, self.volume_size,
-                                    '', '', image_id=self.image_id)
+                                    '', '', image_id=self.image_id,
+                                    availability_zone=av_zone)
             if wait_func:
                 wait_func(context, vol['id'])
 
@@ -349,7 +359,9 @@ class DriverBlankBlockDevice(DriverVolumeBlockDevice):
                virt_driver, wait_func=None, do_check_attach=True):
         if not self.volume_id:
             vol_name = instance.uuid + '-blank-vol'
-            vol = volume_api.create(context, self.volume_size, vol_name, '')
+            av_zone = instance.availability_zone
+            vol = volume_api.create(context, self.volume_size, vol_name, '',
+                                    availability_zone=av_zone)
             if wait_func:
                 wait_func(context, vol['id'])
 
@@ -392,11 +404,27 @@ convert_blanks = functools.partial(_convert_block_devices,
                                    DriverBlankBlockDevice)
 
 
+def convert_all_volumes(*volume_bdms):
+    source_volume = convert_volumes(volume_bdms)
+    source_snapshot = convert_snapshots(volume_bdms)
+    source_image = convert_images(volume_bdms)
+
+    return [vol for vol in
+            itertools.chain(source_volume, source_snapshot, source_image)]
+
+
+def convert_volume(volume_bdm):
+    try:
+        return convert_all_volumes(volume_bdm)[0]
+    except IndexError:
+        pass
+
+
 def attach_block_devices(block_device_mapping, *attach_args, **attach_kwargs):
     def _log_and_attach(bdm):
         context = attach_args[0]
         instance = attach_args[1]
-        LOG.audit(_('Booting with volume %(volume_id)s at %(mountpoint)s'),
+        LOG.info(_LI('Booting with volume %(volume_id)s at %(mountpoint)s'),
                   {'volume_id': bdm.volume_id,
                    'mountpoint': bdm['mount_device']},
                   context=context, instance=instance)

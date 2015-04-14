@@ -11,9 +11,8 @@
 #    under the License.
 
 from nova.api.openstack import extensions
-from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova import compute
+from nova import context as nova_context
 from nova.objects import base as obj_base
 
 
@@ -39,37 +38,18 @@ def output(migrations_obj):
     return objects
 
 
-class MigrationsTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('migrations')
-        elem = xmlutil.SubTemplateElement(root, 'migration',
-                                          selector='migrations')
-        elem.set('id')
-        elem.set('source_node')
-        elem.set('dest_node')
-        elem.set('source_compute')
-        elem.set('dest_compute')
-        elem.set('dest_host')
-        elem.set('status')
-        elem.set('instance_uuid')
-        elem.set('old_instance_type_id')
-        elem.set('new_instance_type_id')
-        elem.set('created_at')
-        elem.set('updated_at')
-
-        return xmlutil.MasterTemplate(root, 1)
-
-
 class MigrationsController(object):
     """Controller for accessing migrations in OpenStack API."""
     def __init__(self):
         self.compute_api = compute.API()
 
-    @wsgi.serializers(xml=MigrationsTemplate)
     def index(self, req):
         """Return all migrations in progress."""
         context = req.environ['nova.context']
         authorize(context, "index")
+        # NOTE(alex_xu): back-compatible with db layer hard-code admin
+        # permission checks.
+        nova_context.require_admin_context(context)
         migrations = self.compute_api.get_migrations(context, req.GET)
         return {'migrations': output(migrations)}
 

@@ -13,20 +13,22 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.serialization import jsonutils
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
 
 from nova import db
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
-from nova.openstack.common import log as logging
 from nova import utils
 
 
 LOG = logging.getLogger(__name__)
 
 
-class PciDevice(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+class PciDevice(base.NovaPersistentObject, base.NovaObject,
+                base.NovaObjectDictCompat):
 
     """Object to represent a PCI device on a compute node.
 
@@ -69,7 +71,8 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: String attributes updated to support unicode
     # Version 1.2: added request_id field
-    VERSION = '1.2'
+    # Version 1.3: Added field to represent PCI device NUMA node
+    VERSION = '1.3'
 
     fields = {
         'id': fields.IntegerField(),
@@ -86,6 +89,7 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
         'instance_uuid': fields.StringField(nullable=True),
         'request_id': fields.StringField(nullable=True),
         'extra_info': fields.DictOfStringsField(),
+        'numa_node': fields.IntegerField(nullable=True),
     }
 
     def obj_make_compatible(self, primitive, target_version):
@@ -159,18 +163,20 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
         return pci_device
 
     @base.remotable
-    def save(self, context):
+    def save(self):
         if self.status == 'removed':
             self.status = 'deleted'
-            db.pci_device_destroy(context, self.compute_node_id, self.address)
+            db.pci_device_destroy(self._context, self.compute_node_id,
+                                  self.address)
         elif self.status != 'deleted':
             updates = self.obj_get_changes()
             if 'extra_info' in updates:
                 updates['extra_info'] = jsonutils.dumps(updates['extra_info'])
             if updates:
-                db_pci = db.pci_device_update(context, self.compute_node_id,
+                db_pci = db.pci_device_update(self._context,
+                                              self.compute_node_id,
                                               self.address, updates)
-                self._from_db_object(context, self, db_pci)
+                self._from_db_object(self._context, self, db_pci)
 
 
 class PciDeviceList(base.ObjectListBase, base.NovaObject):
@@ -186,6 +192,7 @@ class PciDeviceList(base.ObjectListBase, base.NovaObject):
         '1.0': '1.1',
         # NOTE(danms): PciDevice was at 1.1 before we added this
         '1.1': '1.2',
+        '1.2': '1.3',
         }
 
     def __init__(self, *args, **kwargs):

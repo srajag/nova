@@ -23,22 +23,17 @@ from nova.network.security_group import openstack_driver
 
 
 ALIAS = "os-security-group-default-rules"
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
-
-
-def _authorize_context(req):
-    context = req.environ['nova.context']
-    authorize(context)
-    return context
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class SecurityGroupDefaultRulesController(sg.SecurityGroupControllerBase):
 
     def __init__(self):
         self.security_group_api = (
-            openstack_driver.get_openstack_security_group_driver())
+            openstack_driver.get_openstack_security_group_driver(
+                skip_policy_check=True))
 
-    @extensions.expected_errors((400, 501))
+    @extensions.expected_errors((400, 409, 501))
     def create(self, req, body):
         context = sg._authorize_context(req)
         authorize(context)
@@ -62,7 +57,7 @@ class SecurityGroupDefaultRulesController(sg.SecurityGroupControllerBase):
 
         if self.security_group_api.default_rule_exists(context, values):
             msg = _('This default rule already exists.')
-            raise exc.HTTPBadRequest(explanation=msg)
+            raise exc.HTTPConflict(explanation=msg)
         security_group_rule = self.security_group_api.add_default_rules(
             context, [values])[0]
         fmt_rule = self._format_security_group_default_rule(
@@ -87,7 +82,7 @@ class SecurityGroupDefaultRulesController(sg.SecurityGroupControllerBase):
 
         try:
             rule = self.security_group_api.get_default_rule(context, id)
-        except exception.SecurityGroupNotFound as ex:
+        except exception.SecurityGroupDefaultRuleNotFound as ex:
             raise exc.HTTPNotFound(explanation=ex.format_message())
 
         fmt_rule = self._format_security_group_default_rule(rule)
@@ -106,10 +101,6 @@ class SecurityGroupDefaultRulesController(sg.SecurityGroupControllerBase):
 
         try:
             rule = self.security_group_api.get_default_rule(context, id)
-        except exception.SecurityGroupNotFound as ex:
-            raise exc.HTTPNotFound(explanation=ex.format_message())
-
-        try:
             self.security_group_api.remove_default_rules(context, [rule['id']])
         except exception.SecurityGroupDefaultRuleNotFound as ex:
             raise exc.HTTPNotFound(explanation=ex.format_message())
