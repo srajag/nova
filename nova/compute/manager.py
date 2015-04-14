@@ -293,12 +293,21 @@ def reverts_task_state(function):
                 LOG.info(_("Task possibly preempted: %s") % e.format_message())
         except Exception:
             with excutils.save_and_reraise_exception():
+                wrapped_func = utils.get_wrapped_function(function)
+                keyed_args = safe_utils.getcallargs(wrapped_func, context,
+                                                    *args, **kwargs)
+                # NOTE(mriedem): 'instance' must be in keyed_args because we
+                # have utils.expects_func_args('instance') decorating this
+                # method.
+                instance_uuid = keyed_args['instance']['uuid']
                 try:
                     self._instance_update(context,
-                                          kwargs['instance']['uuid'],
+                                          instance_uuid,
                                           task_state=None)
-                except Exception:
-                    pass
+                except Exception as e:
+                    msg = _LW("Failed to revert task state for instance. "
+                              "Error: %s")
+                    LOG.warning(msg, e, instance_uuid=instance_uuid)
 
     return decorated_function
 
@@ -988,6 +997,12 @@ class ComputeManager(manager.Manager):
             self.driver.plug_vifs(instance, net_info)
         except NotImplementedError as e:
             LOG.debug(e, instance=instance)
+        except exception.VirtualInterfacePlugException:
+            # we don't want an exception to block the init_host
+            LOG.exception(_LE("Vifs plug failed"), instance=instance)
+            self._set_instance_error_state(context, instance)
+            return
+
         if instance.task_state == task_states.RESIZE_MIGRATING:
             # We crashed during resize/migration, so roll back for safety
             try:
@@ -4886,8 +4901,11 @@ class ComputeManager(manager.Manager):
         is_volume_backed = self.compute_api.is_volume_backed_instance(ctxt,
                                                                       instance)
         dest_check_data['is_volume_backed'] = is_volume_backed
+        block_device_info = self._get_instance_block_device_info(
+                            ctxt, instance, refresh_conn_info=True)
         return self.driver.check_can_live_migrate_source(ctxt, instance,
-                                                         dest_check_data)
+                                                         dest_check_data,
+                                                         block_device_info)
 
     @object_compat
     @wrap_exception()
@@ -5351,6 +5369,11 @@ class ComputeManager(manager.Manager):
                 self._get_instance_nw_info(context, instance, use_slave=True)
                 LOG.debug('Updated the network info_cache for instance',
                           instance=instance)
+            except exception.InstanceNotFound:
+                # Instance is gone.
+                LOG.debug('Instance no longer exists. Unable to refresh',
+                          instance=instance)
+                return
             except Exception:
                 LOG.error(_('An error occurred while refreshing the network '
                             'cache.'), instance=instance, exc_info=True)

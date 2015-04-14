@@ -361,6 +361,30 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
         self.mox.VerifyAll()
         self.mox.UnsetStubs()
 
+    def test_init_instance_with_binding_failed_vif_type(self):
+        # this instance will plug a 'binding_failed' vif
+        instance = fake_instance.fake_instance_obj(
+                self.context,
+                uuid='fake-uuid',
+                info_cache=None,
+                power_state=power_state.RUNNING,
+                vm_state=vm_states.ACTIVE,
+                task_state=None,
+                expected_attrs=['info_cache'])
+
+        with contextlib.nested(
+            mock.patch.object(context, 'get_admin_context',
+                return_value=self.context),
+            mock.patch.object(compute_utils, 'get_nw_info_for_instance',
+                return_value=network_model.NetworkInfo()),
+            mock.patch.object(self.compute.driver, 'plug_vifs',
+                side_effect=exception.VirtualInterfacePlugException(
+                    "Unexpected vif_type=binding_failed")),
+            mock.patch.object(self.compute, '_set_instance_error_state')
+        ) as (get_admin_context, get_nw_info, plug_vifs, set_error_state):
+            self.compute._init_instance(self.context, instance)
+            set_error_state.assert_called_once_with(self.context, instance)
+
     def test_init_instance_failed_resume_sets_error(self):
         instance = fake_instance.fake_instance_obj(
                 self.context,
@@ -1229,13 +1253,19 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
 
         self.mox.StubOutWithMock(self.compute.compute_api,
                                  'is_volume_backed_instance')
+        self.mox.StubOutWithMock(self.compute,
+                                 '_get_instance_block_device_info')
         self.mox.StubOutWithMock(self.compute.driver,
                                  'check_can_live_migrate_source')
 
         self.compute.compute_api.is_volume_backed_instance(
                 self.context, instance).AndReturn(is_volume_backed)
+        self.compute._get_instance_block_device_info(
+                self.context, instance, refresh_conn_info=True
+                ).AndReturn({'block_device_mapping': 'fake'})
         self.compute.driver.check_can_live_migrate_source(
-                self.context, instance, expected_dest_check_data)
+                self.context, instance, expected_dest_check_data,
+                {'block_device_mapping': 'fake'})
 
         self.mox.ReplayAll()
 

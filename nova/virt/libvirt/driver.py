@@ -5049,7 +5049,8 @@ class LibvirtDriver(driver.ComputeDriver):
         self._cleanup_shared_storage_test_file(filename, instance)
 
     def check_can_live_migrate_source(self, context, instance,
-                                      dest_check_data):
+                                      dest_check_data,
+                                      block_device_info=None):
         """Check if it is possible to execute live migration.
 
         This checks if the live migration can succeed, based on the
@@ -5058,6 +5059,7 @@ class LibvirtDriver(driver.ComputeDriver):
         :param context: security context
         :param instance: nova.db.sqlalchemy.models.Instance
         :param dest_check_data: result of check_can_live_migrate_destination
+        :param block_device_info: result of _get_instance_block_device_info
         :returns: a dict containing migration info
         """
         # Checking shared storage connectivity
@@ -5069,7 +5071,8 @@ class LibvirtDriver(driver.ComputeDriver):
                     dest_check_data['filename'], instance)})
 
         dest_check_data.update({'is_shared_block_storage':
-                self._is_shared_block_storage(instance, dest_check_data)})
+                self._is_shared_block_storage(instance, dest_check_data,
+                                              block_device_info)})
 
         if dest_check_data['block_migration']:
             if (dest_check_data['is_shared_block_storage'] or
@@ -5079,7 +5082,8 @@ class LibvirtDriver(driver.ComputeDriver):
                 raise exception.InvalidLocalStorage(reason=reason, path=source)
             self._assert_dest_node_has_enough_disk(context, instance,
                                     dest_check_data['disk_available_mb'],
-                                    dest_check_data['disk_over_commit'])
+                                    dest_check_data['disk_over_commit'],
+                                    block_device_info)
 
         elif not (dest_check_data['is_shared_block_storage'] or
                   dest_check_data['is_shared_instance_path']):
@@ -5094,9 +5098,16 @@ class LibvirtDriver(driver.ComputeDriver):
                                                         relative=True)
         dest_check_data['instance_relative_path'] = instance_path
 
+        # NOTE(danms): Emulate this old flag in case we're talking to
+        # an older client (<= Juno). We can remove this when we bump the
+        # compute RPC API to 4.0.
+        dest_check_data['is_shared_storage'] = (
+            dest_check_data['is_shared_instance_path'])
+
         return dest_check_data
 
-    def _is_shared_block_storage(self, instance, dest_check_data):
+    def _is_shared_block_storage(self, instance, dest_check_data,
+                                 block_device_info=None):
         """Check if all block storage of an instance can be shared
         between source and destination of a live migration.
 
@@ -5110,6 +5121,7 @@ class LibvirtDriver(driver.ComputeDriver):
         """
         if (CONF.libvirt.images_type == dest_check_data.get('image_type') and
                 self.image_backend.backend().is_shared_block_storage()):
+            # NOTE(dgenin): currently true only for RBD image backend
             return True
 
         if (dest_check_data.get('is_shared_instance_path') and
@@ -5120,14 +5132,16 @@ class LibvirtDriver(driver.ComputeDriver):
 
         if (dest_check_data.get('is_volume_backed') and
                 not bool(jsonutils.loads(
-                    self.get_instance_disk_info(instance['name'])))):
+                    self.get_instance_disk_info(instance['name'],
+                                                block_device_info)))):
             # pylint: disable E1120
             return True
 
         return False
 
     def _assert_dest_node_has_enough_disk(self, context, instance,
-                                             available_mb, disk_over_commit):
+                                             available_mb, disk_over_commit,
+                                             block_device_info=None):
         """Checks if destination has enough disk for block migration."""
         # Libvirt supports qcow2 disk format,which is usually compressed
         # on compute nodes.
@@ -5143,7 +5157,8 @@ class LibvirtDriver(driver.ComputeDriver):
         if available_mb:
             available = available_mb * units.Mi
 
-        ret = self.get_instance_disk_info(instance['name'])
+        ret = self.get_instance_disk_info(instance['name'],
+                                          block_device_info=block_device_info)
         disk_infos = jsonutils.loads(ret)
 
         necessary = 0
@@ -5540,11 +5555,13 @@ class LibvirtDriver(driver.ComputeDriver):
             instance_relative_path = migrate_data.get('instance_relative_path')
 
         if not (is_shared_instance_path and is_shared_block_storage):
-            # NOTE(mikal): live migration of instances using config drive is
-            # not supported because of a bug in libvirt (read only devices
-            # are not copied by libvirt). See bug/1246201
-            if configdrive.required_by(instance):
-                raise exception.NoLiveMigrationForConfigDriveInLibVirt()
+            # NOTE(dims): Using config drive with iso format does not work
+            # because of a bug in libvirt with read only devices. However
+            # one can use vfat as config_drive_format which works fine.
+            # Please see bug/1246201 for details on the libvirt bug.
+            if CONF.config_drive_format != 'vfat':
+                if configdrive.required_by(instance):
+                    raise exception.NoLiveMigrationForConfigDriveInLibVirt()
 
         if not is_shared_instance_path:
             # NOTE(mikal): this doesn't use libvirt_utils.get_instance_path
