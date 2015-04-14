@@ -45,7 +45,6 @@ from eventlet import greenio
 from eventlet import greenthread
 from eventlet import patcher
 from eventlet import tpool
-from eventlet import util as eventlet_util
 from lxml import etree
 from oslo.config import cfg
 import six
@@ -77,6 +76,7 @@ from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import loopingcall
 from nova.openstack.common import processutils
+from nova.openstack.common import strutils
 from nova.openstack.common import timeutils
 from nova.openstack.common import units
 from nova.openstack.common import xmlutils
@@ -110,6 +110,7 @@ from nova.virt import watchdog_actions
 from nova import volume
 from nova.volume import encryptors
 
+native_socket = patcher.original('socket')
 native_threading = patcher.original("threading")
 native_Queue = patcher.original("Queue")
 
@@ -185,6 +186,8 @@ libvirt_opts = [
                       'LibvirtFibreChannelVolumeDriver',
                   'scality='
                       'nova.virt.libvirt.volume.LibvirtScalityVolumeDriver',
+                  'gpfs='
+                      'nova.virt.libvirt.volume.LibvirtGPFSVolumeDriver',
                   ],
                 help='DEPRECATED. Libvirt handlers for remote volumes. '
                      'This option is deprecated and will be removed in the '
@@ -638,12 +641,10 @@ class LibvirtDriver(driver.ComputeDriver):
         except (ImportError, NotImplementedError):
             # This is Windows compatibility -- use a socket instead
             #  of a pipe because pipes don't really exist on Windows.
-            sock = eventlet_util.__original_socket__(socket.AF_INET,
-                                                     socket.SOCK_STREAM)
+            sock = native_socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.bind(('localhost', 0))
             sock.listen(50)
-            csock = eventlet_util.__original_socket__(socket.AF_INET,
-                                                      socket.SOCK_STREAM)
+            csock = native_socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             csock.connect(('localhost', sock.getsockname()[1]))
             nsock, addr = sock.accept()
             self._event_notify_send = nsock.makefile('wb', 0)
@@ -4114,8 +4115,16 @@ class LibvirtDriver(driver.ComputeDriver):
                 raise exception.PciDeviceUnsupportedHypervisor(
                     type=CONF.libvirt.virt_type)
 
-        watchdog_action = flavor.extra_specs.get('hw_watchdog_action',
-                                                 'disabled')
+        if 'hw_watchdog_action' in flavor.extra_specs:
+            LOG.warn(_LW('Old property name "hw_watchdog_action" is now '
+                         'deprecated and will be removed in L release. '
+                         'Use updated property name '
+                         '"hw:watchdog_action" instead'))
+        # TODO(pkholkin): accepting old property name 'hw_watchdog_action'
+        #                should be removed in L release
+        watchdog_action = (flavor.extra_specs.get('hw_watchdog_action') or
+                           flavor.extra_specs.get('hw:watchdog_action')
+                           or 'disabled')
         if (image_meta is not None and
                 image_meta.get('properties', {}).get('hw_watchdog_action')):
             watchdog_action = image_meta['properties']['hw_watchdog_action']
@@ -4345,12 +4354,14 @@ class LibvirtDriver(driver.ComputeDriver):
 
             if power_on:
                 err = _LE('Error launching a defined domain with XML: %s') \
-                          % domain.XMLDesc(0)
+                          % strutils.safe_decode(domain.XMLDesc(0),
+                                                 errors='ignore')
                 domain.createWithFlags(launch_flags)
 
             if not utils.is_neutron():
                 err = _LE('Error enabling hairpin mode with XML: %s') \
-                          % domain.XMLDesc(0)
+                          % strutils.safe_decode(domain.XMLDesc(0),
+                                                 errors='ignore')
                 self._enable_hairpin(domain.XMLDesc(0))
         except Exception:
             with excutils.save_and_reraise_exception():
@@ -4954,6 +4965,22 @@ class LibvirtDriver(driver.ComputeDriver):
         return stats
 
     def check_instance_shared_storage_local(self, context, instance):
+        """Check if instance files located on shared storage.
+
+        This runs check on the destination host, and then calls
+        back to the source host to check the results.
+
+        :param context: security context
+        :param instance: nova.db.sqlalchemy.models.Instance
+        :returns:
+             :tempfile: A dict containing the tempfile info on the destination
+                  host
+             :None: 1. If the instance path is not existing
+                  2. If the image backend is shared block storage type
+        """
+        if self.image_backend.backend().is_shared_block_storage():
+            return None
+
         dirpath = libvirt_utils.get_instance_path(instance)
 
         if not os.path.exists(dirpath):
@@ -6291,7 +6318,13 @@ class LibvirtDriver(driver.ComputeDriver):
         # ensure directories exist and are writable
         instance_path = libvirt_utils.get_instance_path(instance)
         LOG.debug('Checking instance files accessibility %s', instance_path)
-        return os.access(instance_path, os.W_OK)
+        shared_instance_path = os.access(instance_path, os.W_OK)
+        # NOTE(flwang): For shared block storage scenario, the file system is
+        # not really shared by the two hosts, but the volume of evacuated
+        # instance is reachable.
+        shared_block_storage = (self.image_backend.backend().
+                                is_shared_block_storage())
+        return shared_instance_path or shared_block_storage
 
     def inject_network_info(self, instance, nw_info):
         self.firewall_driver.setup_basic_filtering(instance, nw_info)

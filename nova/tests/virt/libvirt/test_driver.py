@@ -59,6 +59,7 @@ from nova.openstack.common import jsonutils
 from nova.openstack.common import lockutils
 from nova.openstack.common import loopingcall
 from nova.openstack.common import processutils
+from nova.openstack.common import strutils
 from nova.openstack.common import timeutils
 from nova.openstack.common import units
 from nova.openstack.common import uuidutils
@@ -2192,14 +2193,15 @@ class LibvirtConnTestCase(test.TestCase):
 
         self.assertEqual("none", cfg.devices[7].action)
 
-    def test_get_guest_config_with_watchdog_action_through_flavor(self):
+    def _test_get_guest_config_with_watchdog_action_flavor(self,
+            hw_watchdog_action="hw:watchdog_action"):
         self.flags(virt_type='kvm', group='libvirt')
 
         conn = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
 
         fake_flavor = objects.Flavor.get_by_id(
                 self.context, self.test_instance['instance_type_id'])
-        fake_flavor.extra_specs = {'hw_watchdog_action': 'none'}
+        fake_flavor.extra_specs = {hw_watchdog_action: 'none'}
 
         instance_ref = db.instance_create(self.context, self.test_instance)
 
@@ -2231,6 +2233,16 @@ class LibvirtConnTestCase(test.TestCase):
                                   vconfig.LibvirtConfigMemoryBalloon)
 
             self.assertEqual("none", cfg.devices[7].action)
+
+    def test_get_guest_config_with_watchdog_action_through_flavor(self):
+        self._test_get_guest_config_with_watchdog_action_flavor()
+
+    # TODO(pkholkin): the test accepting old property name 'hw_watchdog_action'
+    #                should be removed in L release
+    def test_get_guest_config_with_watchdog_action_through_flavor_no_scope(
+            self):
+        self._test_get_guest_config_with_watchdog_action_flavor(
+            hw_watchdog_action="hw_watchdog_action")
 
     def test_get_guest_config_with_watchdog_action_meta_overrides_flavor(self):
         self.flags(virt_type='kvm', group='libvirt')
@@ -8963,7 +8975,8 @@ Active:          8381604 kB
         lookup_mock.assert_called_once_with(instance['name'])
 
     @mock.patch.object(fake_libvirt_utils, 'get_instance_path')
-    def test_create_domain(self, mock_get_inst_path):
+    @mock.patch.object(strutils, 'safe_decode')
+    def test_create_domain(self, mock_safe_decode, mock_get_inst_path):
         conn = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
         mock_domain = mock.MagicMock()
         mock_instance = mock.MagicMock()
@@ -8975,6 +8988,7 @@ Active:          8381604 kB
         self.assertEqual(mock_domain, domain)
         mock_get_inst_path.assertHasCalls([mock.call(mock_instance)])
         mock_domain.createWithFlags.assertHasCalls([mock.call(0)])
+        self.assertEqual(2, mock_safe_decode.call_count)
 
     @mock.patch('nova.virt.disk.api.clean_lxc_namespace')
     @mock.patch('nova.virt.libvirt.driver.LibvirtDriver.get_info')
@@ -10034,6 +10048,33 @@ Active:          8381604 kB
                           "foo/?com=/bin/sh",
                           lambda x: x,
                           lambda x: x)
+
+    @mock.patch('os.path.exists', return_value=True)
+    @mock.patch('tempfile.mkstemp')
+    @mock.patch('os.close', return_value=None)
+    def test_check_instance_shared_storage_local_raw(self,
+                                                 mock_close,
+                                                 mock_mkstemp,
+                                                 mock_exists):
+        instance_uuid = str(uuid.uuid4())
+        self.flags(images_type='raw', group='libvirt')
+        self.flags(instances_path='/tmp')
+        mock_mkstemp.return_value = (-1,
+                                     '/tmp/{0}/file'.format(instance_uuid))
+        driver = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+        instance = fake_instance.fake_instance_obj(self.context)
+        temp_file = driver.check_instance_shared_storage_local(self.context,
+                                                               instance)
+        self.assertEqual('/tmp/{0}/file'.format(instance_uuid),
+                         temp_file['filename'])
+
+    def test_check_instance_shared_storage_local_rbd(self):
+        self.flags(images_type='rbd', group='libvirt')
+        driver = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+        instance = fake_instance.fake_instance_obj(self.context)
+        self.assertIsNone(driver.
+                          check_instance_shared_storage_local(self.context,
+                                                              instance))
 
 
 class HostStateTestCase(test.TestCase):
@@ -12427,6 +12468,17 @@ class LibvirtDriverTestCase(test.TestCase):
         self._assert_on_id_map(idmaps[1],
                                vconfig.LibvirtConfigGuestGIDMap,
                                1, 20000, 10)
+
+    def test_instance_on_disk(self):
+        conn = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+        instance = objects.Instance(uuid='fake-uuid', id=1)
+        self.assertFalse(conn.instance_on_disk(instance))
+
+    def test_instance_on_disk_rbd(self):
+        self.flags(images_type='rbd', group='libvirt')
+        conn = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+        instance = objects.Instance(uuid='fake-uuid', id=1)
+        self.assertTrue(conn.instance_on_disk(instance))
 
 
 class LibvirtVolumeUsageTestCase(test.TestCase):

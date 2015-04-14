@@ -26,6 +26,7 @@ import string
 import uuid
 
 from oslo.config import cfg
+from oslo.utils import units
 import six
 
 from nova import availability_zones
@@ -956,9 +957,18 @@ class API(base.Base):
                 properties = volume.get('volume_image_metadata', {})
                 image_meta = {'properties': properties}
                 # NOTE(yjiang5): restore the basic attributes
-                image_meta['min_ram'] = properties.get('min_ram', 0)
-                image_meta['min_disk'] = properties.get('min_disk', 0)
-                image_meta['size'] = properties.get('size', 0)
+                # NOTE(mdbooth): These values come from volume_glance_metadata
+                # in cinder. This is a simple key/value table, and all values
+                # are strings. We need to convert them to ints to avoid
+                # unexpected type errors.
+                image_meta['min_ram'] = int(properties.get('min_ram', 0))
+                image_meta['min_disk'] = int(properties.get('min_disk', 0))
+                # Volume size is no longer related to the original image size,
+                # so we take it from the volume directly. Cinder creates
+                # volumes in Gb increments, and stores size in Gb, whereas
+                # glance reports size in bytes. As we're returning glance
+                # metadata here, we need to convert it.
+                image_meta['size'] = volume.get('size', 0) * units.Gi
                 # NOTE(yjiang5): Always set the image status as 'active'
                 # and depends on followed volume_api.check_attach() to
                 # verify it. This hack should be harmless with that check.
@@ -1975,6 +1985,9 @@ class API(base.Base):
                 sort_key, sort_dir, limit=limit, marker=marker,
                 expected_attrs=expected_attrs)
 
+        if 'ip6' in filters or 'ip' in filters:
+            inst_models = self._ip_filter(inst_models, filters)
+
         if want_objects:
             return inst_models
 
@@ -1985,18 +1998,29 @@ class API(base.Base):
 
         return instances
 
+    @staticmethod
+    def _ip_filter(inst_models, filters):
+        ipv4_f = re.compile(str(filters.get('ip')))
+        ipv6_f = re.compile(str(filters.get('ip6')))
+        result_objs = []
+        for instance in inst_models:
+            nw_info = compute_utils.get_nw_info_for_instance(instance)
+            for vif in nw_info:
+                for fixed_ip in vif.fixed_ips():
+                    address = fixed_ip.get('address')
+                    if not address:
+                        continue
+                    version = fixed_ip.get('version')
+                    if ((version == 4 and ipv4_f.match(address)) or
+                        (version == 6 and ipv6_f.match(address))):
+                        result_objs.append(instance)
+                        continue
+        return objects.InstanceList(objects=result_objs)
+
     def _get_instances_by_filters(self, context, filters,
                                   sort_key, sort_dir,
                                   limit=None,
                                   marker=None, expected_attrs=None):
-        if 'ip6' in filters or 'ip' in filters:
-            res = self.network_api.get_instance_uuids_by_ip_filter(context,
-                                                                   filters)
-            # NOTE(jkoelker) It is possible that we will get the same
-            #                instance uuid twice (one for ipv4 and ipv6)
-            uuids = set([r['instance_uuid'] for r in res])
-            filters['uuid'] = uuids
-
         fields = ['metadata', 'system_metadata', 'info_cache',
                   'security_groups']
         if expected_attrs:
