@@ -3135,6 +3135,28 @@ class LibvirtDriver(driver.ComputeDriver):
 
         return dev
 
+    @staticmethod
+    def _cpus_to_cpu_set_str(cpus):
+        if cpus is 0:
+            return '0'
+        else:
+            return '0-%d' % (cpus - 1)
+
+    def _get_guest_numa_config(self, cpus, memory):
+        """Return numa config for given cpu_set and memory."""
+
+        guest_config_numa = vconfig.LibvirtConfigGuestCPUNUMA()
+
+        guest_cell = vconfig.LibvirtConfigGuestCPUNUMACell()
+        guest_cell.id = 0 # Only one cell allowed for now
+        guest_cell.cpus = self._cpus_to_cpu_set_str(cpus)
+        guest_cell.memory = memory
+        guest_cell.mem_access = 'shared'
+
+        guest_config_numa.cells.append(guest_cell)
+
+        return guest_config_numa
+
     def get_guest_config(self, instance, network_info, image_meta,
                          disk_info, rescue=None, block_device_info=None):
         """Get config data for parameters.
@@ -3174,6 +3196,12 @@ class LibvirtDriver(driver.ComputeDriver):
                     setattr(guest, scope[1], value)
 
         guest.cpu = self.get_guest_cpu_config()
+
+        # Add NUMA config. This is necessary for sharing memory between VM and
+        # vRouter, which we need for DPDK vRouter.
+        if CONF.libvirt.use_huge_pages:
+            guest.cpu.numa = self._get_guest_numa_config(guest.vcpus,
+                                                         guest.memory)
 
         if 'root' in disk_mapping:
             root_device_name = block_device.prepend_dev(

@@ -339,6 +339,67 @@ class LibvirtConfigGuestCPUFeature(LibvirtConfigCPUFeature):
         return ft
 
 
+class LibvirtConfigGuestCPUNUMACell(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestCPUNUMACell, self).__init__(root_name="cell",
+                                                            **kwargs)
+        self.id = None
+        self.cpus = None
+        self.memory = None
+        self.mem_access = None
+
+    def parse_dom(self, xmldoc):
+        if xmldoc.get("id") is not None:
+            self.id = int(xmldoc.get("id"))
+        if xmldoc.get("memory") is not None:
+            self.memory = int(xmldoc.get("memory"))
+        if xmldoc.get("cpus") is not None:
+            self.cpus = xmldoc.get("cpus")
+        if xmldoc.get("memAccess") is not None:
+            self.mem_access = str(xmldoc.get("memAccess"))
+
+    def format_dom(self):
+        cell = super(LibvirtConfigGuestCPUNUMACell, self).format_dom()
+
+        if self.id is not None:
+            cell.set("id", str(self.id))
+        if self.cpus is not None:
+            cell.set("cpus", self.cpus)
+        if self.memory is not None:
+            cell.set("memory", str(self.memory))
+        if self.mem_access is not None:
+            cell.set("memAccess", str(self.mem_access))
+
+        return cell
+
+
+class LibvirtConfigGuestCPUNUMA(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestCPUNUMA, self).__init__(root_name="numa",
+                                                        **kwargs)
+
+        self.cells = []
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigGuestCPUNUMA, self).parse_Dom(xmldoc)
+
+        for child in xmldoc.getchildren():
+            if child.tag == "cell":
+                cell = LibvirtConfigGuestCPUNUMACell()
+                cell.parse_dom(child)
+                self.cells.append(cell)
+
+    def format_dom(self):
+        numa = super(LibvirtConfigGuestCPUNUMA, self).format_dom()
+
+        for cell in self.cells:
+            numa.append(cell.format_dom())
+
+        return numa
+
+
 class LibvirtConfigGuestCPU(LibvirtConfigCPU):
 
     def __init__(self, **kwargs):
@@ -346,11 +407,17 @@ class LibvirtConfigGuestCPU(LibvirtConfigCPU):
 
         self.mode = None
         self.match = "exact"
+        self.numa = None
 
     def parse_dom(self, xmldoc):
         super(LibvirtConfigGuestCPU, self).parse_dom(xmldoc)
         self.mode = xmldoc.get('mode')
         self.match = xmldoc.get('match')
+        for child in xmldoc.getchildren():
+            if child.tag == "numa":
+                numa = LibvirtConfigGuestCPUNUMA()
+                numa.parse_dom(child)
+                self.numa = numa
 
     def format_dom(self):
         cpu = super(LibvirtConfigGuestCPU, self).format_dom()
@@ -358,6 +425,8 @@ class LibvirtConfigGuestCPU(LibvirtConfigCPU):
         if self.mode:
             cpu.set("mode", self.mode)
         cpu.set("match", self.match)
+        if self.numa is not None:
+            cpu.append(self.numa.format_dom())
 
         return cpu
 
