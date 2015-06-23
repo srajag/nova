@@ -15,6 +15,7 @@
 """Utility methods for scheduling."""
 
 import sys
+import functools
 
 from oslo.config import cfg
 
@@ -238,3 +239,31 @@ def parse_options(opts, sep='=', converter=str, name=""):
 def validate_filter(filter):
     """Validates that the filter is configured in the default filters."""
     return filter in CONF.scheduler_default_filters
+
+def retry_on_timeout(retries=1):
+    """Retry the call in case a MessagingTimeout is raised.
+    A decorator for retrying calls when a service dies mid-request.
+    :param retries: Number of retries
+    :returns: Decorator
+    """
+    def outer(func):
+        @functools.wraps(func)
+        def wrapped(*args, **kwargs):
+            attempt = 0
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except messaging.MessagingTimeout:
+                    attempt += 1
+                    if attempt <= retries:
+                        LOG.warning(_LW(
+                            "Retrying %(name)s after a MessagingTimeout, "
+                            "attempt %(attempt)s of %(retries)s."),
+                                 {'attempt': attempt, 'retries': retries,
+                                  'name': func.__name__})
+                    else:
+                        raise
+        return wrapped
+    return outer
+
+retry_select_destinations = retry_on_timeout(_max_attempts() - 1)
