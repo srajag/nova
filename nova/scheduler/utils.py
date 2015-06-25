@@ -18,6 +18,7 @@ import sys
 import functools
 
 from oslo.config import cfg
+from oslo import messaging
 
 from nova.compute import flavors
 from nova.compute import utils as compute_utils
