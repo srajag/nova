@@ -344,8 +344,25 @@ class LibvirtGenericVIFDriver(object):
         designer.set_vif_host_backend_vhostuser_config(conf, mode, sock_path)
         return conf
 
+    @staticmethod
+    def _vrouter_dpdk_node():
+        r = utils.execute('ps awux | grep contrail-vrouter-dpdk | grep -v grep',
+                          run_as_root=True, check_exit_code=False)
+        return False if r is "" else True
+
     def get_config_vrouter(self, instance, vif, image_meta,
                            inst_type, virt_type):
+        # TODO(md): This is only a temporary hack. Information whether we are
+        # on the DPDK node or not, vhost-user mode and socket paths should come
+        # from neutron and be present in vif['details'] at this stage.
+        if self._vrouter_dpdk_node():
+            dev = self.get_vif_devname(vif)
+            vif['details'][network_model.VIF_DETAILS_VHOSTUSER_MODE] = 'client'
+            vif['details'][network_model.VIF_DETAILS_VHOSTUSER_SOCKET] = \
+                    '/var/run/vrouter/' + 'uvh_vif_' + dev
+            return self.get_config_vhostuser(instance, vif, image_meta,
+                                             inst_type, virt_type)
+
         conf = self.get_base_config(instance, vif, image_meta,
                                     inst_type, virt_type)
         dev = self.get_vif_devname(vif)
@@ -557,6 +574,12 @@ class LibvirtGenericVIFDriver(object):
 
         Bind the vif to a Contrail virtual port.
         """
+        # TODO(md): This is only a temporary hack. Information about the node
+        # type should come from neutron.
+        if self._vrouter_dpdk_node():
+            self.plug_vhostuser(instance, vif)
+            return
+
         dev = self.get_vif_devname(vif)
         linux_net.create_tap_dev(dev)
         self._vrouter_port_add(instance, vif)
@@ -768,6 +791,12 @@ class LibvirtGenericVIFDriver(object):
 
         Unbind the vif from a Contrail virtual port.
         """
+        # TODO(md): Temporary hack, info if we are on DPDK node should come
+        # from neutron
+        if self._vrouter_dpdk_node():
+            self.unplug_vhostuser(instance, vif)
+            return
+
         dev = self.get_vif_devname(vif)
         linux_net.delete_net_dev(dev)
         self._vrouter_port_delete(instance, vif)

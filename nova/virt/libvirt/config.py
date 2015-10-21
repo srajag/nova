@@ -528,6 +528,8 @@ class LibvirtConfigGuestCPUNUMACell(LibvirtConfigObject):
                      hardware.format_cpu_spec(self.cpus))
         if self.memory is not None:
             cell.set("memory", str(self.memory))
+            # TODO(md): Temporary hack. Probably need to patch libvirt for this
+            cell.set("memAccess", "shared")
 
         return cell
 
