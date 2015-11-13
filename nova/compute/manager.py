@@ -374,7 +374,7 @@ def wrap_instance_fault(function):
             # we will get a KeyError exception which will cover up the real
             # exception. So, we update kwargs with the values from args first.
             # then, we can get 'instance' from kwargs easily.
-            kwargs.update(dict(zip(function.func_code.co_varnames[2:], args)))
+            kwargs.update(dict(zip(function.__code__.co_varnames[2:], args)))
 
             with excutils.save_and_reraise_exception():
                 compute_utils.add_instance_fault_from_exc(context,
@@ -398,7 +398,7 @@ def wrap_instance_event(function):
                                        **kwargs)
         instance_uuid = keyed_args['instance']['uuid']
 
-        event_name = 'compute_{0}'.format(function.func_name)
+        event_name = 'compute_{0}'.format(function.__name__)
         with compute_utils.EventReporter(context, event_name, instance_uuid):
             return function(self, context, *args, **kwargs)
 
@@ -1199,8 +1199,8 @@ class ComputeManager(manager.Manager):
                 self.driver.ensure_filtering_rules_for_instance(
                                        instance, net_info)
             except NotImplementedError:
-                LOG.warning(_LW('Hypervisor driver does not support '
-                                'firewall rules'), instance=instance)
+                LOG.debug('Hypervisor driver does not support '
+                          'firewall rules', instance=instance)
 
     def _retry_reboot(self, context, instance):
         current_power_state = self._get_power_state(context, instance)
@@ -1350,6 +1350,8 @@ class ComputeManager(manager.Manager):
     def get_console_pool_info(self, context, console_type):
         return self.driver.get_console_pool_info(console_type)
 
+    # NOTE(hanlind): This and the virt method it calls can be removed in
+    # version 5.0 of the RPC API
     @wrap_exception()
     def refresh_security_group_rules(self, context, security_group_id):
         """Tell the virtualization driver to refresh security group rules.
@@ -1358,15 +1360,6 @@ class ComputeManager(manager.Manager):
 
         """
         return self.driver.refresh_security_group_rules(security_group_id)
-
-    @wrap_exception()
-    def refresh_security_group_members(self, context, security_group_id):
-        """Tell the virtualization driver to refresh security group members.
-
-        Passes straight through to the virtualization driver.
-
-        """
-        return self.driver.refresh_security_group_members(security_group_id)
 
     @object_compat
     @wrap_exception()
@@ -1384,8 +1377,8 @@ class ComputeManager(manager.Manager):
             try:
                 return self.driver.refresh_instance_security_rules(instance)
             except NotImplementedError:
-                LOG.warning(_LW('Hypervisor driver does not support '
-                                'security groups.'), instance=instance)
+                LOG.debug('Hypervisor driver does not support '
+                          'security groups.', instance=instance)
 
         return _sync_refresh()
 
@@ -1503,7 +1496,7 @@ class ComputeManager(manager.Manager):
             return
 
         LOG.debug("Re-scheduling %(method)s: attempt %(num)d",
-                  {'method': reschedule_method.func_name,
+                  {'method': reschedule_method.__name__,
                    'num': retry['num_attempts']}, instance_uuid=instance_uuid)
 
         # reset the task state:
@@ -1699,12 +1692,12 @@ class ComputeManager(manager.Manager):
         if update_root_bdm:
             root_bdm.save()
 
-        ephemerals = filter(block_device.new_format_is_ephemeral,
-                            block_devices)
-        swap = filter(block_device.new_format_is_swap,
-                      block_devices)
-        block_device_mapping = filter(
-              driver_block_device.is_block_device_mapping, block_devices)
+        ephemerals = list(filter(block_device.new_format_is_ephemeral,
+                            block_devices))
+        swap = list(filter(block_device.new_format_is_swap,
+                      block_devices))
+        block_device_mapping = list(filter(
+              driver_block_device.is_block_device_mapping, block_devices))
 
         self._default_device_names_for_instance(instance,
                                                 root_device_name,
@@ -1772,7 +1765,7 @@ class ComputeManager(manager.Manager):
         """
         if not self.send_instance_updates:
             return
-        if isinstance(instance, obj_instance._BaseInstance):
+        if isinstance(instance, obj_instance.Instance):
             instance = objects.InstanceList(objects=[instance])
         context = context.elevated()
         self.scheduler_client.update_instance_info(context, self.host,
@@ -1809,8 +1802,12 @@ class ComputeManager(manager.Manager):
     def _deallocate_network(self, context, instance,
                             requested_networks=None):
         LOG.debug('Deallocating network for instance', instance=instance)
-        self.network_api.deallocate_for_instance(
-            context, instance, requested_networks=requested_networks)
+        with timeutils.StopWatch() as timer:
+            self.network_api.deallocate_for_instance(
+                context, instance, requested_networks=requested_networks)
+        # nova-network does an rpc call so we're OK tracking time spent here
+        LOG.info(_LI('Took %0.2f seconds to deallocate network for instance.'),
+                 timer.elapsed(), instance=instance)
 
     def _get_instance_block_device_info(self, context, instance,
                                         refresh_conn_info=False,
@@ -1876,8 +1873,8 @@ class ComputeManager(manager.Manager):
             node=None, limits=None):
 
         try:
-            LOG.info(_LI('Starting instance...'), context=context,
-                  instance=instance)
+            LOG.debug('Starting instance...', context=context,
+                      instance=instance)
             instance.vm_state = vm_states.BUILDING
             instance.task_state = None
             instance.save(expected_task_state=
@@ -1902,10 +1899,13 @@ class ComputeManager(manager.Manager):
                       instance=instance)
 
         try:
-            self._build_and_run_instance(context, instance, image,
-                    decoded_files, admin_password, requested_networks,
-                    security_groups, block_device_mapping, node, limits,
-                    filter_properties)
+            with timeutils.StopWatch() as timer:
+                self._build_and_run_instance(context, instance, image,
+                        decoded_files, admin_password, requested_networks,
+                        security_groups, block_device_mapping, node, limits,
+                        filter_properties)
+            LOG.info(_LI('Took %0.2f seconds to build instance.'),
+                     timer.elapsed(), instance=instance)
             return build_results.ACTIVE
         except exception.RescheduledException as e:
             retry = filter_properties.get('retry')
@@ -2006,10 +2006,16 @@ class ComputeManager(manager.Manager):
                             task_states.BLOCK_DEVICE_MAPPING)
                     block_device_info = resources['block_device_info']
                     network_info = resources['network_info']
-                    self.driver.spawn(context, instance, image,
-                                      injected_files, admin_password,
-                                      network_info=network_info,
-                                      block_device_info=block_device_info)
+                    LOG.debug('Start spawning the instance on the hypervisor.',
+                              instance=instance)
+                    with timeutils.StopWatch() as timer:
+                        self.driver.spawn(context, instance, image,
+                                          injected_files, admin_password,
+                                          network_info=network_info,
+                                          block_device_info=block_device_info)
+                    LOG.info(_LI('Took %0.2f seconds to spawn the instance on '
+                                 'the hypervisor.'), timer.elapsed(),
+                             instance=instance)
         except (exception.InstanceNotFound,
                 exception.UnexpectedDeletingTaskStateError) as e:
             with excutils.save_and_reraise_exception():
@@ -2099,6 +2105,8 @@ class ComputeManager(manager.Manager):
         resources = {}
         network_info = None
         try:
+            LOG.debug('Start building networks asynchronously for instance.',
+                      instance=instance)
             network_info = self._build_networks_for_instance(context, instance,
                     requested_networks, security_groups)
             resources['network_info'] = network_info
@@ -2123,6 +2131,8 @@ class ComputeManager(manager.Manager):
             self._default_block_device_names(context, instance, image,
                     block_device_mapping)
 
+            LOG.debug('Start building block device mappings for instance.',
+                      instance=instance)
             instance.vm_state = vm_states.BUILDING
             instance.task_state = task_states.BLOCK_DEVICE_MAPPING
             instance.save()
@@ -2174,12 +2184,14 @@ class ComputeManager(manager.Manager):
                     self._shutdown_instance(context, instance,
                             block_device_mapping, requested_networks,
                             try_deallocate_networks=deallocate_networks)
-                except Exception:
+                except Exception as exc2:
                     ctxt.reraise = False
-                    msg = _('Could not clean up failed build,'
-                            ' not rescheduling')
+                    LOG.warning(_LW('Could not clean up failed build,'
+                                    ' not rescheduling. Error: %s'),
+                                six.text_type(exc2))
                     raise exception.BuildAbortException(
-                            instance_uuid=instance.uuid, reason=msg)
+                            instance_uuid=instance.uuid,
+                            reason=six.text_type(exc))
 
     def _cleanup_allocated_networks(self, context, instance,
             requested_networks):
@@ -2263,9 +2275,15 @@ class ComputeManager(manager.Manager):
 
         # NOTE(melwitt): attempt driver destroy before releasing ip, may
         #                want to keep ip allocated for certain failures
+        timer = timeutils.StopWatch()
         try:
+            LOG.debug('Start destroying the instance on the hypervisor.',
+                      instance=instance)
+            timer.start()
             self.driver.destroy(context, instance, network_info,
                     block_device_info)
+            LOG.info(_LI('Took %0.2f seconds to destroy the instance on the '
+                         'hypervisor.'), timer.elapsed(), instance=instance)
         except exception.InstancePowerOffFailure:
             # if the instance can't power off, don't release the ip
             with excutils.save_and_reraise_exception():
@@ -2281,6 +2299,7 @@ class ComputeManager(manager.Manager):
         if try_deallocate_networks:
             self._try_deallocate_network(context, instance, requested_networks)
 
+        timer.restart()
         for bdm in vol_bdms:
             try:
                 # NOTE(vish): actual driver detach done in driver.destroy, so
@@ -2303,6 +2322,12 @@ class ComputeManager(manager.Manager):
             except cinder_exception.ClientException as exc:
                 LOG.warning(_LW('Ignoring Unknown cinder exception: %s'), exc,
                             instance=instance)
+
+        if vol_bdms:
+            LOG.info(_LI('Took %(time).2f seconds to detach %(num)s volumes '
+                         'for instance.'),
+                     {'time': timer.elapsed(), 'num': len(vol_bdms)},
+                     instance=instance)
 
         if notify:
             self._notify_about_instance_usage(context, instance,
@@ -3273,6 +3298,7 @@ class ComputeManager(manager.Manager):
         except Exception as e:
             LOG.exception(_LE("Error trying to Rescue Instance"),
                           instance=instance)
+            self._set_instance_obj_error_state(context, instance)
             raise exception.InstanceNotRescuable(
                 instance_id=instance.uuid,
                 reason=_("Driver Error: %s") % e)
@@ -4353,6 +4379,10 @@ class ComputeManager(manager.Manager):
                   instance=instance)
         output = self.driver.get_console_output(context, instance)
 
+        if type(output) is six.text_type:
+            # the console output will be bytes.
+            output = six.b(output)
+
         if tail_length is not None:
             output = self._tail_log(output, tail_length)
 
@@ -4365,9 +4395,9 @@ class ComputeManager(manager.Manager):
             length = 0
 
         if length == 0:
-            return ''
+            return b''
         else:
-            return '\n'.join(log.split('\n')[-int(length):])
+            return b'\n'.join(log.split(b'\n')[-int(length):])
 
     @messaging.expected_exceptions(exception.ConsoleTypeInvalid,
                                    exception.InstanceNotReady,
@@ -5442,18 +5472,27 @@ class ComputeManager(manager.Manager):
         self._notify_about_instance_usage(
                       context, instance, "live_migration.rollback.dest.start",
                       network_info=network_info)
+        try:
+            # NOTE(tr3buchet): tear down networks on destination host
+            self.network_api.setup_networks_on_host(context, instance,
+                                                    self.host, teardown=True)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                # NOTE(tdurakov): even if teardown networks fails driver
+                # should try to rollback live migration on destination.
+                LOG.exception(
+                    _LE('An error occurred while deallocating network.'),
+                    instance=instance)
+        finally:
+            # always run this even if setup_networks_on_host fails
+            # NOTE(vish): The mapping is passed in so the driver can disconnect
+            #             from remote volumes if necessary
+            block_device_info = self._get_instance_block_device_info(context,
+                                                                     instance)
+            self.driver.rollback_live_migration_at_destination(
+                context, instance, network_info, block_device_info,
+                destroy_disks=destroy_disks, migrate_data=migrate_data)
 
-        # NOTE(tr3buchet): tear down networks on destination host
-        self.network_api.setup_networks_on_host(context, instance,
-                                                self.host, teardown=True)
-
-        # NOTE(vish): The mapping is passed in so the driver can disconnect
-        #             from remote volumes if necessary
-        block_device_info = self._get_instance_block_device_info(context,
-                                                                 instance)
-        self.driver.rollback_live_migration_at_destination(
-                        context, instance, network_info, block_device_info,
-                        destroy_disks=destroy_disks, migrate_data=migrate_data)
         self._notify_about_instance_usage(
                         context, instance, "live_migration.rollback.dest.end",
                         network_info=network_info)
@@ -5686,6 +5725,7 @@ class ComputeManager(manager.Manager):
             return
 
         filters = {'vm_state': vm_states.SHELVED,
+                   'task_state': None,
                    'host': self.host}
         shelved_instances = objects.InstanceList.get_by_filters(
             context, filters=filters, expected_attrs=['system_metadata'],
@@ -5701,7 +5741,7 @@ class ComputeManager(manager.Manager):
         for instance in to_gc:
             try:
                 instance.task_state = task_states.SHELVING_OFFLOADING
-                instance.save()
+                instance.save(expected_task_state=(None,))
                 self.shelve_offload_instance(context, instance,
                                              clean_shutdown=False)
             except Exception:
@@ -5794,8 +5834,8 @@ class ComputeManager(manager.Manager):
                 # NOTE(PhilDay): Record that its not supported so we can
                 # skip fast on future calls rather than waste effort getting
                 # the list of instances.
-                LOG.warning(_LW("Bandwidth usage not supported by "
-                                "hypervisor."))
+                LOG.info(_LI("Bandwidth usage not supported by "
+                             "hypervisor."))
                 self._bw_usage_supported = False
                 return
 
@@ -6282,8 +6322,8 @@ class ComputeManager(manager.Manager):
                             # disable starting the instance
                             self.driver.set_bootable(instance, False)
                         except NotImplementedError:
-                            LOG.warning(_LW("set_bootable is not implemented "
-                                            "for the current driver"))
+                            LOG.debug("set_bootable is not implemented "
+                                      "for the current driver")
                         # and power it off
                         self.driver.power_off(instance)
                     except Exception:

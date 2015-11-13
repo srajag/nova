@@ -22,14 +22,13 @@ import copy
 import datetime
 import functools
 import sys
-import threading
 import uuid
 
 from oslo_config import cfg
 from oslo_db import api as oslo_db_api
 from oslo_db import exception as db_exc
 from oslo_db import options as oslo_db_options
-from oslo_db.sqlalchemy import session as db_session
+from oslo_db.sqlalchemy import enginefacade
 from oslo_db.sqlalchemy import update_match
 from oslo_db.sqlalchemy import utils as sqlalchemyutils
 from oslo_log import log as logging
@@ -126,23 +125,20 @@ CONF = cfg.CONF
 CONF.register_opts(db_opts)
 CONF.register_opts(oslo_db_options.database_opts, 'database')
 CONF.register_opts(api_db_opts, group='api_database')
+CONF.import_opt('until_refresh', 'nova.quota')
 
 LOG = logging.getLogger(__name__)
 
-_ENGINE_FACADE = {'main': None, 'api': None}
-_MAIN_FACADE = 'main'
-_API_FACADE = 'api'
-_LOCK = threading.Lock()
+main_context_manager = enginefacade.transaction_context()
+api_context_manager = enginefacade.transaction_context()
 
 
-def _create_facade(conf_group):
-
-    # NOTE(dheeraj): This fragment is copied from oslo.db
-    return db_session.EngineFacade(
-        sql_connection=conf_group.connection,
+def _get_db_conf(conf_group):
+    kw = dict(
+        connection=conf_group.connection,
         slave_connection=conf_group.slave_connection,
         sqlite_fk=False,
-        autocommit=True,
+        __autocommit=True,
         expire_on_commit=False,
         mysql_sql_mode=conf_group.mysql_sql_mode,
         idle_timeout=conf_group.idle_timeout,
@@ -154,39 +150,31 @@ def _create_facade(conf_group):
         connection_trace=conf_group.connection_trace,
         max_retries=conf_group.max_retries,
         retry_interval=conf_group.retry_interval)
+    return kw
 
 
-def _create_facade_lazily(facade, conf_group):
-    global _LOCK, _ENGINE_FACADE
-    if _ENGINE_FACADE[facade] is None:
-        with _LOCK:
-            if _ENGINE_FACADE[facade] is None:
-                _ENGINE_FACADE[facade] = _create_facade(conf_group)
-    return _ENGINE_FACADE[facade]
+def configure(conf):
+    main_context_manager.configure(**_get_db_conf(conf.database))
+    api_context_manager.configure(**_get_db_conf(conf.api_database))
 
 
 def get_engine(use_slave=False):
-    conf_group = CONF.database
-    facade = _create_facade_lazily(_MAIN_FACADE, conf_group)
-    return facade.get_engine(use_slave=use_slave)
+    return main_context_manager._factory.get_legacy_facade().get_engine(
+        use_slave=use_slave)
 
 
 def get_api_engine():
-    conf_group = CONF.api_database
-    facade = _create_facade_lazily(_API_FACADE, conf_group)
-    return facade.get_engine()
+    return api_context_manager._factory.get_legacy_facade().get_engine()
 
 
 def get_session(use_slave=False, **kwargs):
-    conf_group = CONF.database
-    facade = _create_facade_lazily(_MAIN_FACADE, conf_group)
-    return facade.get_session(use_slave=use_slave, **kwargs)
+    return main_context_manager._factory.get_legacy_facade().get_session(
+        use_slave=use_slave, **kwargs)
 
 
 def get_api_session(**kwargs):
-    conf_group = CONF.api_database
-    facade = _create_facade_lazily(_API_FACADE, conf_group)
-    return facade.get_session(**kwargs)
+    return api_context_manager._factory.get_legacy_facade().get_session(
+        **kwargs)
 
 
 _SHADOW_TABLE_PREFIX = 'shadow_'
@@ -268,6 +256,9 @@ def model_query(context, model,
                         query to match the context's project_id. If set to
                         'allow_none', restriction includes project_id = None.
     """
+
+    if hasattr(context, 'session'):
+        session = context.session
 
     if session is None:
         if CONF.database.slave_connection == '':
@@ -438,6 +429,17 @@ def _service_get(context, service_id, session=None,
 def service_get(context, service_id, use_slave=False):
     return _service_get(context, service_id,
                         use_slave=use_slave)
+
+
+def service_get_minimum_version(context, binary, use_slave=False):
+    session = get_session(use_slave=use_slave)
+    with session.begin():
+        min_version = session.query(
+            func.min(models.Service.version)).\
+                             filter(models.Service.binary == binary).\
+                             filter(models.Service.forced_down == false()).\
+                             scalar()
+    return min_version
 
 
 def service_get_all(context, disabled=None):
@@ -2646,6 +2648,7 @@ def instance_remove_security_group(context, instance_uuid, security_group_id):
 
 
 @require_context
+@main_context_manager.reader
 def instance_info_cache_get(context, instance_uuid):
     """Gets an instance info cache from the table.
 
@@ -2657,6 +2660,7 @@ def instance_info_cache_get(context, instance_uuid):
 
 
 @require_context
+@main_context_manager.writer
 def instance_info_cache_update(context, instance_uuid, values):
     """Update an instance info cache record in the table.
 
@@ -2665,33 +2669,31 @@ def instance_info_cache_update(context, instance_uuid, values):
     """
     convert_objects_related_datetimes(values)
 
-    session = get_session()
-    with session.begin():
-        info_cache = model_query(context, models.InstanceInfoCache,
-                                 session=session).\
-                         filter_by(instance_uuid=instance_uuid).\
-                         first()
-        if info_cache and info_cache['deleted']:
-            raise exception.InstanceInfoCacheNotFound(
-                    instance_uuid=instance_uuid)
-        elif not info_cache:
-            # NOTE(tr3buchet): just in case someone blows away an instance's
-            #                  cache entry, re-create it.
-            info_cache = models.InstanceInfoCache()
-            values['instance_uuid'] = instance_uuid
+    info_cache = model_query(context, models.InstanceInfoCache).\
+                     filter_by(instance_uuid=instance_uuid).\
+                     first()
+    if info_cache and info_cache['deleted']:
+        raise exception.InstanceInfoCacheNotFound(
+                instance_uuid=instance_uuid)
+    elif not info_cache:
+        # NOTE(tr3buchet): just in case someone blows away an instance's
+        #                  cache entry, re-create it.
+        info_cache = models.InstanceInfoCache()
+        values['instance_uuid'] = instance_uuid
 
-        try:
-            info_cache.update(values)
-        except db_exc.DBDuplicateEntry:
-            # NOTE(sirp): Possible race if two greenthreads attempt to
-            # recreate the instance cache entry at the same time. First one
-            # wins.
-            pass
+    try:
+        info_cache.update(values)
+    except db_exc.DBDuplicateEntry:
+        # NOTE(sirp): Possible race if two greenthreads attempt to
+        # recreate the instance cache entry at the same time. First one
+        # wins.
+        pass
 
     return info_cache
 
 
 @require_context
+@main_context_manager.writer
 def instance_info_cache_delete(context, instance_uuid):
     """Deletes an existing instance_info_cache record
 
@@ -2708,10 +2710,11 @@ def instance_info_cache_delete(context, instance_uuid):
 def _instance_extra_create(context, values):
     inst_extra_ref = models.InstanceExtra()
     inst_extra_ref.update(values)
-    inst_extra_ref.save()
+    inst_extra_ref.save(context.session)
     return inst_extra_ref
 
 
+@main_context_manager.writer
 def instance_extra_update_by_uuid(context, instance_uuid, values):
     rows_updated = model_query(context, models.InstanceExtra).\
         filter_by(instance_uuid=instance_uuid).\
@@ -2725,6 +2728,7 @@ def instance_extra_update_by_uuid(context, instance_uuid, values):
     return rows_updated
 
 
+@main_context_manager.reader
 def instance_extra_get_by_instance_uuid(context, instance_uuid,
                                         columns=None):
     query = model_query(context, models.InstanceExtra).\
@@ -2742,17 +2746,19 @@ def instance_extra_get_by_instance_uuid(context, instance_uuid,
 
 
 @require_context
+@main_context_manager.writer
 def key_pair_create(context, values):
     try:
         key_pair_ref = models.KeyPair()
         key_pair_ref.update(values)
-        key_pair_ref.save()
+        key_pair_ref.save(session=context.session)
         return key_pair_ref
     except db_exc.DBDuplicateEntry:
         raise exception.KeyPairExists(key_name=values['name'])
 
 
 @require_context
+@main_context_manager.writer
 def key_pair_destroy(context, user_id, name):
     result = model_query(context, models.KeyPair).\
                          filter_by(user_id=user_id).\
@@ -2763,6 +2769,7 @@ def key_pair_destroy(context, user_id, name):
 
 
 @require_context
+@main_context_manager.reader
 def key_pair_get(context, user_id, name):
     result = model_query(context, models.KeyPair).\
                      filter_by(user_id=user_id).\
@@ -2776,6 +2783,7 @@ def key_pair_get(context, user_id, name):
 
 
 @require_context
+@main_context_manager.reader
 def key_pair_get_all_by_user(context, user_id):
     return model_query(context, models.KeyPair, read_deleted="no").\
                    filter_by(user_id=user_id).\
@@ -2783,6 +2791,7 @@ def key_pair_get_all_by_user(context, user_id):
 
 
 @require_context
+@main_context_manager.reader
 def key_pair_count_by_user(context, user_id):
     return model_query(context, models.KeyPair, read_deleted="no").\
                    filter_by(user_id=user_id).\
@@ -3956,6 +3965,18 @@ def block_device_mapping_update_or_create(context, values, legacy=True):
 
 
 @require_context
+def block_device_mapping_get_all_by_instance_uuids(context, instance_uuids,
+                                                   use_slave=False):
+    if not instance_uuids:
+        return []
+    return _block_device_mapping_get_query(
+        context, use_slave=use_slave
+    ).filter(
+        models.BlockDeviceMapping.instance_uuid.in_(instance_uuids)
+    ).all()
+
+
+@require_context
 def block_device_mapping_get_all_by_instance(context, instance_uuid,
                                              use_slave=False):
     return _block_device_mapping_get_query(context, use_slave=use_slave).\
@@ -4198,7 +4219,7 @@ def _security_group_ensure_default(context, session=None):
                                     context.user_id,
                                     'security_groups',
                                     1, 0,
-                                    None,
+                                    CONF.until_refresh,
                                     session=session)
             else:
                 usage.update({'in_use': int(usage.first().in_use) + 1})
@@ -4920,36 +4941,36 @@ def flavor_extra_specs_update_or_create(context, flavor_id, specs,
 ####################
 
 
+@main_context_manager.writer
 def cell_create(context, values):
     cell = models.Cell()
     cell.update(values)
     try:
-        cell.save()
+        cell.save(session=context.session)
     except db_exc.DBDuplicateEntry:
         raise exception.CellExists(name=values['name'])
     return cell
 
 
-def _cell_get_by_name_query(context, cell_name, session=None):
-    return model_query(context, models.Cell,
-                       session=session).filter_by(name=cell_name)
+def _cell_get_by_name_query(context, cell_name):
+    return model_query(context, models.Cell).filter_by(name=cell_name)
 
 
+@main_context_manager.writer
 def cell_update(context, cell_name, values):
-    session = get_session()
-    with session.begin():
-        cell_query = _cell_get_by_name_query(context, cell_name,
-                                             session=session)
-        if not cell_query.update(values):
-            raise exception.CellNotFound(cell_name=cell_name)
-        cell = cell_query.first()
+    cell_query = _cell_get_by_name_query(context, cell_name)
+    if not cell_query.update(values):
+        raise exception.CellNotFound(cell_name=cell_name)
+    cell = cell_query.first()
     return cell
 
 
+@main_context_manager.writer
 def cell_delete(context, cell_name):
     return _cell_get_by_name_query(context, cell_name).soft_delete()
 
 
+@main_context_manager.reader
 def cell_get(context, cell_name):
     result = _cell_get_by_name_query(context, cell_name).first()
     if not result:
@@ -4957,6 +4978,7 @@ def cell_get(context, cell_name):
     return result
 
 
+@main_context_manager.reader
 def cell_get_all(context):
     return model_query(context, models.Cell, read_deleted="no").all()
 
@@ -5952,9 +5974,9 @@ def task_log_end_task(context, task_name, period_beginning, period_ending,
             raise exception.TaskNotRunning(task_name=task_name, host=host)
 
 
-def archive_deleted_rows_for_table(context, tablename, max_rows):
+def _archive_deleted_rows_for_table(tablename, max_rows):
     """Move up to max_rows rows from one tables to the corresponding
-    shadow table. The context argument is only used for the decorator.
+    shadow table.
 
     :returns: number of rows archived
     """
@@ -6005,14 +6027,13 @@ def archive_deleted_rows_for_table(context, tablename, max_rows):
         with conn.begin():
             conn.execute(insert)
             result_delete = conn.execute(delete_statement)
-    except db_exc.DBError:
-        # TODO(ekudryashova): replace by DBReferenceError when db layer
-        # raise it.
+    except db_exc.DBReferenceError as ex:
         # A foreign key constraint keeps us from deleting some of
         # these rows until we clean up a dependent table.  Just
         # skip this table for now; we'll come back to it later.
-        msg = _("IntegrityError detected when archiving table %s") % tablename
-        LOG.warn(msg)
+        LOG.warn(_LW("IntegrityError detected when archiving table "
+                     "%(tablename)s: %(error)s"),
+                 {'tablename': tablename, 'error': six.text_type(ex)})
         return rows_archived
 
     rows_archived = result_delete.rowcount
@@ -6020,24 +6041,38 @@ def archive_deleted_rows_for_table(context, tablename, max_rows):
     return rows_archived
 
 
-def archive_deleted_rows(context, max_rows=None):
+def archive_deleted_rows(max_rows=None):
     """Move up to max_rows rows from production tables to the corresponding
     shadow tables.
 
-    :returns: Number of rows archived.
+    :returns: dict that maps table name to number of rows archived from that
+              table, for example:
+
+    ::
+
+        {
+            'instances': 5,
+            'block_device_mapping': 5,
+            'pci_devices': 2,
+        }
+
     """
-    # The context argument is only used for the decorator.
+    table_to_rows_archived = {}
     tablenames = []
     for model_class in six.itervalues(models.__dict__):
         if hasattr(model_class, "__tablename__"):
             tablenames.append(model_class.__tablename__)
-    rows_archived = 0
+    total_rows_archived = 0
     for tablename in tablenames:
-        rows_archived += archive_deleted_rows_for_table(context, tablename,
-                                         max_rows=max_rows - rows_archived)
-        if rows_archived >= max_rows:
+        rows_archived = _archive_deleted_rows_for_table(
+            tablename, max_rows=max_rows - total_rows_archived)
+        total_rows_archived += rows_archived
+        # Only report results for tables that had updates.
+        if rows_archived:
+            table_to_rows_archived[tablename] = rows_archived
+        if total_rows_archived >= max_rows:
             break
-    return rows_archived
+    return table_to_rows_archived
 
 
 ####################

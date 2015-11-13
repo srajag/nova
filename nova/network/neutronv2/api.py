@@ -729,7 +729,8 @@ class API(base_api.NetworkAPI):
             context, instance, networks=nets_in_requested_order,
             port_ids=ports_in_requested_order,
             admin_client=admin_client,
-            preexisting_port_ids=preexisting_port_ids)
+            preexisting_port_ids=preexisting_port_ids,
+            update_cells=True)
         # NOTE(danms): Only return info about ports we created in this run.
         # In the initial allocation case, this will be everything we created,
         # and in later runs will only be what was created that time. Thus,
@@ -1399,7 +1400,9 @@ class API(base_api.NetworkAPI):
     def get_floating_ips_by_project(self, context):
         client = get_client(context)
         project_id = context.project_id
-        fips = client.list_floatingips(tenant_id=project_id)['floatingips']
+        fips = self._safe_get_floating_ips(client, tenant_id=project_id)
+        if not fips:
+            return []
         pool_dict = self._setup_pools_dict(client)
         port_dict = self._setup_ports_dict(client, project_id)
         return [self._format_floating_ip_model(fip, pool_dict, port_dict)
@@ -1457,12 +1460,29 @@ class API(base_api.NetworkAPI):
 
         return fip['floatingip']['floating_ip_address']
 
+    def _safe_get_floating_ips(self, client, **kwargs):
+        """Get floatingip gracefully handling 404 from Neutron."""
+        try:
+            return client.list_floatingips(**kwargs)['floatingips']
+        # If a neutron plugin does not implement the L3 API a 404 from
+        # list_floatingips will be raised.
+        except neutron_client_exc.NotFound:
+            return []
+        except neutron_client_exc.NeutronClientException as e:
+            # bug/1513879 neutron client is currently using
+            # NeutronClientException when there is no L3 API
+            if e.status_code == 404:
+                return []
+            with excutils.save_and_reraise_exception():
+                LOG.exception(_LE('Unable to access floating IP for %s'),
+                        ', '.join(['%s %s' % (k, v)
+                                   for k, v in six.iteritems(kwargs)]))
+
     def _get_floating_ip_by_address(self, client, address):
         """Get floatingip from floating ip address."""
         if not address:
             raise exception.FloatingIpNotFoundForAddress(address=address)
-        data = client.list_floatingips(floating_ip_address=address)
-        fips = data['floatingips']
+        fips = self._safe_get_floating_ips(client, floating_ip_address=address)
         if len(fips) == 0:
             raise exception.FloatingIpNotFoundForAddress(address=address)
         elif len(fips) > 1:
@@ -1471,19 +1491,8 @@ class API(base_api.NetworkAPI):
 
     def _get_floating_ips_by_fixed_and_port(self, client, fixed_ip, port):
         """Get floatingips from fixed ip and port."""
-        try:
-            data = client.list_floatingips(fixed_ip_address=fixed_ip,
+        return self._safe_get_floating_ips(client, fixed_ip_address=fixed_ip,
                                            port_id=port)
-        # If a neutron plugin does not implement the L3 API a 404 from
-        # list_floatingips will be raised.
-        except neutron_client_exc.NeutronClientException as e:
-            if e.status_code == 404:
-                return []
-            with excutils.save_and_reraise_exception():
-                LOG.exception(_LE('Unable to access floating IP %(fixed_ip)s '
-                                  'for port %(port_id)s'),
-                              {'fixed_ip': fixed_ip, 'port_id': port})
-        return data['floatingips']
 
     def release_floating_ip(self, context, address,
                             affect_auto_assigned=False):

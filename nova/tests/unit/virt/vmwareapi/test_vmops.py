@@ -12,7 +12,6 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-import contextlib
 
 import mock
 from oslo_serialization import jsonutils
@@ -239,7 +238,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
             self.assertTrue(kwargs['consolidate'])
             return 'fake_remove_snapshot_task'
 
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self._session, '_wait_for_task'),
             mock.patch.object(self._session, '_call_method', fake_call_method)
         ) as (_wait_for_task, _call_method):
@@ -266,7 +265,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                 self.assertEqual(('fake_snapshot_task', 'info'), args)
                 return task_info
 
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self._session, '_wait_for_task'),
             mock.patch.object(self._session, '_call_method', fake_call_method)
         ) as (_wait_for_task, _call_method):
@@ -438,7 +437,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                                 'fake-capacity',
                                 device)
 
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self._vmops, 'get_datacenter_ref_and_name'),
             mock.patch.object(vm_util, 'get_vmdk_info',
                               return_value=vmdk)
@@ -485,7 +484,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
             self.assertEqual('get_object_property', method)
             self.assertEqual(expected_args, args)
 
-        with contextlib.nested(
+        with test.nested(
                 mock.patch.object(vm_util, 'power_on_instance'),
                 mock.patch.object(vm_util, 'find_rescue_device'),
                 mock.patch.object(vm_util, 'get_vm_ref', return_value=vm_ref),
@@ -509,7 +508,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                 vm_ref, self._instance, mock.ANY, destroy_disk=True)
 
     def _test_finish_migration(self, power_on=True, resize_instance=False):
-        with contextlib.nested(
+        with test.nested(
                 mock.patch.object(self._vmops,
                                   '_resize_create_ephemerals_and_swap'),
                 mock.patch.object(self._vmops, "_update_instance_progress"),
@@ -592,7 +591,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                                  vmFolder='fake_folder')
         extra_specs = vm_util.ExtraSpecs()
         fake_get_extra_specs.return_value = extra_specs
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self._vmops, 'get_datacenter_ref_and_name',
                               return_value=dc_info),
             mock.patch.object(vm_util, 'get_vmdk_info',
@@ -779,7 +778,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                                 device)
         dc_info = ds_util.DcInfo(ref='fake_ref', name='fake',
                                  vmFolder='fake_folder')
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self._vmops, 'get_datacenter_ref_and_name',
                               return_value=dc_info),
             mock.patch.object(vm_util, 'get_vmdk_info',
@@ -853,11 +852,13 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                  for i in range(4)]
         fake_progress.assert_has_calls(calls)
 
+    @mock.patch.object(vutil, 'get_inventory_path', return_value='fake_path')
     @mock.patch.object(vmops.VMwareVMOps, '_attach_cdrom_to_vm')
     @mock.patch.object(vmops.VMwareVMOps, '_create_config_drive')
     def test_configure_config_drive(self,
                                     mock_create_config_drive,
-                                    mock_attach_cdrom_to_vm):
+                                    mock_attach_cdrom_to_vm,
+                                    mock_get_inventory_path):
         injected_files = mock.Mock()
         admin_password = mock.Mock()
         network_info = mock.Mock()
@@ -868,9 +869,11 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                 injected_files, admin_password, network_info)
 
         upload_iso_path = self._ds.build_path("fake_iso_path")
+        mock_get_inventory_path.assert_called_once_with(self._session.vim,
+                                                        self._dc_info.ref)
         mock_create_config_drive.assert_called_once_with(self._instance,
                 injected_files, admin_password, network_info, self._ds.name,
-                self._dc_info.name, self._instance.uuid, "Fake-CookieJar")
+                'fake_path', self._instance.uuid, "Fake-CookieJar")
         mock_attach_cdrom_to_vm.assert_called_once_with(
                 vm_ref, self._instance, self._ds.ref, str(upload_iso_path))
 
@@ -1352,7 +1355,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
         if extra_specs is None:
             extra_specs = vm_util.ExtraSpecs()
 
-        with contextlib.nested(
+        with test.nested(
                 mock.patch.object(self._session, '_wait_for_task'),
                 mock.patch.object(self._session, '_call_method',
                                   mock_call_method),
@@ -1994,9 +1997,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                 return ticket
             elif method == 'get_object_property':
                 return 'fira-host'
-        with contextlib.nested(
-            mock.patch.object(self._session, 'invoke_api', fake_invoke),
-        ):
+        with mock.patch.object(self._session, 'invoke_api', fake_invoke):
             result = self._vmops._get_esx_host_and_cookies(datastore,
                                                            'ha-datacenter',
                                                            file_path)
@@ -2266,7 +2267,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
             elif (expected_method == 'ResetVM_Task'):
                 return 'fake-task'
 
-        with contextlib.nested(
+        with test.nested(
                 mock.patch.object(vm_util, "get_vm_ref",
                                   return_value='fake-vm-ref'),
                 mock.patch.object(self._session, "_call_method",

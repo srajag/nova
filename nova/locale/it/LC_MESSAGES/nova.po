@@ -12,14 +12,13 @@
 # Tom Cocozzello <tjcocozz@us.ibm.com>, 2015. #zanata
 msgid ""
 msgstr ""
-"Project-Id-Version: nova 12.0.0.0rc2.dev3\n"
+"Project-Id-Version: nova 13.0.0.dev41\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2015-10-03 06:33+0000\n"
+"POT-Creation-Date: 2015-10-27 06:29+0000\n"
 "PO-Revision-Date: 2015-09-06 10:17+0000\n"
 "Last-Translator: openstackjenkins <jenkins@openstack.org>\n"
 "Language: it\n"
-"Language-Team: Italian (http://www.transifex.com/openstack/nova/language/"
-"it/)\n"
+"Language-Team: Italian\n"
 "Plural-Forms: nplurals=2; plural=(n != 1)\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
@@ -2019,14 +2018,6 @@ msgid "Instance snapshots are not permitted at this time."
 msgstr "Le istantanee dell'istanza non sono consentite in questo momento."
 
 #, python-format
-msgid ""
-"Insufficient Space on Volume Group %(vg)s. Only %(free_space)db available, "
-"but %(size)db required by volume %(lv)s."
-msgstr ""
-"Spazio insufficiente nel gruppo volume %(vg)s. Solo %(free_space)db "
-"disponibile, ma %(size)db richiesto dal volume %(lv)s."
-
-#, python-format
 msgid "Insufficient compute resources: %(reason)s."
 msgstr "Risorse di elaborazione insufficienti: %(reason)s."
 
@@ -2034,10 +2025,6 @@ msgstr "Risorse di elaborazione insufficienti: %(reason)s."
 msgid "Insufficient free memory on compute node to start %(uuid)s."
 msgstr ""
 "Memoria disponibile insufficiente sul nodo di calcolo per avviare %(uuid)s."
-
-#, python-format
-msgid "IntegrityError detected when archiving table %s"
-msgstr "Rilevato IntegrityError durante l'archiviazione della tabella %s"
 
 #, python-format
 msgid "Interface %(interface)s not found."

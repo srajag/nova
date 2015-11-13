@@ -501,6 +501,65 @@ class ModelQueryTestCase(DbTestCase):
                                    session=mock.MagicMock())
         self.assertFalse(mock_get_session.called)
 
+    @mock.patch.object(sqlalchemy_api, 'get_session')
+    @mock.patch.object(sqlalchemyutils, 'model_query')
+    def test_model_query_use_context_session(self, mock_model_query,
+                                             mock_get_session):
+        @sqlalchemy_api.main_context_manager.reader
+        def fake_method(context):
+            session = context.session
+            sqlalchemy_api.model_query(context, models.Instance)
+            return session
+
+        session = fake_method(self.context)
+        self.assertFalse(mock_get_session.called)
+        mock_model_query.assert_called_once_with(models.Instance, session,
+                                                 None, deleted=False)
+
+
+class EngineFacadeTestCase(DbTestCase):
+    @mock.patch.object(sqlalchemy_api, 'get_session')
+    def test_use_single_context_session_writer(self, mock_get_session):
+        # Checks that session in context would not be overwritten by
+        # annotation @sqlalchemy_api.main_context_manager.writer if annotation
+        # is used twice.
+
+        @sqlalchemy_api.main_context_manager.writer
+        def fake_parent_method(context):
+            session = context.session
+            return fake_child_method(context), session
+
+        @sqlalchemy_api.main_context_manager.writer
+        def fake_child_method(context):
+            session = context.session
+            sqlalchemy_api.model_query(context, models.Instance)
+            return session
+
+        parent_session, child_session = fake_parent_method(self.context)
+        self.assertFalse(mock_get_session.called)
+        self.assertEqual(parent_session, child_session)
+
+    @mock.patch.object(sqlalchemy_api, 'get_session')
+    def test_use_single_context_session_reader(self, mock_get_session):
+        # Checks that session in context would not be overwritten by
+        # annotation @sqlalchemy_api.main_context_manager.reader if annotation
+        # is used twice.
+
+        @sqlalchemy_api.main_context_manager.reader
+        def fake_parent_method(context):
+            session = context.session
+            return fake_child_method(context), session
+
+        @sqlalchemy_api.main_context_manager.reader
+        def fake_child_method(context):
+            session = context.session
+            sqlalchemy_api.model_query(context, models.Instance)
+            return session
+
+        parent_session, child_session = fake_parent_method(self.context)
+        self.assertFalse(mock_get_session.called)
+        self.assertEqual(parent_session, child_session)
+
 
 class AggregateDBApiTestCase(test.TestCase):
     def setUp(self):
@@ -968,44 +1027,44 @@ class SqlAlchemyDbApiNoDbTestCase(test.NoDBTestCase):
         op = sqlalchemy_api._get_regexp_op_for_connection('notdb:///')
         self.assertEqual('LIKE', op)
 
-    @mock.patch.object(sqlalchemy_api, '_create_facade_lazily')
+    @mock.patch.object(sqlalchemy_api.main_context_manager._factory,
+                       'get_legacy_facade')
     def test_get_engine(self, mock_create_facade):
         mock_facade = mock.MagicMock()
         mock_create_facade.return_value = mock_facade
 
         sqlalchemy_api.get_engine()
-        mock_create_facade.assert_called_once_with(sqlalchemy_api._MAIN_FACADE,
-                CONF.database)
+        mock_create_facade.assert_called_once_with()
         mock_facade.get_engine.assert_called_once_with(use_slave=False)
 
-    @mock.patch.object(sqlalchemy_api, '_create_facade_lazily')
+    @mock.patch.object(sqlalchemy_api.api_context_manager._factory,
+                       'get_legacy_facade')
     def test_get_api_engine(self, mock_create_facade):
         mock_facade = mock.MagicMock()
         mock_create_facade.return_value = mock_facade
 
         sqlalchemy_api.get_api_engine()
-        mock_create_facade.assert_called_once_with(sqlalchemy_api._API_FACADE,
-                CONF.api_database)
+        mock_create_facade.assert_called_once_with()
         mock_facade.get_engine.assert_called_once_with()
 
-    @mock.patch.object(sqlalchemy_api, '_create_facade_lazily')
+    @mock.patch.object(sqlalchemy_api.main_context_manager._factory,
+                       'get_legacy_facade')
     def test_get_session(self, mock_create_facade):
         mock_facade = mock.MagicMock()
         mock_create_facade.return_value = mock_facade
 
         sqlalchemy_api.get_session()
-        mock_create_facade.assert_called_once_with(sqlalchemy_api._MAIN_FACADE,
-                CONF.database)
+        mock_create_facade.assert_called_once_with()
         mock_facade.get_session.assert_called_once_with(use_slave=False)
 
-    @mock.patch.object(sqlalchemy_api, '_create_facade_lazily')
+    @mock.patch.object(sqlalchemy_api.api_context_manager._factory,
+                       'get_legacy_facade')
     def test_get_api_session(self, mock_create_facade):
         mock_facade = mock.MagicMock()
         mock_create_facade.return_value = mock_facade
 
         sqlalchemy_api.get_api_session()
-        mock_create_facade.assert_called_once_with(sqlalchemy_api._API_FACADE,
-                CONF.api_database)
+        mock_create_facade.assert_called_once_with()
         mock_facade.get_session.assert_called_once_with()
 
     @mock.patch.object(sqlalchemy_api, '_instance_get_by_uuid')
@@ -1846,6 +1905,17 @@ class SecurityGroupTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                    'security_groups',
                                    self.ctxt.user_id)
         self.assertEqual(1, usage.in_use)
+
+    def test_security_group_ensure_default_until_refresh(self):
+        self.flags(until_refresh=2)
+        self.ctxt.project_id = 'fake'
+        self.ctxt.user_id = 'fake'
+        db.security_group_ensure_default(self.ctxt)
+        usage = db.quota_usage_get(self.ctxt,
+                                   self.ctxt.project_id,
+                                   'security_groups',
+                                   self.ctxt.user_id)
+        self.assertEqual(2, usage.until_refresh)
 
     @mock.patch.object(db.sqlalchemy.api, '_security_group_get_by_names')
     def test_security_group_ensure_default_called_concurrently(self, sg_mock):
@@ -3166,6 +3236,20 @@ class ServiceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         real_service1 = db.service_get(self.ctxt, service1['id'])
         self._assertEqualObjects(service1, real_service1,
                                  ignored_keys=['compute_node'])
+
+    def test_service_get_minimum_version(self):
+        self._create_service({'version': 1,
+                              'host': 'host3',
+                              'binary': 'compute',
+                              'forced_down': True})
+        self._create_service({'version': 2,
+                              'host': 'host1',
+                              'binary': 'compute'})
+        self._create_service({'version': 3,
+                              'host': 'host2',
+                              'binary': 'compute'})
+        self.assertEqual(2, db.service_get_minimum_version(self.ctxt,
+                                                           'compute'))
 
     def test_service_get_not_found_exception(self):
         self.assertRaises(exception.ServiceNotFound,
@@ -5891,26 +5975,52 @@ class BlockDeviceMappingTestCase(test.TestCase):
         self.assertEqual(bdm_real['guest_format'], 'swap')
         db.block_device_mapping_destroy(self.ctxt, bdm_real['id'])
 
-    def test_block_device_mapping_get_all_by_instance(self):
+    def test_block_device_mapping_get_all_by_instance_uuids(self):
         uuid1 = self.instance['uuid']
         uuid2 = db.instance_create(self.ctxt, {})['uuid']
 
-        bmds_values = [{'instance_uuid': uuid1,
+        bdms_values = [{'instance_uuid': uuid1,
                         'device_name': '/dev/vda'},
                        {'instance_uuid': uuid2,
                         'device_name': '/dev/vdb'},
                        {'instance_uuid': uuid2,
                         'device_name': '/dev/vdc'}]
 
-        for bdm in bmds_values:
+        for bdm in bdms_values:
             self._create_bdm(bdm)
 
-        bmd = db.block_device_mapping_get_all_by_instance(self.ctxt, uuid1)
-        self.assertEqual(len(bmd), 1)
-        self.assertEqual(bmd[0]['device_name'], '/dev/vda')
+        bdms = db.block_device_mapping_get_all_by_instance_uuids(
+            self.ctxt, [])
+        self.assertEqual(len(bdms), 0)
 
-        bmd = db.block_device_mapping_get_all_by_instance(self.ctxt, uuid2)
-        self.assertEqual(len(bmd), 2)
+        bdms = db.block_device_mapping_get_all_by_instance_uuids(
+            self.ctxt, [uuid2])
+        self.assertEqual(len(bdms), 2)
+
+        bdms = db.block_device_mapping_get_all_by_instance_uuids(
+            self.ctxt, [uuid1, uuid2])
+        self.assertEqual(len(bdms), 3)
+
+    def test_block_device_mapping_get_all_by_instance(self):
+        uuid1 = self.instance['uuid']
+        uuid2 = db.instance_create(self.ctxt, {})['uuid']
+
+        bdms_values = [{'instance_uuid': uuid1,
+                        'device_name': '/dev/vda'},
+                       {'instance_uuid': uuid2,
+                        'device_name': '/dev/vdb'},
+                       {'instance_uuid': uuid2,
+                        'device_name': '/dev/vdc'}]
+
+        for bdm in bdms_values:
+            self._create_bdm(bdm)
+
+        bdms = db.block_device_mapping_get_all_by_instance(self.ctxt, uuid1)
+        self.assertEqual(len(bdms), 1)
+        self.assertEqual(bdms[0]['device_name'], '/dev/vda')
+
+        bdms = db.block_device_mapping_get_all_by_instance(self.ctxt, uuid2)
+        self.assertEqual(len(bdms), 2)
 
     def test_block_device_mapping_destroy(self):
         bdm = self._create_bdm({})
@@ -7997,11 +8107,10 @@ class Ec2TestCase(test.TestCase):
                           self.ctxt, 100500)
 
 
-class ArchiveTestCase(test.TestCase):
+class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
     def setUp(self):
         super(ArchiveTestCase, self).setUp()
-        self.context = context.get_admin_context()
         self.engine = get_engine()
         self.conn = self.engine.connect()
         self.instance_id_mappings = models.InstanceIdMapping.__table__
@@ -8083,7 +8192,9 @@ class ArchiveTestCase(test.TestCase):
         # Verify we have 0 in shadow
         self.assertEqual(len(rows), 0)
         # Archive 2 rows
-        db.archive_deleted_rows(self.context, max_rows=2)
+        results = db.archive_deleted_rows(max_rows=2)
+        expected = dict(instance_id_mappings=2)
+        self._assertEqualObjects(expected, results)
         rows = self.conn.execute(qiim).fetchall()
         # Verify we have 4 left in main
         self.assertEqual(len(rows), 4)
@@ -8091,7 +8202,9 @@ class ArchiveTestCase(test.TestCase):
         # Verify we have 2 in shadow
         self.assertEqual(len(rows), 2)
         # Archive 2 more rows
-        db.archive_deleted_rows(self.context, max_rows=2)
+        results = db.archive_deleted_rows(max_rows=2)
+        expected = dict(instance_id_mappings=2)
+        self._assertEqualObjects(expected, results)
         rows = self.conn.execute(qiim).fetchall()
         # Verify we have 2 left in main
         self.assertEqual(len(rows), 2)
@@ -8099,7 +8212,9 @@ class ArchiveTestCase(test.TestCase):
         # Verify we have 4 in shadow
         self.assertEqual(len(rows), 4)
         # Try to archive more, but there are no deleted rows left.
-        db.archive_deleted_rows(self.context, max_rows=2)
+        results = db.archive_deleted_rows(max_rows=2)
+        expected = dict()
+        self._assertEqualObjects(expected, results)
         rows = self.conn.execute(qiim).fetchall()
         # Verify we still have 2 left in main
         self.assertEqual(len(rows), 2)
@@ -8153,7 +8268,7 @@ class ArchiveTestCase(test.TestCase):
         # Verify we have 0 in shadow
         self.assertEqual(len(rows), 0)
         # Archive 2 rows
-        db.archive_deleted_rows_for_table(self.context, tablename, max_rows=2)
+        sqlalchemy_api._archive_deleted_rows_for_table(tablename, max_rows=2)
         # Verify we have 4 left in main
         rows = self.conn.execute(qmt).fetchall()
         self.assertEqual(len(rows), 4)
@@ -8161,7 +8276,7 @@ class ArchiveTestCase(test.TestCase):
         rows = self.conn.execute(qst).fetchall()
         self.assertEqual(len(rows), 2)
         # Archive 2 more rows
-        db.archive_deleted_rows_for_table(self.context, tablename, max_rows=2)
+        sqlalchemy_api._archive_deleted_rows_for_table(tablename, max_rows=2)
         # Verify we have 2 left in main
         rows = self.conn.execute(qmt).fetchall()
         self.assertEqual(len(rows), 2)
@@ -8169,7 +8284,7 @@ class ArchiveTestCase(test.TestCase):
         rows = self.conn.execute(qst).fetchall()
         self.assertEqual(len(rows), 4)
         # Try to archive more, but there are no deleted rows left.
-        db.archive_deleted_rows_for_table(self.context, tablename, max_rows=2)
+        sqlalchemy_api._archive_deleted_rows_for_table(tablename, max_rows=2)
         # Verify we still have 2 left in main
         rows = self.conn.execute(qmt).fetchall()
         self.assertEqual(len(rows), 2)
@@ -8194,7 +8309,7 @@ class ArchiveTestCase(test.TestCase):
                         self.shadow_dns_domains.c.domain == uuidstr0)
         rows = self.conn.execute(qsdd).fetchall()
         self.assertEqual(len(rows), 0)
-        db.archive_deleted_rows(self.context, max_rows=1)
+        db.archive_deleted_rows(max_rows=1)
         rows = self.conn.execute(qdd).fetchall()
         self.assertEqual(len(rows), 0)
         rows = self.conn.execute(qsdd).fetchall()
@@ -8226,13 +8341,16 @@ class ArchiveTestCase(test.TestCase):
         result = self.conn.execute(ins_stmt)
         result.inserted_primary_key[0]
         # The first try to archive console_pools should fail, due to FK.
-        num = db.archive_deleted_rows_for_table(self.context, "console_pools")
+        num = sqlalchemy_api._archive_deleted_rows_for_table("console_pools",
+                                                             max_rows=None)
         self.assertEqual(num, 0)
         # Then archiving consoles should work.
-        num = db.archive_deleted_rows_for_table(self.context, "consoles")
+        num = sqlalchemy_api._archive_deleted_rows_for_table("consoles",
+                                                             max_rows=None)
         self.assertEqual(num, 1)
         # Then archiving console_pools should work.
-        num = db.archive_deleted_rows_for_table(self.context, "console_pools")
+        num = sqlalchemy_api._archive_deleted_rows_for_table("console_pools",
+                                                             max_rows=None)
         self.assertEqual(num, 1)
         self._assert_shadow_tables_empty_except(
             'shadow_console_pools',
@@ -8275,7 +8393,7 @@ class ArchiveTestCase(test.TestCase):
         rows = self.conn.execute(qsi).fetchall()
         self.assertEqual(len(rows), 0)
         # Archive 7 rows, which should be 4 in one table and 3 in the other.
-        db.archive_deleted_rows(self.context, max_rows=7)
+        db.archive_deleted_rows(max_rows=7)
         # Verify we have 5 left in the two main tables combined
         iim_rows = self.conn.execute(qiim).fetchall()
         i_rows = self.conn.execute(qi).fetchall()
@@ -8285,7 +8403,7 @@ class ArchiveTestCase(test.TestCase):
         si_rows = self.conn.execute(qsi).fetchall()
         self.assertEqual(len(siim_rows) + len(si_rows), 7)
         # Archive the remaining deleted rows.
-        db.archive_deleted_rows(self.context, max_rows=1)
+        db.archive_deleted_rows(max_rows=1)
         # Verify we have 4 total left in both main tables.
         iim_rows = self.conn.execute(qiim).fetchall()
         i_rows = self.conn.execute(qi).fetchall()
@@ -8295,7 +8413,7 @@ class ArchiveTestCase(test.TestCase):
         si_rows = self.conn.execute(qsi).fetchall()
         self.assertEqual(len(siim_rows) + len(si_rows), 8)
         # Try to archive more, but there are no deleted rows left.
-        db.archive_deleted_rows(self.context, max_rows=500)
+        db.archive_deleted_rows(max_rows=500)
         # Verify we have 4 total left in both main tables.
         iim_rows = self.conn.execute(qiim).fetchall()
         i_rows = self.conn.execute(qi).fetchall()

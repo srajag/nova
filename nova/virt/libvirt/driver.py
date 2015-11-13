@@ -685,6 +685,10 @@ class LibvirtDriver(driver.ComputeDriver):
         inst_path = libvirt_utils.get_instance_path(instance)
         container_dir = os.path.join(inst_path, 'rootfs')
         rootfs_dev = instance.system_metadata.get('rootfs_device_name')
+        LOG.debug('Attempting to teardown container at path %(dir)s with '
+                  'root device: %(rootfs_dev)s',
+                  {'dir': container_dir, 'rootfs_dev': rootfs_dev},
+                  instance=instance)
         disk.teardown_container(container_dir, rootfs_dev)
 
     def _destroy(self, instance, attempt=1):
@@ -1803,6 +1807,51 @@ class LibvirtDriver(driver.ComputeDriver):
         timer = loopingcall.FixedIntervalLoopingCall(_wait_for_snapshot)
         timer.start(interval=0.5).wait()
 
+    @staticmethod
+    def _rebase_with_qemu_img(guest, device, active_disk_object,
+                              rebase_base):
+        """Rebase a device tied to a guest using qemu-img.
+
+        :param guest:the Guest which owns the device being rebased
+        :type guest: nova.virt.libvirt.guest.Guest
+        :param device: the guest block device to rebase
+        :type device: nova.virt.libvirt.guest.BlockDevice
+        :param active_disk_object: the guest block device to rebase
+        :type active_disk_object: nova.virt.libvirt.config.\
+                                    LibvirtConfigGuestDisk
+        :param rebase_base: the new parent in the backing chain
+        :type rebase_base: None or string
+        """
+
+        # It's unsure how well qemu-img handles network disks for
+        # every protocol. So let's be safe.
+        active_protocol = active_disk_object.source_protocol
+        if active_protocol is not None:
+            msg = _("Something went wrong when deleting a volume snapshot: "
+                    "rebasing a %(protocol)s network disk using qemu-img "
+                    "has not been fully tested") % {'protocol':
+                    active_protocol}
+            LOG.error(msg)
+            raise exception.NovaException(msg)
+
+        if rebase_base is None:
+            # If backing_file is specified as "" (the empty string), then
+            # the image is rebased onto no backing file (i.e. it will exist
+            # independently of any backing file).
+            backing_file = ""
+            qemu_img_extra_arg = []
+        else:
+            # If the rebased image is going to have a backing file then
+            # explicitly set the backing file format to avoid any security
+            # concerns related to file format auto detection.
+            backing_file = rebase_base
+            b_file_fmt = libvirt_utils.get_disk_type(backing_file)
+            qemu_img_extra_arg = ['-F', b_file_fmt]
+
+        qemu_img_extra_arg.append(active_disk_object.source_path)
+        utils.execute("qemu-img", "rebase", "-b", backing_file,
+                      *qemu_img_extra_arg)
+
     def _volume_snapshot_delete(self, context, instance, volume_id,
                                 snapshot_id, delete_info=None):
         """Note:
@@ -1956,15 +2005,24 @@ class LibvirtDriver(driver.ComputeDriver):
                  'relative': str(relative)}, instance=instance)
 
             dev = guest.get_block_device(rebase_disk)
-            result = dev.rebase(rebase_base, relative=relative)
-            if result == 0:
-                LOG.debug('blockRebase started successfully',
-                          instance=instance)
+            if guest.is_active():
+                result = dev.rebase(rebase_base, relative=relative)
+                if result == 0:
+                    LOG.debug('blockRebase started successfully',
+                              instance=instance)
 
-            while dev.wait_for_job(abort_on_error=True):
-                LOG.debug('waiting for blockRebase job completion',
-                          instance=instance)
-                time.sleep(0.5)
+                while dev.wait_for_job(abort_on_error=True):
+                    LOG.debug('waiting for blockRebase job completion',
+                              instance=instance)
+                    time.sleep(0.5)
+
+            # If the guest is not running libvirt won't do a blockRebase.
+            # In that case, let's ask qemu-img to rebase the disk.
+            else:
+                LOG.debug('Guest is not running so doing a block rebase '
+                          'using "qemu-img rebase"', instance=instance)
+                self._rebase_with_qemu_img(guest, dev, active_disk_object,
+                                           rebase_base)
 
         else:
             # commit with blockCommit()
@@ -3226,10 +3284,6 @@ class LibvirtDriver(driver.ComputeDriver):
         topology = hardware.get_best_cpu_topology(
                 flavor, image_meta, numa_topology=instance_numa_topology)
 
-        if instance_numa_topology:
-            for cell in instance_numa_topology.cells:
-                cell.cpu_topology = topology
-
         cpu.sockets = topology.sockets
         cpu.cores = topology.cores
         cpu.threads = topology.threads
@@ -4430,6 +4484,8 @@ class LibvirtDriver(driver.ComputeDriver):
             # NOTE(uni): Now the container is running with its own private
             # mount namespace and so there is no need to keep the container
             # rootfs mounted in the host namespace
+            LOG.debug('Attempting to unmount container filesystem: %s',
+                      container_dir, instance=instance)
             disk.clean_lxc_namespace(container_dir=container_dir)
         else:
             disk.teardown_container(container_dir=container_dir)
@@ -5000,9 +5056,6 @@ class LibvirtDriver(driver.ComputeDriver):
 
     def refresh_security_group_rules(self, security_group_id):
         self.firewall_driver.refresh_security_group_rules(security_group_id)
-
-    def refresh_security_group_members(self, security_group_id):
-        self.firewall_driver.refresh_security_group_members(security_group_id)
 
     def refresh_instance_security_rules(self, instance):
         self.firewall_driver.refresh_instance_security_rules(instance)
@@ -5993,7 +6046,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 if (len(downtime_steps) > 0 and
                     elapsed > downtime_steps[0][0]):
                     downtime = downtime_steps.pop(0)
-                    LOG.info(_LI("Increasing downtime to %(downtime)dms "
+                    LOG.info(_LI("Increasing downtime to %(downtime)d ms "
                                  "after %(waittime)d sec elapsed time"),
                              {"downtime": downtime[1],
                               "waittime": downtime[0]},
@@ -6286,10 +6339,10 @@ class LibvirtDriver(driver.ComputeDriver):
             LOG.debug('Connecting volumes before live migration.',
                       instance=instance)
 
-        for vol in block_device_mapping:
-            connection_info = vol['connection_info']
+        for bdm in block_device_mapping:
+            connection_info = bdm['connection_info']
             disk_info = blockinfo.get_info_from_bdm(
-                instance, CONF.libvirt.virt_type, image_meta, vol)
+                instance, CONF.libvirt.virt_type, image_meta, bdm)
             self._connect_volume(connection_info, disk_info)
 
         # We call plug_vifs before the compute manager calls

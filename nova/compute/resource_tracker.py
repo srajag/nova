@@ -50,8 +50,16 @@ resource_tracker_opts = [
                default='nova.compute.stats.Stats',
                help='Class that will manage stats for the local compute host'),
     cfg.ListOpt('compute_resources',
-                default=['vcpu'],
-                help='The names of the extra resources to track.'),
+                default=[],
+                help='DEPRECATED: The names of the extra resources to track. '
+                     'The Extensible Resource Tracker is deprecated and will '
+                     'be removed in the 14.0.0 release. If you '
+                     'use this functionality and have custom resources that '
+                     'are managed by the Extensible Resource Tracker, please '
+                     'contact the Nova development team by posting to the '
+                     'openstack-dev mailing list. There is no future planned '
+                     'support for the tracking of custom resources.',
+                deprecated_for_removal=True),
 ]
 
 allocation_ratio_opts = [
@@ -663,6 +671,7 @@ class ResourceTracker(object):
         self.compute_node.memory_mb_used += sign * mem_usage
         self.compute_node.local_gb_used += sign * usage.get('root_gb', 0)
         self.compute_node.local_gb_used += sign * usage.get('ephemeral_gb', 0)
+        self.compute_node.vcpus_used += sign * usage.get('vcpus', 0)
 
         # free ram and disk may be negative, depending on policy:
         self.compute_node.free_ram_mb = (self.compute_node.memory_mb -

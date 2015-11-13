@@ -319,7 +319,7 @@ class ServersController(wsgi.Controller):
         # If an admin hasn't specified a 'deleted' search option, we need
         # to filter out deleted instances by setting the filter ourselves.
         # ... Unless 'changes-since' is specified, because 'changes-since'
-        # should return recently deleted images according to the API spec.
+        # should return recently deleted instances according to the API spec.
 
         if 'deleted' not in search_opts:
             if 'changes-since' not in search_opts:
@@ -427,15 +427,6 @@ class ServersController(wsgi.Controller):
                                        expected_attrs=expected_attrs)
         req.cache_db_instance(instance)
         return instance
-
-    def _check_string_length(self, value, name, max_length=None):
-        try:
-            if isinstance(value, six.string_types):
-                value = value.strip()
-            utils.check_string_length(value, name, min_length=1,
-                                      max_length=max_length)
-        except exception.InvalidInput as e:
-            raise exc.HTTPBadRequest(explanation=e.format_message())
 
     def _get_requested_networks(self, requested_networks):
         """Create a list of requested networks from the networks attribute."""
@@ -658,6 +649,9 @@ class ServersController(wsgi.Controller):
                 exception.InvalidBDMBootSequence,
                 exception.InvalidBDMLocalsLimit,
                 exception.InvalidBDMVolumeNotBootable,
+                exception.InvalidBDMEphemeralSize,
+                exception.InvalidBDMFormat,
+                exception.InvalidBDMSwapSize,
                 exception.AutoDiskConfigDisabledByImage,
                 exception.ImageNUMATopologyIncomplete,
                 exception.ImageNUMATopologyForbidden,

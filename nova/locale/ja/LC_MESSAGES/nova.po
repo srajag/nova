@@ -11,16 +11,17 @@
 # Akihiro Motoki <amotoki@gmail.com>, 2015. #zanata
 # KATO Tomoyuki <kato.tomoyuki@jp.fujitsu.com>, 2015. #zanata
 # Mie Yamamoto <myamamot@redhat.com>, 2015. #zanata
+# OpenStack Infra <zanata@openstack.org>, 2015. #zanata
+# Yuko Katabami <yukokatabami@gmail.com>, 2015. #zanata
 msgid ""
 msgstr ""
-"Project-Id-Version: nova 12.0.0.0rc2.dev13\n"
+"Project-Id-Version: nova 13.0.0.dev41\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2015-10-06 06:38+0000\n"
-"PO-Revision-Date: 2015-10-06 04:52+0000\n"
+"POT-Creation-Date: 2015-10-27 06:29+0000\n"
+"PO-Revision-Date: 2015-10-08 04:20+0000\n"
 "Last-Translator: Akihiro Motoki <amotoki@gmail.com>\n"
 "Language: ja\n"
-"Language-Team: Japanese (http://www.transifex.com/openstack/nova/language/"
-"ja/)\n"
+"Language-Team: Japanese\n"
 "Plural-Forms: nplurals=1; plural=0\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
@@ -1785,7 +1786,7 @@ msgid ""
 "Image property 'hw_cpu_policy' is not permitted to override CPU pinning "
 "policy set against the flavor"
 msgstr ""
-"このフレーバーでは、イメージプロパティー \"hw_cpu_policy\" による CPU ピンポ"
+"イメージプロパティー「hw_cpu_policy」はフレーバーに対して設定されたCPU ピンポ"
 "リシーのオーバーライドを許可されていません"
 
 msgid "Image that the instance was started with could not be found."
@@ -1993,15 +1994,6 @@ msgid "Instance snapshots are not permitted at this time."
 msgstr "現在、インスタンスのスナップショット作成は許可されていません。"
 
 #, python-format
-msgid ""
-"Insufficient Space on Volume Group %(vg)s. Only %(free_space)db available, "
-"but %(size)db required by volume %(lv)s."
-msgstr ""
-"ボリュームグループ %(vg)s の容量が不足しています。使用可能な容量は "
-"%(free_space)d バイトしかありませんが、ボリューム %(lv)s には %(size)d バイト"
-"必要です。"
-
-#, python-format
 msgid "Insufficient compute resources: %(reason)s."
 msgstr "コンピュートリソースが不十分です: %(reason)s。"
 
@@ -2010,10 +2002,6 @@ msgid "Insufficient free memory on compute node to start %(uuid)s."
 msgstr ""
 "コンピュートノードには %(uuid)s を開始するための十分な空きメモリーがありませ"
 "ん。"
-
-#, python-format
-msgid "IntegrityError detected when archiving table %s"
-msgstr "テーブル %s をアーカイブするときに IntegrityError が検出されました"
 
 #, python-format
 msgid "Interface %(interface)s not found."
@@ -3055,7 +3043,7 @@ msgid ""
 "%(unit_string)s."
 msgstr ""
 "%(uri)s に対して実行できる要求は、%(unit_string)s につき %(value)s %(verb)s "
-"リクエストに限られます。"
+"要求に限られます。"
 
 msgid "Only 'updated_since', 'project_id' and 'deleted' are understood."
 msgstr "'updated_since'、'project_id'、および 'deleted' のみが認識できます。"
@@ -3715,6 +3703,16 @@ msgstr "ストレージエラー: %(reason)s"
 #, python-format
 msgid "Storage policy %s did not match any datastores"
 msgstr "ストレージポリシー %s がどのデータストアにも一致しませんでした"
+
+#, python-format
+msgid "Subject for certificate for projects, %s for project, timestamp"
+msgstr ""
+"プロジェクトの証明書のサブジェクト、%s はプロジェクト、およびタイムスタンプ"
+
+#, python-format
+msgid "Subject for certificate for users, %s for project, user, timestamp"
+msgstr ""
+"ユーザーの証明書のサブジェクト、%s はプロジェクト、ユーザー、タイムスタンプ"
 
 msgid "Success"
 msgstr "成功"

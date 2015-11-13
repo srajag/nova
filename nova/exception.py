@@ -30,6 +30,7 @@ from oslo_log import log as logging
 from oslo_utils import excutils
 import six
 import webob.exc
+from webob import util as woutil
 
 from nova.i18n import _, _LE
 from nova import safe_utils
@@ -47,9 +48,24 @@ CONF.register_opts(exc_log_opts)
 
 
 class ConvertedException(webob.exc.WSGIHTTPException):
-    def __init__(self, code=500, title="", explanation=""):
+    def __init__(self, code, title="", explanation=""):
         self.code = code
-        self.title = title
+        # There is a strict rule about constructing status line for HTTP:
+        # '...Status-Line, consisting of the protocol version followed by a
+        # numeric status code and its associated textual phrase, with each
+        # element separated by SP characters'
+        # (http://www.faqs.org/rfcs/rfc2616.html)
+        # 'code' and 'title' can not be empty because they correspond
+        # to numeric status code and its associated text
+        if title:
+            self.title = title
+        else:
+            try:
+                self.title = woutil.status_reasons[self.code]
+            except KeyError:
+                msg = _LE("Improper or unknown HTTP status code used: %d")
+                LOG.error(msg, code)
+                self.title = woutil.status_generic_reasons[self.code // 100]
         self.explanation = explanation
         super(ConvertedException, self).__init__()
 
@@ -480,6 +496,12 @@ class DestinationHypervisorTooOld(Invalid):
                 "has been provided.")
 
 
+class ServiceTooOld(Invalid):
+    msg_fmt = _("This service is older (v%(thisver)i) than the minimum "
+                "(v%(minver)i) version of the rest of the deployment. "
+                "Unable to continue.")
+
+
 class DestinationDiskExists(Invalid):
     msg_fmt = _("The supplied disk path (%(path)s) already exists, "
                 "it is expected not to exist.")
@@ -573,6 +595,11 @@ class AgentBuildExists(NovaException):
 class VolumeNotFound(NotFound):
     ec2_code = 'InvalidVolume.NotFound'
     msg_fmt = _("Volume %(volume_id)s could not be found.")
+
+
+class UndefinedRootBDM(NovaException):
+    msg_fmt = _("Undefined Block Device Mapping root: BlockDeviceMappingList "
+                "contains Block Device Mappings from multiple instances.")
 
 
 class BDMNotFound(NotFound):
@@ -1926,10 +1953,6 @@ class InvalidImageFormat(Invalid):
 
 class UnsupportedImageModel(Invalid):
     msg_fmt = _("Image model '%(image)s' is not supported")
-
-
-class DatabaseMigrationError(NovaException):
-    msg_fmt = _("Database migration failed: %(reason)s")
 
 
 class HostMappingNotFound(Invalid):
