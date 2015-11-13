@@ -39,6 +39,7 @@ def get_test_node(**kw):
                                                  ironic_states.NOSTATE),
                 'last_error': kw.get('last_error'),
                 'instance_uuid': kw.get('instance_uuid'),
+                'instance_info': kw.get('instance_info'),
                 'driver': kw.get('driver', 'fake'),
                 'driver_info': kw.get('driver_info', {}),
                 'properties': kw.get('properties', {}),
@@ -73,6 +74,11 @@ def get_test_flavor(**kw):
 
 def get_test_image_meta(**kw):
     return {'id': kw.get('id', 'cccccccc-cccc-cccc-cccc-cccccccccccc')}
+
+
+def get_test_image_meta_object(**kw):
+    return objects.ImageMeta.from_dict(
+        get_test_image_meta(**kw))
 
 
 class FakePortClient(object):

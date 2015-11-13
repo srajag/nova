@@ -140,7 +140,7 @@ class ExtensionManager(object):
     """
     def sorted_extensions(self):
         if self.sorted_ext_list is None:
-            self.sorted_ext_list = sorted(self.extensions.iteritems())
+            self.sorted_ext_list = sorted(six.iteritems(self.extensions))
 
         for _alias, ext in self.sorted_ext_list:
             yield ext
@@ -210,6 +210,13 @@ class ExtensionManager(object):
         LOG.debug("Loading extension %s", ext_factory)
 
         if isinstance(ext_factory, six.string_types):
+            if ext_factory.startswith('nova.api.openstack.compute.contrib'):
+                LOG.warn(_LW("The legacy v2 API module already moved into"
+                             "'nova.api.openstack.compute.legacy_v2.contrib'. "
+                             "Use new path instead of old path %s"),
+                         ext_factory)
+                ext_factory = ext_factory.replace('contrib',
+                                                  'legacy_v2.contrib')
             # Load the factory
             factory = importutils.import_class(ext_factory)
         else:
@@ -397,10 +404,10 @@ def os_compute_soft_authorizer(extension_name):
 
 
 @six.add_metaclass(abc.ABCMeta)
-class V3APIExtensionBase(object):
-    """Abstract base class for all V3 API extensions.
+class V21APIExtensionBase(object):
+    """Abstract base class for all v2.1 API extensions.
 
-    All V3 API extensions must derive from this class and implement
+    All v2.1 API extensions must derive from this class and implement
     the abstract methods get_resources and get_controller_extensions
     even if they just return an empty list. The extensions must also
     define the abstract properties.
@@ -458,7 +465,7 @@ class V3APIExtensionBase(object):
 
 
 def expected_errors(errors):
-    """Decorator for v3 API methods which specifies expected exceptions.
+    """Decorator for v2.1 API methods which specifies expected exceptions.
 
     Specify which exceptions may occur when an API method is called. If an
     unexpected exception occurs then return a 500 instead and ask the user

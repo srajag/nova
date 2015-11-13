@@ -18,6 +18,7 @@
 from oslo_config import cfg
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
+from oslo_versionedobjects import base as ovo_base
 
 from nova.objects import base as objects_base
 from nova import rpc
@@ -159,7 +160,37 @@ class ConductorAPI(object):
     * 2.1  - Make notify_usage_exists() take an instance object
     * Remove bw_usage_update()
     * Remove notify_usage_exists()
+
+    ... Kilo supports message version 2.1.  So, any changes to
+    existing methods in 2.x after that point should be done such
+    that they can handle the version_cap being set to 2.1.
+
     * Remove get_ec2_ids()
+    * Remove service_get_all_by()
+    * Remove service_create()
+    * Remove service_destroy()
+    * Remove service_update()
+    * Remove migration_get_in_progress_by_host_and_node()
+    * Remove aggregate_metadata_get_by_host()
+    * Remove block_device_mapping_update_or_create()
+    * Remove block_device_mapping_get_all_by_instance()
+    * Remove instance_get_all_by_host()
+    * Remove compute_node_update()
+    * Remove compute_node_delete()
+    * Remove security_groups_trigger_handler()
+    * Remove task_log_get()
+    * Remove task_log_begin_task()
+    * Remove task_log_end_task()
+    * Remove security_groups_trigger_members_refresh()
+    * Remove vol_usage_update()
+    * Remove instance_update()
+
+    * 2.2 - Add object_backport_versions()
+    * 2.3 - Add object_class_action_versions()
+    * Remove compute_node_create()
+    * Remove object_backport()
+
+    * 3.0  - Drop backwards compatibility
 
     """
 
@@ -168,11 +199,12 @@ class ConductorAPI(object):
         'havana': '1.58',
         'icehouse': '2.0',
         'juno': '2.0',
+        'kilo': '2.1',
     }
 
     def __init__(self):
         super(ConductorAPI, self).__init__()
-        target = messaging.Target(topic=CONF.conductor.topic, version='2.0')
+        target = messaging.Target(topic=CONF.conductor.topic, version='3.0')
         version_cap = self.VERSION_ALIASES.get(CONF.upgrade_levels.conductor,
                                                CONF.upgrade_levels.conductor)
         serializer = objects_base.NovaObjectSerializer()
@@ -180,159 +212,39 @@ class ConductorAPI(object):
                                      version_cap=version_cap,
                                      serializer=serializer)
 
-    def instance_update(self, context, instance_uuid, updates,
-                        service=None):
-        updates_p = jsonutils.to_primitive(updates)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'instance_update',
-                          instance_uuid=instance_uuid,
-                          updates=updates_p,
-                          service=service)
-
-    def migration_get_in_progress_by_host_and_node(self, context,
-                                                   host, node):
-        cctxt = self.client.prepare()
-        return cctxt.call(context,
-                          'migration_get_in_progress_by_host_and_node',
-                          host=host, node=node)
-
-    def aggregate_metadata_get_by_host(self, context, host, key):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'aggregate_metadata_get_by_host',
-                          host=host,
-                          key=key)
-
     def provider_fw_rule_get_all(self, context):
         cctxt = self.client.prepare()
         return cctxt.call(context, 'provider_fw_rule_get_all')
 
-    def block_device_mapping_update_or_create(self, context, values,
-                                              create=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'block_device_mapping_update_or_create',
-                          values=values, create=create)
-
-    def block_device_mapping_get_all_by_instance(self, context, instance,
-                                                 legacy=True):
-        instance_p = jsonutils.to_primitive(instance)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'block_device_mapping_get_all_by_instance',
-                          instance=instance_p, legacy=legacy)
-
-    def vol_usage_update(self, context, vol_id, rd_req, rd_bytes, wr_req,
-                         wr_bytes, instance, last_refreshed=None,
-                         update_totals=False):
-        instance_p = jsonutils.to_primitive(instance)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'vol_usage_update',
-                          vol_id=vol_id, rd_req=rd_req,
-                          rd_bytes=rd_bytes, wr_req=wr_req,
-                          wr_bytes=wr_bytes,
-                          instance=instance_p, last_refreshed=last_refreshed,
-                          update_totals=update_totals)
-
-    def service_get_all_by(self, context, topic=None, host=None, binary=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'service_get_all_by',
-                          topic=topic, host=host, binary=binary)
-
-    def instance_get_all_by_host(self, context, host, node=None,
-                                 columns_to_join=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'instance_get_all_by_host',
-                          host=host, node=node,
-                          columns_to_join=columns_to_join)
-
-    def service_create(self, context, values):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'service_create', values=values)
-
-    def service_destroy(self, context, service_id):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'service_destroy', service_id=service_id)
-
-    def compute_node_create(self, context, values):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'compute_node_create', values=values)
-
-    def compute_node_update(self, context, node, values):
-        node_p = jsonutils.to_primitive(node)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'compute_node_update',
-                          node=node_p, values=values)
-
-    def compute_node_delete(self, context, node):
-        node_p = jsonutils.to_primitive(node)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'compute_node_delete', node=node_p)
-
-    def service_update(self, context, service, values):
-        service_p = jsonutils.to_primitive(service)
-
-        # (NOTE:jichenjc)If we're calling this periodically, it makes no
-        # sense for the RPC timeout to be more than the service
-        # report interval. Select 5 here is only find a reaonable long
-        # interval as threshold.
-        timeout = CONF.report_interval
-        if timeout and timeout > 5:
-            timeout -= 1
-
-        if timeout:
-            cctxt = self.client.prepare(timeout=timeout)
-        else:
-            cctxt = self.client.prepare()
-
-        return cctxt.call(context, 'service_update',
-                          service=service_p, values=values)
-
-    def task_log_get(self, context, task_name, begin, end, host, state=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'task_log_get',
-                          task_name=task_name, begin=begin, end=end,
-                          host=host, state=state)
-
-    def task_log_begin_task(self, context, task_name, begin, end, host,
-                            task_items=None, message=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'task_log_begin_task',
-                          task_name=task_name,
-                          begin=begin, end=end, host=host,
-                          task_items=task_items, message=message)
-
-    def task_log_end_task(self, context, task_name, begin, end, host, errors,
-                          message=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'task_log_end_task',
-                          task_name=task_name, begin=begin, end=end,
-                          host=host, errors=errors, message=message)
-
-    def security_groups_trigger_handler(self, context, event, args):
-        args_p = jsonutils.to_primitive(args)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'security_groups_trigger_handler',
-                          event=event, args=args_p)
-
-    def security_groups_trigger_members_refresh(self, context, group_ids):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'security_groups_trigger_members_refresh',
-                          group_ids=group_ids)
-
+    # TODO(hanlind): This method can be removed once oslo.versionedobjects
+    # has been converted to use version_manifests in remotable_classmethod
+    # operations, which will use the new class action handler.
     def object_class_action(self, context, objname, objmethod, objver,
                             args, kwargs):
+        versions = ovo_base.obj_tree_get_versions(objname)
+        return self.object_class_action_versions(context,
+                                                 objname,
+                                                 objmethod,
+                                                 versions,
+                                                 args, kwargs)
+
+    def object_class_action_versions(self, context, objname, objmethod,
+                                     object_versions, args, kwargs):
         cctxt = self.client.prepare()
-        return cctxt.call(context, 'object_class_action',
+        return cctxt.call(context, 'object_class_action_versions',
                           objname=objname, objmethod=objmethod,
-                          objver=objver, args=args, kwargs=kwargs)
+                          object_versions=object_versions,
+                          args=args, kwargs=kwargs)
 
     def object_action(self, context, objinst, objmethod, args, kwargs):
         cctxt = self.client.prepare()
         return cctxt.call(context, 'object_action', objinst=objinst,
                           objmethod=objmethod, args=args, kwargs=kwargs)
 
-    def object_backport(self, context, objinst, target_version):
+    def object_backport_versions(self, context, objinst, object_versions):
         cctxt = self.client.prepare()
-        return cctxt.call(context, 'object_backport', objinst=objinst,
-                          target_version=target_version)
+        return cctxt.call(context, 'object_backport_versions', objinst=objinst,
+                          object_versions=object_versions)
 
 
 class ComputeTaskAPI(object):

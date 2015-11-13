@@ -21,6 +21,7 @@ import datetime
 import mock
 from oslo_config import cfg
 from oslo_utils import timeutils
+from six.moves import range
 
 from nova.cells import messaging
 from nova.cells import utils as cells_utils
@@ -222,46 +223,46 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
         instances = ['instance1', 'instance2', 'instance3']
 
         def get_instances_to_sync(context, **kwargs):
-            self.assertEqual(context, fake_context)
+            self.assertEqual(fake_context, context)
             call_info['shuffle'] = kwargs.get('shuffle')
             call_info['project_id'] = kwargs.get('project_id')
             call_info['updated_since'] = kwargs.get('updated_since')
             call_info['get_instances'] += 1
             return iter(instances)
 
+        @staticmethod
         def instance_get_by_uuid(context, uuid):
             return instances[int(uuid[-1]) - 1]
 
         def sync_instance(context, instance):
-            self.assertEqual(context, fake_context)
+            self.assertEqual(fake_context, context)
             call_info['sync_instances'].append(instance)
 
         self.stubs.Set(cells_utils, 'get_instances_to_sync',
                 get_instances_to_sync)
-        self.stubs.Set(self.cells_manager.db, 'instance_get_by_uuid',
+        self.stubs.Set(objects.Instance, 'get_by_uuid',
                 instance_get_by_uuid)
         self.stubs.Set(self.cells_manager, '_sync_instance',
                 sync_instance)
         self.stubs.Set(timeutils, 'utcnow', utcnow)
 
         self.cells_manager._heal_instances(fake_context)
-        self.assertEqual(call_info['shuffle'], True)
+        self.assertEqual(True, call_info['shuffle'])
         self.assertIsNone(call_info['project_id'])
-        self.assertEqual(call_info['updated_since'], updated_since)
-        self.assertEqual(call_info['get_instances'], 1)
+        self.assertEqual(updated_since, call_info['updated_since'])
+        self.assertEqual(1, call_info['get_instances'])
         # Only first 2
-        self.assertEqual(call_info['sync_instances'],
-                instances[:2])
+        self.assertEqual(instances[:2], call_info['sync_instances'])
 
         call_info['sync_instances'] = []
         self.cells_manager._heal_instances(fake_context)
-        self.assertEqual(call_info['shuffle'], True)
+        self.assertEqual(True, call_info['shuffle'])
         self.assertIsNone(call_info['project_id'])
-        self.assertEqual(call_info['updated_since'], updated_since)
-        self.assertEqual(call_info['get_instances'], 2)
+        self.assertEqual(updated_since, call_info['updated_since'])
+        self.assertEqual(2, call_info['get_instances'])
         # Now the last 1 and the first 1
-        self.assertEqual(call_info['sync_instances'],
-                [instances[-1], instances[0]])
+        self.assertEqual([instances[-1], instances[0]],
+                         call_info['sync_instances'])
 
     def test_sync_instances(self):
         self.mox.StubOutWithMock(self.msg_runner,
@@ -279,7 +280,7 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
         expected_response = []
         # 3 cells... so 3 responses.  Each response is a list of services.
         # Manager should turn these into a single list of responses.
-        for i in xrange(3):
+        for i in range(3):
             cell_name = 'path!to!cell%i' % i
             services = []
             for service in FAKE_SERVICES:
@@ -405,7 +406,7 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
         # 3 cells... so 3 responses.  Each response is a list of task log
         # entries. Manager should turn these into a single list of
         # task log entries.
-        for i in xrange(num):
+        for i in range(num):
             cell_name = 'path!to!cell%i' % i
             task_logs = []
             for task_log in FAKE_TASK_LOGS:
@@ -468,7 +469,7 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
         expected_response = []
         # 3 cells... so 3 responses.  Each response is a list of computes.
         # Manager should turn these into a single list of responses.
-        for i in xrange(3):
+        for i in range(3):
             cell_name = 'path!to!cell%i' % i
             compute_nodes = []
             for compute_node in FAKE_COMPUTE_NODES:
@@ -607,17 +608,16 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
     def test_validate_console_port(self):
         instance_uuid = 'fake-instance-uuid'
         cell_name = 'fake-cell-name'
-        instance = {'cell_name': cell_name}
+        instance = objects.Instance(cell_name=cell_name)
         console_port = 'fake-console-port'
         console_type = 'fake-console-type'
 
         self.mox.StubOutWithMock(self.msg_runner,
                                  'validate_console_port')
-        self.mox.StubOutWithMock(self.cells_manager.db,
-                                 'instance_get_by_uuid')
+        self.mox.StubOutWithMock(objects.Instance, 'get_by_uuid')
         fake_response = self._get_fake_response()
 
-        self.cells_manager.db.instance_get_by_uuid(self.ctxt,
+        objects.Instance.get_by_uuid(self.ctxt,
                 instance_uuid).AndReturn(instance)
         self.msg_runner.validate_console_port(self.ctxt, cell_name,
                 instance_uuid, console_port,
@@ -784,10 +784,12 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
 
     def test_terminate_instance(self):
         self.mox.StubOutWithMock(self.msg_runner, 'terminate_instance')
-        self.msg_runner.terminate_instance(self.ctxt, 'fake-instance')
+        self.msg_runner.terminate_instance(self.ctxt, 'fake-instance',
+                                           delete_type='delete')
         self.mox.ReplayAll()
         self.cells_manager.terminate_instance(self.ctxt,
-                                              instance='fake-instance')
+                                              instance='fake-instance',
+                                              delete_type='delete')
 
     def test_soft_delete_instance(self):
         self.mox.StubOutWithMock(self.msg_runner, 'soft_delete_instance')
@@ -877,3 +879,27 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
                     instance='fake-instance', new_pass='fake-password')
             set_admin_password.assert_called_once_with(self.ctxt,
                     'fake-instance', 'fake-password')
+
+    def test_get_keypair_at_top(self):
+        keypairs = [self._get_fake_response('fake_keypair'),
+                    self._get_fake_response('fake_keypair2')]
+        with mock.patch.object(self.msg_runner,
+                               'get_keypair_at_top',
+                               return_value=keypairs) as fake_get_keypair:
+            response = self.cells_manager.get_keypair_at_top(self.ctxt,
+                                                             'fake_user_id',
+                                                             'fake_name')
+            fake_get_keypair.assert_called_once_with(self.ctxt, 'fake_user_id',
+                                                     'fake_name')
+            self.assertEqual('fake_keypair', response)
+
+    def test_get_keypair_at_top_with_empty_responses(self):
+        with mock.patch.object(self.msg_runner,
+                               'get_keypair_at_top',
+                               return_value=[]) as fake_get_keypair:
+            self.assertIsNone(
+                self.cells_manager.get_keypair_at_top(self.ctxt,
+                                                      'fake_user_id',
+                                                      'fake_name'))
+            fake_get_keypair.assert_called_once_with(self.ctxt, 'fake_user_id',
+                                                     'fake_name')

@@ -17,7 +17,6 @@ import os
 import re
 
 from oslo_serialization import jsonutils
-from oslo_utils import importutils
 import six
 
 from nova import test
@@ -56,26 +55,33 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
             parts.append('all_extensions')
         # Note(gmann): if _use_common_server_api_samples is set to True
         # then common server sample files present in 'servers' directory
-        # will be used.
+        # will be used. As of now it is being used for server POST request
+        # to avoid duplicate copy of server req and resp sample files.
+        # Example - ServersSampleBase's _post_server method.
         elif cls._use_common_server_api_samples:
             parts.append('servers')
-        elif cls.sample_dir:
-            parts.append(cls.sample_dir)
-        elif cls.extension_name:
-            alias = importutils.import_class(cls.extension_name).alias
-            parts.append(alias)
+        else:
+            if cls.sample_dir:
+                parts.append(cls.sample_dir)
+            elif cls.extension_name:
+                parts.append(cls.extension_name)
+            if api_version:
+                parts.append('v' + api_version)
         parts.append(name + "." + cls.ctype + suffix)
         return os.path.join(*parts)
 
     @classmethod
-    def _get_sample(cls, name, api_version):
+    def _get_sample(cls, name, api_version=None):
         dirname = os.path.dirname(os.path.abspath(__file__))
-        dirname = os.path.normpath(os.path.join(dirname, "../../../doc"))
+        dirname = os.path.normpath(os.path.join(dirname,
+                                                "../../../doc"))
         return cls._get_sample_path(name, dirname, api_version=api_version)
 
     @classmethod
-    def _get_template(cls, name, api_version):
+    def _get_template(cls, name, api_version=None):
         dirname = os.path.dirname(os.path.abspath(__file__))
+        dirname = os.path.normpath(os.path.join(dirname,
+                                   "./api_sample_tests"))
         return cls._get_sample_path(name, dirname, suffix='.tpl',
                                     api_version=api_version)
 
@@ -185,6 +191,19 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
                 if isinstance(result, six.string_types):
                     result = result.strip()
             if expected != result:
+                # NOTE(tdurakov):this attempt to parse string as JSON
+                # is needed for correct comparison of hypervisor.cpu_info,
+                # which is stringified JSON object
+                #
+                # TODO(tdurakov): remove this check as soon as
+                # hypervisor.cpu_info become common JSON object in REST API.
+                try:
+                    expected = self._objectify(expected)
+                    result = self._objectify(result)
+                    return self._compare_result(subs, expected, result,
+                                                result_str)
+                except ValueError:
+                    pass
                 raise NoMatch(
                         'Values do not match:\n'
                         'Template: %(expected)s\n%(result_str)s: '
@@ -205,7 +224,7 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
         return subs
 
     def _verify_response(self, name, subs, response, exp_code):
-        self.assertEqual(response.status_code, exp_code)
+        self.assertEqual(exp_code, response.status_code)
         response_data = response.content
         response_data = self._pretty_data(response_data)
         if not os.path.exists(self._get_template(name,
@@ -291,6 +310,7 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
             'compute_host': self.compute.host,
             'text': text,
             'int': '[0-9]+',
+            'user_id': text,
         }
 
     def _get_response(self, url, method, body=None, strip_version=False,
@@ -305,18 +325,24 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
 
     def _do_get(self, url, strip_version=False, api_version=None):
         return self._get_response(url, 'GET', strip_version=strip_version,
-                                  api_version=api_version)
+                                  api_version=(api_version or
+                                               self.request_api_version))
 
     def _do_post(self, url, name, subs, method='POST', api_version=None):
         body = self._read_template(name) % subs
         sample = self._get_sample(name, self.request_api_version)
         if self.generate_samples and not os.path.exists(sample):
                 self._write_sample(name, body)
-        return self._get_response(url, method, body, api_version=api_version)
+        return self._get_response(url, method, body,
+                                  api_version=(api_version or
+                                               self.request_api_version))
 
     def _do_put(self, url, name, subs, api_version=None):
         return self._do_post(url, name, subs, method='PUT',
-                             api_version=api_version)
+                             api_version=(api_version or
+                                          self.request_api_version))
 
     def _do_delete(self, url, api_version=None):
-        return self._get_response(url, 'DELETE', api_version=api_version)
+        return self._get_response(url, 'DELETE',
+                                  api_version=(api_version or
+                                               self.request_api_version))

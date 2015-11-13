@@ -290,13 +290,9 @@ class ComputeHostAPITestCase(test.TestCase):
             self.ctxt, host_name, binary, params_to_update)
         self._compare_obj(result, expected_result)
 
-    def test_instance_get_all_by_host(self):
-        self.mox.StubOutWithMock(self.host_api.db,
-                                 'instance_get_all_by_host')
-
-        self.host_api.db.instance_get_all_by_host(self.ctxt,
-                'fake-host').AndReturn(['fake-responses'])
-        self.mox.ReplayAll()
+    @mock.patch.object(objects.InstanceList, 'get_by_host',
+                       return_value = ['fake-responses'])
+    def test_instance_get_all_by_host(self, mock_get):
         result = self.host_api.instance_get_all_by_host(self.ctxt,
                                                         'fake-host')
         self.assertEqual(['fake-responses'], result)
@@ -370,13 +366,15 @@ class ComputeHostAPICellsTestCase(ComputeHostAPITestCase):
         self.assertEqual(services, result)
 
     def _test_service_get_all(self, fake_filters, **kwargs):
+        service_attrs = dict(test_service.fake_service)
+        del service_attrs['version']
         services = [
             cells_utils.ServiceProxy(
-                objects.Service(**dict(test_service.fake_service, id=1,
+                objects.Service(**dict(service_attrs, id=1,
                                 topic='compute', host='host1')),
                 'cell1'),
             cells_utils.ServiceProxy(
-                objects.Service(**dict(test_service.fake_service, id=2,
+                objects.Service(**dict(service_attrs, id=2,
                                 topic='compute', host='host2')),
                 'cell1')]
         exp_services = []
@@ -446,17 +444,13 @@ class ComputeHostAPICellsTestCase(ComputeHostAPITestCase):
             service_delete.assert_called_once_with(
                 self.ctxt, cell_service_id)
 
-    def test_instance_get_all_by_host(self):
+    @mock.patch.object(objects.InstanceList, 'get_by_host')
+    def test_instance_get_all_by_host(self, mock_get):
         instances = [dict(id=1, cell_name='cell1', host='host1'),
                      dict(id=2, cell_name='cell2', host='host1'),
                      dict(id=3, cell_name='cell1', host='host2')]
 
-        self.mox.StubOutWithMock(self.host_api.db,
-                                 'instance_get_all_by_host')
-
-        self.host_api.db.instance_get_all_by_host(self.ctxt,
-                'fake-host').AndReturn(instances)
-        self.mox.ReplayAll()
+        mock_get.return_value = instances
         expected_result = [instances[0], instances[2]]
         cell_and_host = cells_utils.cell_with_item('cell1', 'fake-host')
         result = self.host_api.instance_get_all_by_host(self.ctxt,

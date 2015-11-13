@@ -19,10 +19,12 @@ Tests For Filter Scheduler.
 import mock
 
 from nova import exception
+from nova import objects
 from nova.scheduler import filter_scheduler
 from nova.scheduler import host_manager
 from nova.scheduler import utils as scheduler_utils
 from nova.scheduler import weights
+from nova import test  # noqa
 from nova.tests.unit.scheduler import fakes
 from nova.tests.unit.scheduler import test_scheduler
 
@@ -235,6 +237,24 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
 
         self.assertEqual(50, hosts[0].weight)
 
+    @mock.patch.object(objects.InstancePCIRequests,
+                       'from_request_spec_instance_props')
+    @mock.patch.object(host_manager.HostManager, 'get_filtered_hosts')
+    def test_schedule_with_pci_requests(self, get_filtered_hosts, from_rs_ip):
+        self.driver._get_all_host_states = mock.Mock()
+        get_filtered_hosts.return_value = None
+
+        fake_requests = objects.InstancePCIRequests()
+        from_rs_ip.return_value = fake_requests
+
+        instance_properties = {'pci_requests': 'anything_as_it_is_mocked'}
+        request_spec = dict(instance_properties=instance_properties,
+                            instance_type={})
+
+        self.driver._schedule(self.context, request_spec, {})
+        from_rs_ip.assert_called_once_with('anything_as_it_is_mocked')
+        self.assertEqual(fake_requests, instance_properties['pci_requests'])
+
     @mock.patch('nova.objects.ServiceList.get_by_binary',
                 return_value=fakes.SERVICES)
     @mock.patch('nova.objects.InstanceList.get_by_host')
@@ -314,13 +334,17 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
     def test_select_destinations_no_valid_host_not_enough(self):
         # Tests that we have fewer hosts available than number of instances
         # requested to build.
+        consumed_hosts = [mock.MagicMock(), mock.MagicMock()]
         with mock.patch.object(self.driver, '_schedule',
-                               return_value=[mock.sentinel.host1]):
+                               return_value=consumed_hosts):
             try:
                 self.driver.select_destinations(
-                    self.context, {'num_instances': 2}, {})
+                    self.context, {'num_instances': 3}, {})
                 self.fail('Expected NoValidHost to be raised.')
             except exception.NoValidHost as e:
                 # Make sure that we provided a reason why NoValidHost.
                 self.assertIn('reason', e.kwargs)
                 self.assertTrue(len(e.kwargs['reason']) > 0)
+                # Make sure that the consumed hosts have chance to be reverted.
+                for host in consumed_hosts:
+                    self.assertIsNone(host.obj.updated)

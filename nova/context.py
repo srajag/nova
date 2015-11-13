@@ -193,7 +193,7 @@ class RequestContext(context.RequestContext):
     def from_dict(cls, values):
         return cls(**values)
 
-    def elevated(self, read_deleted=None, overwrite=False):
+    def elevated(self, read_deleted=None):
         """Return a version of this context with admin flag set."""
         context = copy.deepcopy(self)
         context.is_admin = True
@@ -230,7 +230,7 @@ def is_user_context(context):
 
 
 def require_admin_context(ctxt):
-    """Raise exception.AdminRequired() if context is an admin context."""
+    """Raise exception.AdminRequired() if context is not an admin context."""
     if not ctxt.is_admin:
         raise exception.AdminRequired()
 

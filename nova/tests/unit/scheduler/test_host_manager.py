@@ -17,6 +17,7 @@ Tests For HostManager
 """
 
 import collections
+import datetime
 
 import mock
 from oslo_config import cfg
@@ -29,8 +30,10 @@ from nova.compute import vm_states
 from nova import exception
 from nova import objects
 from nova.objects import base as obj_base
+from nova.pci import stats as pci_stats
 from nova.scheduler import filters
 from nova.scheduler import host_manager
+from nova.scheduler import utils as sched_utils
 from nova import test
 from nova.tests.unit import fake_instance
 from nova.tests.unit import matchers
@@ -65,9 +68,9 @@ class HostManagerTestCase(test.NoDBTestCase):
         self.flags(scheduler_default_filters=['FakeFilterClass1'])
         self.host_manager = host_manager.HostManager()
         self.fake_hosts = [host_manager.HostState('fake_host%s' % x,
-                'fake-node') for x in xrange(1, 5)]
+                'fake-node') for x in range(1, 5)]
         self.fake_hosts += [host_manager.HostState('fake_multihost',
-                'fake-node%s' % x) for x in xrange(1, 5)]
+                'fake-node%s' % x) for x in range(1, 5)]
 
     def test_load_filters(self):
         filters = self.host_manager._load_filters()
@@ -386,7 +389,7 @@ class HostManagerTestCase(test.NoDBTestCase):
 
         self.assertEqual(len(host_states_map), 4)
         # Check that .service is set properly
-        for i in xrange(4):
+        for i in range(4):
             compute_node = fakes.COMPUTE_NODES[i]
             host = compute_node['host']
             node = compute_node['hypervisor_hostname']
@@ -780,7 +783,8 @@ class HostStateTestCase(test.NoDBTestCase):
             hypervisor_hostname='hostname', cpu_info='cpu_info',
             supported_hv_specs=[],
             hypervisor_version=hyper_ver_int, numa_topology=None,
-            pci_device_pools=None, metrics=None)
+            pci_device_pools=None, metrics=None,
+            cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5)
 
         host = host_manager.HostState("fakehost", "fakenode")
         host.update_from_compute_node(compute)
@@ -820,7 +824,8 @@ class HostStateTestCase(test.NoDBTestCase):
             hypervisor_hostname='hostname', cpu_info='cpu_info',
             supported_hv_specs=[],
             hypervisor_version=hyper_ver_int, numa_topology=None,
-            pci_device_pools=None, metrics=None)
+            pci_device_pools=None, metrics=None,
+            cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5)
 
         host = host_manager.HostState("fakehost", "fakenode")
         host.update_from_compute_node(compute)
@@ -851,7 +856,8 @@ class HostStateTestCase(test.NoDBTestCase):
             hypervisor_hostname='hostname', cpu_info='cpu_info',
             supported_hv_specs=[],
             hypervisor_version=hyper_ver_int, numa_topology=None,
-            pci_device_pools=None, metrics=None)
+            pci_device_pools=None, metrics=None,
+            cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5)
 
         host = host_manager.HostState("fakehost", "fakenode")
         host.update_from_compute_node(compute)
@@ -880,9 +886,11 @@ class HostStateTestCase(test.NoDBTestCase):
                         project_id='12345', vm_state=vm_states.BUILDING,
                         task_state=task_states.SCHEDULING, os_type='Linux',
                         uuid='fake-uuid',
-                        numa_topology=fake_numa_topology)
+                        numa_topology=fake_numa_topology,
+                        pci_requests={'requests': []})
         host = host_manager.HostState("fakehost", "fakenode")
 
+        self.assertIsNone(host.updated)
         host.consume_from_instance(instance)
         numa_fit_mock.assert_called_once_with('fake-host-topology',
                                               fake_numa_topology,
@@ -891,10 +899,11 @@ class HostStateTestCase(test.NoDBTestCase):
         numa_usage_mock.assert_called_once_with(host, instance)
         self.assertEqual('fake-consumed-once', host.numa_topology)
         self.assertEqual('fake-fitted-once', instance['numa_topology'])
+        self.assertIsNotNone(host.updated)
 
         instance = dict(root_gb=0, ephemeral_gb=0, memory_mb=0, vcpus=0,
-                        project_id='12345', vm_state=vm_states.PAUSED,
-                        task_state=None, os_type='Linux',
+                        project_id='12345', vm_state=vm_states.ACTIVE,
+                        task_state=task_states.RESIZE_PREP, os_type='Linux',
                         uuid='fake-uuid',
                         numa_topology=fake_numa_topology)
         numa_usage_mock.return_value = 'fake-consumed-twice'
@@ -903,21 +912,103 @@ class HostStateTestCase(test.NoDBTestCase):
         self.assertEqual('fake-fitted-twice', instance['numa_topology'])
 
         self.assertEqual(2, host.num_instances)
-        self.assertEqual(1, host.num_io_ops)
+        self.assertEqual(2, host.num_io_ops)
         self.assertEqual(2, numa_usage_mock.call_count)
         self.assertEqual(((host, instance),), numa_usage_mock.call_args)
         self.assertEqual('fake-consumed-twice', host.numa_topology)
+        self.assertIsNotNone(host.updated)
+
+    def test_stat_consumption_from_instance_pci(self):
+
+        inst_topology = objects.InstanceNUMATopology(
+                            cells = [objects.InstanceNUMACell(
+                                                      cpuset=set([0]),
+                                                      memory=512, id=0)])
+
+        fake_requests = [{'request_id': 'fake_request1', 'count': 1,
+                          'spec': [{'vendor_id': '8086'}]}]
+        fake_requests_obj = objects.InstancePCIRequests(
+                                requests=[objects.InstancePCIRequest(**r)
+                                          for r in fake_requests],
+                                instance_uuid='fake-uuid')
+        instance = objects.Instance(root_gb=0, ephemeral_gb=0, memory_mb=512,
+                        vcpus=1,
+                        project_id='12345', vm_state=vm_states.BUILDING,
+                        task_state=task_states.SCHEDULING, os_type='Linux',
+                        uuid='fake-uuid',
+                        numa_topology=inst_topology,
+                        pci_requests=fake_requests_obj,
+                        id = 1243)
+        req_spec = sched_utils.build_request_spec(None,
+                                                  None,
+                                                  [instance],
+                                                  objects.Flavor(
+                                                             root_gb=0,
+                                                             ephemeral_gb=0,
+                                                             memory_mb=1024,
+                                                             vcpus=1))
+        # NOTE(sbauza): FilterSchedule._schedule() rehydrates pci_requests
+        req_spec['instance_properties']['pci_requests'] = fake_requests_obj
+        host = host_manager.HostState("fakehost", "fakenode")
+        self.assertIsNone(host.updated)
+        host.pci_stats = pci_stats.PciDeviceStats(
+                                      [objects.PciDevicePool(vendor_id='8086',
+                                                             product_id='15ed',
+                                                             numa_node=1,
+                                                             count=1)])
+        host.numa_topology = fakes.NUMA_TOPOLOGY
+        host.consume_from_instance(req_spec['instance_properties'])
+        self.assertIsInstance(req_spec['instance_properties']['numa_topology'],
+                              objects.InstanceNUMATopology)
+
+        self.assertEqual(512, host.numa_topology.cells[1].memory_usage)
+        self.assertEqual(1, host.numa_topology.cells[1].cpu_usage)
+        self.assertEqual(0, len(host.pci_stats.pools))
+        self.assertIsNotNone(host.updated)
+
+    def test_stat_consumption_from_instance_with_pci_exception(self):
+        fake_requests = [{'request_id': 'fake_request1', 'count': 3,
+                          'spec': [{'vendor_id': '8086'}]}]
+        fake_requests_obj = objects.InstancePCIRequests(
+                                requests=[objects.InstancePCIRequest(**r)
+                                          for r in fake_requests],
+                                instance_uuid='fake-uuid')
+        instance = objects.Instance(root_gb=0, ephemeral_gb=0, memory_mb=512,
+                        vcpus=1,
+                        project_id='12345', vm_state=vm_states.BUILDING,
+                        task_state=task_states.SCHEDULING, os_type='Linux',
+                        uuid='fake-uuid',
+                        pci_requests=fake_requests_obj,
+                        id=1243)
+        req_spec = sched_utils.build_request_spec(None,
+                                                  None,
+                                                  [instance],
+                                                  objects.Flavor(
+                                                             root_gb=0,
+                                                             ephemeral_gb=0,
+                                                             memory_mb=1024,
+                                                             vcpus=1))
+        host = host_manager.HostState("fakehost", "fakenode")
+        self.assertIsNone(host.updated)
+        fake_updated = mock.sentinel.fake_updated
+        host.updated = fake_updated
+        host.pci_stats = pci_stats.PciDeviceStats()
+        with mock.patch.object(host.pci_stats, 'apply_requests',
+                               side_effect=exception.PciDeviceRequestFailed):
+            host.consume_from_instance(req_spec['instance_properties'])
+        self.assertEqual(fake_updated, host.updated)
 
     def test_resources_consumption_from_compute_node(self):
+        _ts_now = datetime.datetime(2015, 11, 11, 11, 0, 0)
         metrics = [
-            dict(name='res1',
+            dict(name='cpu.frequency',
                  value=1.0,
                  source='source1',
-                 timestamp=None),
-            dict(name='res2',
-                 value="string2",
+                 timestamp=_ts_now),
+            dict(name='numa.membw.current',
+                 numa_membw_values={"0": 10, "1": 43},
                  source='source2',
-                 timestamp=None),
+                 timestamp=_ts_now),
         ]
         hyper_ver_int = utils.convert_version_to_int('6.0.0')
         compute = objects.ComputeNode(
@@ -931,14 +1022,17 @@ class HostStateTestCase(test.NoDBTestCase):
             supported_hv_specs=[],
             hypervisor_version=hyper_ver_int,
             numa_topology=fakes.NUMA_TOPOLOGY._to_json(),
-            stats=None, pci_device_pools=None)
+            stats=None, pci_device_pools=None,
+            cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5)
         host = host_manager.HostState("fakehost", "fakenode")
         host.update_from_compute_node(compute)
 
         self.assertEqual(len(host.metrics), 2)
-        self.assertEqual(set(['res1', 'res2']), set(host.metrics.keys()))
-        self.assertEqual(1.0, host.metrics['res1'].value)
-        self.assertEqual('source1', host.metrics['res1'].source)
-        self.assertEqual('string2', host.metrics['res2'].value)
-        self.assertEqual('source2', host.metrics['res2'].source)
+        self.assertEqual(1.0, host.metrics.to_list()[0]['value'])
+        self.assertEqual('source1', host.metrics[0].source)
+        self.assertEqual('cpu.frequency', host.metrics[0].name)
+        self.assertEqual('numa.membw.current', host.metrics[1].name)
+        self.assertEqual('source2', host.metrics.to_list()[1]['source'])
+        self.assertEqual({'0': 10, '1': 43},
+                         host.metrics[1].numa_membw_values)
         self.assertIsInstance(host.numa_topology, six.string_types)

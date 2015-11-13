@@ -19,9 +19,8 @@ import mock
 from oslo_serialization import jsonutils
 import webob
 
-from nova.api.openstack.compute import image_metadata
-from nova.api.openstack.compute.plugins.v3 import image_metadata \
-     as image_metadata_v21
+from nova.api.openstack.compute import image_metadata as image_metadata_v21
+from nova.api.openstack.compute.legacy_v2 import image_metadata
 from nova import exception
 from nova import test
 from nova.tests.unit.api.openstack import fakes
@@ -296,7 +295,6 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
     @mock.patch('nova.image.api.API.get', return_value=get_image_123())
     def test_too_many_metadata_items_on_put(self, _get_mocked,
                                             update_mocked, _quota_mocked):
-        body = {"metadata": {"foo": "bar"}}
         req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata/blah')
         req.method = 'PUT'
         body = {"meta": {"blah": "blah", "blah1": "blah1"}}

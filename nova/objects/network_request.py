@@ -18,6 +18,7 @@ from nova import utils
 
 
 # TODO(berrange): Remove NovaObjectDictCompat
+@obj_base.NovaObjectRegistry.register
 class NetworkRequest(obj_base.NovaObject,
                      obj_base.NovaObjectDictCompat):
     # Version 1.0: Initial version
@@ -46,25 +47,19 @@ class NetworkRequest(obj_base.NovaObject,
             network_id, address, port_id, pci_request_id = net_tuple
             return cls(network_id=network_id, address=address,
                        port_id=port_id, pci_request_id=pci_request_id)
-        elif len(net_tuple) == 3:
-            # NOTE(alex_xu): This is only for compatible with icehouse , and
-            # should be removed in the next cycle.
-            network_id, address, port_id = net_tuple
-            return cls(network_id=network_id, address=address,
-                       port_id=port_id)
         else:
             network_id, address = net_tuple
             return cls(network_id=network_id, address=address)
 
 
+@obj_base.NovaObjectRegistry.register
 class NetworkRequestList(obj_base.ObjectListBase, obj_base.NovaObject):
     fields = {
         'objects': fields.ListOfObjectsField('NetworkRequest'),
         }
 
-    child_versions = {
-        '1.0': '1.0',
-        '1.1': '1.1',
+    obj_relationships = {
+        'objects': [('1.0', '1.0'), ('1.1', '1.1')],
         }
     VERSION = '1.1'
 

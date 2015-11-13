@@ -15,11 +15,13 @@
 """
 Datastore utility functions
 """
+import collections
 
 from oslo_log import log as logging
 from oslo_vmware import exceptions as vexc
 from oslo_vmware.objects import datastore as ds_obj
 from oslo_vmware import pbm
+from oslo_vmware import vim_util as vutil
 
 from nova import exception
 from nova.i18n import _, _LE, _LI
@@ -30,17 +32,16 @@ from nova.virt.vmwareapi import vm_util
 LOG = logging.getLogger(__name__)
 ALL_SUPPORTED_DS_TYPES = frozenset([constants.DATASTORE_TYPE_VMFS,
                                     constants.DATASTORE_TYPE_NFS,
+                                    constants.DATASTORE_TYPE_NFS41,
                                     constants.DATASTORE_TYPE_VSAN])
 
 
-# NOTE(mdbooth): this convenience function is temporarily duplicated in
-# vm_util. The correct fix is to handle paginated results as they are returned
-# from the relevant vim_util function. However, vim_util is currently
-# effectively deprecated as we migrate to oslo.vmware. This duplication will be
-# removed when we fix it properly in oslo.vmware.
-def _get_token(results):
-    """Get the token from the property results."""
-    return getattr(results, 'token', None)
+DcInfo = collections.namedtuple('DcInfo',
+                                ['ref', 'name', 'vmFolder'])
+
+# A cache for datastore/datacenter mappings. The key will be
+# the datastore moref. The value will the the DcInfo object.
+_DS_DC_MAPPING = {}
 
 
 def _select_datastore(session, data_stores, best_match, datastore_regex=None,
@@ -113,10 +114,10 @@ def get_datastore(session, cluster, datastore_regex=None,
                   storage_policy=None,
                   allowed_ds_types=ALL_SUPPORTED_DS_TYPES):
     """Get the datastore list and choose the most preferable one."""
-    datastore_ret = session._call_method(
-                                vim_util,
-                                "get_dynamic_property", cluster,
-                                "ClusterComputeResource", "datastore")
+    datastore_ret = session._call_method(vutil,
+                                         "get_object_property",
+                                         cluster,
+                                         "datastore")
     # If there are no hosts in the cluster then an empty string is
     # returned
     if not datastore_ret:
@@ -139,12 +140,8 @@ def get_datastore(session, cluster, datastore_regex=None,
                                        datastore_regex,
                                        storage_policy,
                                        allowed_ds_types)
-        token = _get_token(data_stores)
-        if not token:
-            break
-        data_stores = session._call_method(vim_util,
-                                           "continue_to_get_objects",
-                                           token)
+        data_stores = session._call_method(vutil, 'continue_retrieval',
+                                           data_stores)
     if best_match:
         return best_match
 
@@ -158,17 +155,6 @@ def get_datastore(session, cluster, datastore_regex=None,
             % datastore_regex.pattern)
     else:
         raise exception.DatastoreNotFound()
-
-
-def get_datastore_by_ref(session, ds_ref):
-    lst_properties = ["summary.type", "summary.name",
-                      "summary.capacity", "summary.freeSpace"]
-    props = session._call_method(vim_util, "get_object_properties",
-                                 None, ds_ref, "Datastore", lst_properties)
-    query = vm_util.get_values_from_object_properties(session, props)
-    return ds_obj.Datastore(ds_ref, query["summary.name"],
-                            capacity=query["summary.capacity"],
-                            freespace=query["summary.freeSpace"])
 
 
 def _get_allowed_datastores(data_stores, datastore_regex):
@@ -190,8 +176,10 @@ def _get_allowed_datastores(data_stores, datastore_regex):
 
 def get_available_datastores(session, cluster=None, datastore_regex=None):
     """Get the datastore list and choose the first local storage."""
-    ds = session._call_method(vim_util, "get_dynamic_property", cluster,
-                              "ClusterComputeResource", "datastore")
+    ds = session._call_method(vutil,
+                              "get_object_property",
+                              cluster,
+                              "datastore")
     if not ds:
         return []
     data_store_mors = ds.ManagedObjectReference
@@ -205,13 +193,8 @@ def get_available_datastores(session, cluster=None, datastore_regex=None):
     allowed = []
     while data_stores:
         allowed.extend(_get_allowed_datastores(data_stores, datastore_regex))
-        token = _get_token(data_stores)
-        if not token:
-            break
-
-        data_stores = session._call_method(vim_util,
-                                           "continue_to_get_objects",
-                                           token)
+        data_stores = session._call_method(vutil, 'continue_retrieval',
+                                           data_stores)
     return allowed
 
 
@@ -364,6 +347,11 @@ def search_datastore_spec(client_factory, file_name):
     """Builds the datastore search spec."""
     search_spec = client_factory.create('ns0:HostDatastoreBrowserSearchSpec')
     search_spec.matchPattern = [file_name]
+    search_spec.details = client_factory.create('ns0:FileQueryFlags')
+    search_spec.details.fileOwner = False
+    search_spec.details.fileSize = True
+    search_spec.details.fileType = False
+    search_spec.details.modification = False
     return search_spec
 
 
@@ -384,6 +372,20 @@ def file_exists(session, ds_browser, ds_path, file_name):
     file_exists = (getattr(task_info.result, 'file', False) and
                    task_info.result.file[0].path == file_name)
     return file_exists
+
+
+def file_size(session, ds_browser, ds_path, file_name):
+    """Returns the size of the specified file."""
+    client_factory = session.vim.client.factory
+    search_spec = search_datastore_spec(client_factory, file_name)
+    search_task = session._call_method(session.vim,
+                                       "SearchDatastore_Task",
+                                       ds_browser,
+                                       datastorePath=str(ds_path),
+                                       searchSpec=search_spec)
+    task_info = session._wait_for_task(search_task)
+    if hasattr(task_info.result, 'file'):
+        return task_info.result.file[0].fileSize
 
 
 def mkdir(session, ds_path, dc_ref):
@@ -443,3 +445,42 @@ def _filter_datastores_matching_storage_policy(session, data_stores,
             return data_stores
     LOG.error(_LE("Unable to retrieve storage policy with name %s"),
               storage_policy)
+
+
+def _update_datacenter_cache_from_objects(session, dcs):
+    """Updates the datastore/datacenter cache."""
+    while dcs:
+        for dco in dcs.objects:
+            dc_ref = dco.obj
+            ds_refs = []
+            prop_dict = vm_util.propset_dict(dco.propSet)
+            name = prop_dict.get('name')
+            vmFolder = prop_dict.get('vmFolder')
+            datastore_refs = prop_dict.get('datastore')
+            if datastore_refs:
+                datastore_refs = datastore_refs.ManagedObjectReference
+                for ds in datastore_refs:
+                    ds_refs.append(ds.value)
+            else:
+                LOG.debug("Datacenter %s doesn't have any datastore "
+                          "associated with it, ignoring it", name)
+            for ds_ref in ds_refs:
+                _DS_DC_MAPPING[ds_ref] = DcInfo(ref=dc_ref, name=name,
+                                                vmFolder=vmFolder)
+        dcs = session._call_method(vutil, 'continue_retrieval', dcs)
+
+
+def get_dc_info(session, ds_ref):
+    """Get the datacenter name and the reference."""
+    dc_info = _DS_DC_MAPPING.get(ds_ref.value)
+    if not dc_info:
+        dcs = session._call_method(vim_util, "get_objects",
+                "Datacenter", ["name", "datastore", "vmFolder"])
+        _update_datacenter_cache_from_objects(session, dcs)
+        dc_info = _DS_DC_MAPPING.get(ds_ref.value)
+    return dc_info
+
+
+def dc_cache_reset():
+    global _DS_DC_MAPPING
+    _DS_DC_MAPPING = {}

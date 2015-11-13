@@ -20,6 +20,7 @@ import base64
 import re
 
 import jsonschema
+from jsonschema import exceptions as jsonschema_exc
 import netaddr
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
@@ -74,6 +75,63 @@ def _validate_uri(instance):
                                 require_authority=True)
 
 
+def _soft_validate_additional_properties(validator,
+                                         additional_properties_value,
+                                         instance,
+                                         schema):
+    """This validator function is used for legacy v2 compatible mode in v2.1.
+    This will skip all the addtional properties checking but keep check the
+    'patternProperties'. 'patternProperties' is used for metadata API.
+
+    If there are not any properties on the instance that are not specified in
+    the schema, this will return without any effect. If there are any such
+    extra properties, they will be handled as follows:
+
+    - if the validator passed to the method is not of type "object", this
+      method will return without any effect.
+    - if the 'additional_properties_value' parameter is True, this method will
+      return without any effect.
+    - if the schema has an additionalProperties value of True, the extra
+      properties on the instance will not be touched.
+    - if the schema has an additionalProperties value of False and there
+      aren't patternProperties specified, the extra properties will be stripped
+      from the instance.
+    - if the schema has an additionalProperties value of False and there
+      are patternProperties specified, the extra properties will not be
+      touched and raise validation error if pattern doesn't match.
+    """
+    if (not validator.is_type(instance, "object") or
+            additional_properties_value):
+        return
+
+    properties = schema.get("properties", {})
+    patterns = "|".join(schema.get("patternProperties", {}))
+    extra_properties = set()
+    for prop in instance:
+        if prop not in properties:
+            if patterns:
+                if not re.search(patterns, prop):
+                    extra_properties.add(prop)
+            else:
+                extra_properties.add(prop)
+
+    if not extra_properties:
+        return
+
+    if patterns:
+        error = "Additional properties are not allowed (%s %s unexpected)"
+        if len(extra_properties) == 1:
+            verb = "was"
+        else:
+            verb = "were"
+        yield jsonschema_exc.ValidationError(
+            error % (", ".join(repr(extra) for extra in extra_properties),
+                     verb))
+    else:
+        for prop in extra_properties:
+            del instance[prop]
+
+
 class _SchemaValidator(object):
     """A validator class
 
@@ -87,11 +145,15 @@ class _SchemaValidator(object):
     validator = None
     validator_org = jsonschema.Draft4Validator
 
-    def __init__(self, schema):
+    def __init__(self, schema, relax_additional_properties=False):
         validators = {
             'minimum': self._validate_minimum,
             'maximum': self._validate_maximum,
         }
+        if relax_additional_properties:
+            validators[
+                'additionalProperties'] = _soft_validate_additional_properties
+
         validator_cls = jsonschema.validators.extend(self.validator_org,
                                                      validators)
         format_checker = jsonschema.FormatChecker()

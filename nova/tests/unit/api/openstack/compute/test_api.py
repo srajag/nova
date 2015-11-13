@@ -14,6 +14,7 @@
 #    under the License.
 
 from oslo_serialization import jsonutils
+import six
 import webob
 import webob.dec
 import webob.exc
@@ -27,6 +28,10 @@ from nova.tests.unit.api.openstack import fakes
 
 class APITest(test.NoDBTestCase):
 
+    def setUp(self):
+        super(APITest, self).setUp()
+        self.wsgi_app = fakes.wsgi_app()
+
     def _wsgi_app(self, inner_app):
         # simpler version of the app than fakes.wsgi_app
         return openstack_api.FaultWrapper(inner_app)
@@ -37,7 +42,7 @@ class APITest(test.NoDBTestCase):
         req.body = '{'
         req.headers["content-type"] = "application/json"
 
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(self.wsgi_app)
         self.assertEqual(res.status_int, 400)
 
     def test_malformed_xml(self):
@@ -46,7 +51,7 @@ class APITest(test.NoDBTestCase):
         req.body = '<hi im not xml>'
         req.headers["content-type"] = "application/xml"
 
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(self.wsgi_app)
         self.assertEqual(res.status_int, 400)
 
     def test_vendor_content_type_json(self):
@@ -55,7 +60,7 @@ class APITest(test.NoDBTestCase):
         req = webob.Request.blank('/')
         req.headers['Accept'] = ctype
 
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(self.wsgi_app)
         self.assertEqual(res.status_int, 200)
         self.assertEqual(res.content_type, ctype)
 
@@ -128,7 +133,7 @@ class APITest(test.NoDBTestCase):
         self.assertEqual(resp.status_int, exception_type.code, resp.body)
 
         if hasattr(exception_type, 'headers'):
-            for (key, value) in exception_type.headers.iteritems():
+            for (key, value) in six.iteritems(exception_type.headers):
                 self.assertIn(key, resp.headers)
                 self.assertEqual(resp.headers[key], str(value))
 
@@ -160,3 +165,14 @@ class APITest(test.NoDBTestCase):
         api = self._wsgi_app(fail)
         resp = webob.Request.blank('/').get_response(api)
         self.assertEqual(500, resp.status_int)
+
+
+class APITestV21(APITest):
+
+    def setUp(self):
+        super(APITestV21, self).setUp()
+        self.wsgi_app = fakes.wsgi_app_v21()
+
+    # TODO(alex_xu): Get rid of the case translate NovaException to
+    # HTTPException after V2 api code removed. Because V2.1 API required raise
+    # HTTPException explicitly, so V2.1 API needn't such translation.

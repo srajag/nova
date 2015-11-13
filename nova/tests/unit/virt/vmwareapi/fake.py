@@ -27,6 +27,7 @@ from oslo_utils import units
 from oslo_utils import uuidutils
 from oslo_vmware import exceptions as vexc
 from oslo_vmware.objects import datastore as ds_obj
+import six
 
 from nova import exception
 from nova.virt.vmwareapi import constants
@@ -36,6 +37,7 @@ _CLASSES = ['Datacenter', 'Datastore', 'ResourcePool', 'VirtualMachine',
             'files', 'ClusterComputeResource', 'HostStorageSystem']
 
 _FAKE_FILE_SIZE = 1024
+_FAKE_VCENTER_UUID = '497c514c-ef5e-4e7f-8d93-ec921993b93a'
 
 _db_content = {}
 _array_types = {}
@@ -286,10 +288,11 @@ class DataObject(object):
 class HostInternetScsiHba(DataObject):
     """iSCSI Host Bus Adapter."""
 
-    def __init__(self):
+    def __init__(self, iscsi_name=None):
         super(HostInternetScsiHba, self).__init__()
         self.device = 'vmhba33'
         self.key = 'key-vmhba33'
+        self.iScsiName = iscsi_name
 
 
 class FileAlreadyExists(DataObject):
@@ -751,7 +754,7 @@ class HostSystem(ManagedObject):
 
         product = DataObject()
         product.name = "VMware ESXi"
-        product.version = "5.0.0"
+        product.version = constants.MIN_VC_VERSION
         config = DataObject()
         config.product = product
         summary.config = config
@@ -985,7 +988,7 @@ def create_vm(uuid=None, name=None,
     if vm_path.rel_path == '':
         vm_path = vm_path.join(name, name + '.vmx')
 
-    for key, value in _db_content["Datastore"].iteritems():
+    for key, value in six.iteritems(_db_content["Datastore"]):
         if value.get('summary.name') == vm_path.datastore:
             ds = key
             break
@@ -1150,6 +1153,9 @@ class FakeObjectRetrievalSession(FakeSession):
         self.ind = 0
 
     def _call_method(self, module, method, *args, **kwargs):
+        if (method == 'continue_retrieval' or
+            method == 'cancel_retrieval'):
+            return
         # return fake objects in a circular manner
         self.ind = (self.ind + 1) % len(self.ret)
         return self.ret[self.ind - 1]
@@ -1192,6 +1198,8 @@ class FakeVim(object):
         about_info = DataObject()
         about_info.name = "VMware vCenter Server"
         about_info.version = "5.1.0"
+        about_info.instanceUuid = _FAKE_VCENTER_UUID
+
         service_content.about = about_info
 
         self._service_content = service_content
@@ -1280,7 +1288,7 @@ class FakeVim(object):
         return task_mdo.obj
 
     def _extend_disk(self, method, size):
-        """Extend disk size when create a instance."""
+        """Extend disk size when create an instance."""
         task_mdo = create_task(method, "success")
         return task_mdo.obj
 
@@ -1380,7 +1388,7 @@ class FakeVim(object):
             for file in _db_content.get("files"):
                 if file.find(ds_path) != -1:
                     if not file.endswith(ds_path):
-                        path = file.lstrip(dname).split('/')
+                        path = file.replace(dname, '', 1).split('/')
                         if path:
                             matched_files.add(path[0])
             if not matched_files:
@@ -1396,6 +1404,7 @@ class FakeVim(object):
             for file in matched_files:
                 matched = DataObject()
                 matched.path = file
+                matched.fileSize = 1024
                 result.file.append(matched)
             task_mdo = create_task(method, "success", result=result)
         else:

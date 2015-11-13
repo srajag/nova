@@ -21,9 +21,12 @@ import platform
 
 from oslo_log import log as logging
 
-from nova.i18n import _
+from nova.i18n import _, _LW
+from nova import objects
 from nova.virt import driver
+from nova.virt.hyperv import eventhandler
 from nova.virt.hyperv import hostops
+from nova.virt.hyperv import hostutils
 from nova.virt.hyperv import livemigrationops
 from nova.virt.hyperv import migrationops
 from nova.virt.hyperv import rdpconsoleops
@@ -35,6 +38,12 @@ LOG = logging.getLogger(__name__)
 
 
 class HyperVDriver(driver.ComputeDriver):
+    capabilities = {
+        "has_imagecache": False,
+        "supports_recreate": False,
+        "supports_migrate_to_same_host": True
+    }
+
     def __init__(self, virtapi):
         super(HyperVDriver, self).__init__(virtapi)
 
@@ -46,8 +55,23 @@ class HyperVDriver(driver.ComputeDriver):
         self._migrationops = migrationops.MigrationOps()
         self._rdpconsoleops = rdpconsoleops.RDPConsoleOps()
 
+        # check if the current version is older than kernel version 6.2
+        # (Windows Server 2012)
+        if not hostutils.HostUtils().check_min_windows_version(6, 2):
+            # the version is Windows Server 2008 R2. Log a warning, letting
+            # users know that this version is deprecated in Liberty.
+            LOG.warning(
+                _LW('You are running nova-compute on Windows / Hyper-V Server '
+                    '2008 R2. This version of Windows is deprecated in the '
+                    'current version of OpenStack and the support for it will '
+                    'be removed in the next cycle.'))
+
     def init_host(self, host):
         self._vmops.restart_vm_log_writers()
+        event_handler = eventhandler.InstanceEventHandler(
+            state_change_callback=self.emit_event,
+            running_state_callback=self._vmops.log_vm_serial_output)
+        event_handler.start_listener()
 
     def list_instance_uuids(self):
         return self._vmops.list_instance_uuids()
@@ -57,6 +81,7 @@ class HyperVDriver(driver.ComputeDriver):
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, network_info=None, block_device_info=None):
+        image_meta = objects.ImageMeta.from_dict(image_meta)
         self._vmops.spawn(context, instance, image_meta, injected_files,
                           admin_password, network_info, block_device_info)
 
@@ -225,6 +250,7 @@ class HyperVDriver(driver.ComputeDriver):
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance,
                          block_device_info=None, power_on=True):
+        image_meta = objects.ImageMeta.from_dict(image_meta)
         self._migrationops.finish_migration(context, migration, instance,
                                             disk_info, network_info,
                                             image_meta, resize_instance,
@@ -241,3 +267,9 @@ class HyperVDriver(driver.ComputeDriver):
 
     def get_console_output(self, context, instance):
         return self._vmops.get_console_output(instance)
+
+    def attach_interface(self, instance, image_meta, vif):
+        return self._vmops.attach_interface(instance, vif)
+
+    def detach_interface(self, instance, vif):
+        return self._vmops.detach_interface(instance, vif)

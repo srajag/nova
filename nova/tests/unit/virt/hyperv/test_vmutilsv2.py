@@ -38,6 +38,18 @@ class VMUtilsV2TestCase(test_vmutils.VMUtilsTestCase):
         self._vmutils = vmutilsv2.VMUtilsV2()
         self._vmutils._conn = mock.MagicMock()
 
+    @mock.patch('nova.virt.hyperv.hostutils.HostUtils'
+                '.check_min_windows_version')
+    @mock.patch.object(vmutilsv2, 'sys')
+    def test_serial_port_setting_data_win_version_10(self, mock_sys,
+                                                     mock_check_version):
+        mock_sys.platform = 'win32'
+        mock_check_version.return_value = True
+        _vmutils = vmutilsv2.VMUtilsV2()
+
+        self.assertEqual("Msvm_SerialPortSettingData",
+                         _vmutils._SERIAL_PORT_SETTING_DATA_CLASS)
+
     def test_create_vm(self):
         super(VMUtilsV2TestCase, self).test_create_vm()
         mock_vssd = self._vmutils._conn.Msvm_VirtualSystemSettingData.new()
@@ -140,13 +152,18 @@ class VMUtilsV2TestCase(test_vmutils.VMUtilsTestCase):
         attrs = {'ElementName': 'fake_name',
                  'Notes': ['4f54fb69-d3a2-45b7-bb9b-b6e6b3d893b3']}
         vs.configure_mock(**attrs)
-        self._vmutils._conn.Msvm_VirtualSystemSettingData.return_value = [vs]
+        vs2 = mock.MagicMock(ElementName='fake_name2', Notes=None)
+        self._vmutils._conn.Msvm_VirtualSystemSettingData.return_value = [vs,
+                                                                          vs2]
         response = self._vmutils.list_instance_notes()
 
         self.assertEqual([(attrs['ElementName'], attrs['Notes'])], response)
         self._vmutils._conn.Msvm_VirtualSystemSettingData.assert_called_with(
             ['ElementName', 'Notes'],
             VirtualSystemType=self._vmutils._VIRTUAL_SYSTEM_TYPE_REALIZED)
+
+    def _get_fake_instance_notes(self):
+        return [self._FAKE_VM_UUID]
 
     @mock.patch('nova.virt.hyperv.vmutilsv2.VMUtilsV2.check_ret_val')
     @mock.patch('nova.virt.hyperv.vmutilsv2.VMUtilsV2._get_wmi_obj')
@@ -258,3 +275,20 @@ class VMUtilsV2TestCase(test_vmutils.VMUtilsTestCase):
 
         ret_val = self._vmutils.get_vm_dvd_disk_paths(self._FAKE_VM_NAME)
         self.assertEqual(mock.sentinel.FAKE_DVD_PATH1, ret_val[0])
+
+    @mock.patch.object(vmutilsv2.VMUtilsV2, '_get_vm_setting_data')
+    def _test_get_vm_generation(self, vm_gen, mock_get_vm_setting_data):
+        self._lookup_vm()
+        vm_gen_string = "Microsoft:Hyper-V:SubType:" + str(vm_gen)
+        mock_vssd = mock.MagicMock(VirtualSystemSubType=vm_gen_string)
+        mock_get_vm_setting_data.return_value = mock_vssd
+
+        ret = self._vmutils.get_vm_generation(mock.sentinel.FAKE_VM_NAME)
+
+        self.assertEqual(vm_gen, ret)
+
+    def test_get_vm_generation_gen1(self):
+        self._test_get_vm_generation(constants.VM_GEN_1)
+
+    def test_get_vm_generation_gen2(self):
+        self._test_get_vm_generation(constants.VM_GEN_2)

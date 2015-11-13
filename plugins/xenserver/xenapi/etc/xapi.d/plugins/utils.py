@@ -17,7 +17,11 @@
 
 """Various utilities used by XenServer plugins."""
 
-import cPickle as pickle
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
+
 import errno
 import logging
 import os
@@ -202,6 +206,15 @@ def _handle_old_style_images(staging_path):
         if os.path.exists(path):
             _rename(path, os.path.join(staging_path, "%d.vhd" % file_num))
             file_num += 1
+
+    # Rename any format of name to 0.vhd when there is only single one
+    contents = os.listdir(staging_path)
+    if len(contents) == 1:
+        filename = contents[0]
+        if filename != '0.vhd' and filename.endswith('.vhd'):
+            _rename(
+                os.path.join(staging_path, filename),
+                os.path.join(staging_path, '0.vhd'))
 
 
 def _assert_vhd_not_hidden(path):

@@ -29,9 +29,11 @@ from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import units
+import six
 import six.moves.urllib.parse as urlparse
 
 from nova.i18n import _, _LE, _LW
+from nova import objects
 from nova import utils
 from nova.virt import driver
 from nova.virt.xenapi.client import session
@@ -188,6 +190,7 @@ class XenAPIDriver(driver.ComputeDriver):
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, network_info=None, block_device_info=None):
         """Create VM instance."""
+        image_meta = objects.ImageMeta.from_dict(image_meta)
         self._vmops.spawn(context, instance, image_meta, injected_files,
                           admin_password, network_info, block_device_info)
 
@@ -208,6 +211,7 @@ class XenAPIDriver(driver.ComputeDriver):
                          network_info, image_meta, resize_instance,
                          block_device_info=None, power_on=True):
         """Completes a resize, turning on the migrated instance."""
+        image_meta = objects.ImageMeta.from_dict(image_meta)
         self._vmops.finish_migration(context, migration, instance, disk_info,
                                      network_info, image_meta, resize_instance,
                                      block_device_info, power_on)
@@ -282,6 +286,7 @@ class XenAPIDriver(driver.ComputeDriver):
     def rescue(self, context, instance, network_info, image_meta,
                rescue_password):
         """Rescue the specified instance."""
+        image_meta = objects.ImageMeta.from_dict(image_meta)
         self._vmops.rescue(context, instance, network_info, image_meta,
                            rescue_password)
 
@@ -357,7 +362,7 @@ class XenAPIDriver(driver.ComputeDriver):
         # of mac addresses with values that are the bw counters:
         # e.g. {'instance-001' : { 12:34:56:78:90:12 : {'bw_in': 0, ....}}
         all_counters = self._vmops.get_all_bw_counters()
-        for instance_name, counters in all_counters.iteritems():
+        for instance_name, counters in six.iteritems(all_counters):
             if instance_name in imap:
                 # yes these are stats for a nova-managed vm
                 # correlate the stats with the nova instance uuid:
@@ -397,8 +402,7 @@ class XenAPIDriver(driver.ComputeDriver):
             return CONF.my_block_storage_ip
         return self.get_host_ip_addr()
 
-    @staticmethod
-    def get_host_ip_addr():
+    def get_host_ip_addr(self):
         xs_url = urlparse.urlparse(CONF.xenserver.connection_url)
         return xs_url.netloc
 
@@ -546,8 +550,11 @@ class XenAPIDriver(driver.ComputeDriver):
         # NOTE(johngarbutt) Destroying the VM is not appropriate here
         # and in the cases where it might make sense,
         # XenServer has already done it.
-        # TODO(johngarbutt) investigate if any cleanup is required here
-        pass
+        # NOTE(sulo): The only cleanup we do explicitly is to forget
+        # any volume that was attached to the destination during
+        # live migration. XAPI should take care of all other cleanup.
+        self._vmops.rollback_live_migration_at_destination(instance,
+                                                           block_device_info)
 
     def pre_live_migration(self, context, instance, block_device_info,
                            network_info, disk_info, migrate_data=None):

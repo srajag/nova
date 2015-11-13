@@ -18,20 +18,23 @@ Manage hosts in the current zone.
 """
 
 import collections
+import functools
 import time
-import UserDict
+try:
+    from collections import UserDict as IterableUserDict   # Python 3
+except ImportError:
+    from UserDict import IterableUserDict                  # Python 2
+
 
 import iso8601
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_serialization import jsonutils
 from oslo_utils import timeutils
+import six
 
-from nova.compute import task_states
-from nova.compute import vm_states
 from nova import context as context_module
 from nova import exception
-from nova.i18n import _, _LI, _LW
+from nova.i18n import _LI, _LW
 from nova import objects
 from nova.pci import stats as pci_stats
 from nova.scheduler import filters
@@ -51,6 +54,7 @@ host_manager_opts = [
                   'RetryFilter',
                   'AvailabilityZoneFilter',
                   'RamFilter',
+                  'DiskFilter',
                   'ComputeFilter',
                   'ComputeCapabilitiesFilter',
                   'ImagePropertiesFilter',
@@ -75,7 +79,7 @@ LOG = logging.getLogger(__name__)
 HOST_INSTANCE_SEMAPHORE = "host_instance"
 
 
-class ReadOnlyDict(UserDict.IterableUserDict):
+class ReadOnlyDict(IterableUserDict):
     """A read-only dict."""
     def __init__(self, source=None):
         self.data = {}
@@ -101,9 +105,30 @@ class ReadOnlyDict(UserDict.IterableUserDict):
         raise TypeError()
 
 
-# Representation of a single metric value from a compute node.
-MetricItem = collections.namedtuple(
-             'MetricItem', ['value', 'timestamp', 'source'])
+@utils.expects_func_args('self', 'instance')
+def set_update_time_on_success(function):
+    """Set updated time of HostState when consuming succeed."""
+
+    @functools.wraps(function)
+    def decorated_function(self, instance):
+        return_value = None
+        try:
+            return_value = function(self, instance)
+        except Exception as e:
+            # Ignores exception raised from consume_from_instance() so that
+            # booting instance would fail in the resource claim of compute
+            # node, other suitable node may be chosen during scheduling retry.
+            LOG.warning(_LW("Selected host: %(host)s failed to consume from "
+                            "instance. Error: %(error)s"),
+                        {'host': self.host, 'error': e},
+                        instance=instance)
+        else:
+            now = timeutils.utcnow()
+            # NOTE(sbauza): Objects are UTC tz-aware by default
+            self.updated = now.replace(tzinfo=iso8601.iso8601.Utc())
+        return return_value
+
+    return decorated_function
 
 
 class HostState(object):
@@ -144,7 +169,7 @@ class HostState(object):
         self.limits = {}
 
         # Generic metrics from compute nodes
-        self.metrics = {}
+        self.metrics = None
 
         # List of aggregates the host belongs to
         self.aggregates = []
@@ -152,33 +177,16 @@ class HostState(object):
         # Instances on this host
         self.instances = {}
 
+        # Allocation ratios for this host
+        self.ram_allocation_ratio = None
+        self.cpu_allocation_ratio = None
+
         self.updated = None
         if compute:
             self.update_from_compute_node(compute)
 
     def update_service(self, service):
         self.service = ReadOnlyDict(service)
-
-    def _update_metrics_from_compute_node(self, compute):
-        """Update metrics from a ComputeNode object."""
-        # NOTE(llu): The 'or []' is to avoid json decode failure of None
-        #            returned from compute.get, because DB schema allows
-        #            NULL in the metrics column
-        metrics = compute.metrics or []
-        if metrics:
-            metrics = jsonutils.loads(metrics)
-        for metric in metrics:
-            # 'name', 'value', 'timestamp' and 'source' are all required
-            # to be valid keys, just let KeyError happen if any one of
-            # them is missing. But we also require 'name' to be True.
-            name = metric['name']
-            item = MetricItem(value=metric['value'],
-                              timestamp=metric['timestamp'],
-                              source=metric['source'])
-            if name:
-                self.metrics[name] = item
-            else:
-                LOG.warning(_LW("Metric name unknown of %r"), item)
 
     def update_from_compute_node(self, compute):
         """Update information about a host from a ComputeNode object."""
@@ -238,8 +246,13 @@ class HostState(object):
         self.num_io_ops = int(self.stats.get('io_workload', 0))
 
         # update metrics
-        self._update_metrics_from_compute_node(compute)
+        self.metrics = objects.MonitorMetricList.from_json(compute.metrics)
 
+        # update allocation ratios given by the ComputeNode object
+        self.cpu_allocation_ratio = compute.cpu_allocation_ratio
+        self.ram_allocation_ratio = compute.ram_allocation_ratio
+
+    @set_update_time_on_success
     def consume_from_instance(self, instance):
         """Incrementally update host state from an instance."""
         disk_mb = (instance['root_gb'] + instance['ephemeral_gb']) * 1024
@@ -249,46 +262,38 @@ class HostState(object):
         self.free_disk_mb -= disk_mb
         self.vcpus_used += vcpus
 
-        now = timeutils.utcnow()
-        # NOTE(sbauza): Objects are UTC tz-aware by default
-        self.updated = now.replace(tzinfo=iso8601.iso8601.Utc())
-
         # Track number of instances on host
         self.num_instances += 1
 
-        instance_numa_topology = hardware.instance_topology_from_instance(
-            instance)
-        instance_cells = None
-        if instance_numa_topology:
-            instance_cells = instance_numa_topology.cells
-
         pci_requests = instance.get('pci_requests')
-        # NOTE(danms): Instance here is still a dict, which is converted from
-        # an object. Thus, it has a .pci_requests field, which gets converted
-        # to a primitive early on, and is thus a dict here. Convert this when
-        # we get an object all the way to this path.
-        if pci_requests and pci_requests['requests'] and self.pci_stats:
+        if pci_requests and self.pci_stats:
             pci_requests = pci_requests.requests
-            self.pci_stats.apply_requests(pci_requests, instance_cells)
+        else:
+            pci_requests = None
 
         # Calculate the numa usage
         host_numa_topology, _fmt = hardware.host_topology_and_format_from_host(
                                 self)
+        instance_numa_topology = hardware.instance_topology_from_instance(
+            instance)
+
         instance['numa_topology'] = hardware.numa_fit_instance_to_host(
             host_numa_topology, instance_numa_topology,
             limits=self.limits.get('numa_topology'),
             pci_requests=pci_requests, pci_stats=self.pci_stats)
+        if pci_requests:
+            instance_cells = None
+            if instance['numa_topology']:
+                instance_cells = instance['numa_topology'].cells
+            self.pci_stats.apply_requests(pci_requests, instance_cells)
+
         self.numa_topology = hardware.get_host_numa_usage_from_instance(
                 self, instance)
 
-        vm_state = instance.get('vm_state', vm_states.BUILDING)
-        task_state = instance.get('task_state')
-        if vm_state == vm_states.BUILDING or task_state in [
-                task_states.RESIZE_MIGRATING, task_states.REBUILDING,
-                task_states.RESIZE_PREP, task_states.IMAGE_SNAPSHOT,
-                task_states.IMAGE_BACKUP, task_states.UNSHELVING,
-                task_states.RESCUING]:
-            self.num_io_ops += 1
+        # NOTE(sbauza): By considering all cases when the scheduler is called
+        # and when consume_from_instance() is run, we can safely say that there
+        # is always an IO operation because we want to move the instance
+        self.num_io_ops += 1
 
     def __repr__(self):
         return ("(%s, %s) ram:%s disk:%s io_ops:%s instances:%s" %
@@ -442,44 +447,43 @@ class HostManager(object):
         def _strip_ignore_hosts(host_map, hosts_to_ignore):
             ignored_hosts = []
             for host in hosts_to_ignore:
-                for (hostname, nodename) in host_map.keys():
+                for (hostname, nodename) in list(host_map.keys()):
                     if host == hostname:
                         del host_map[(hostname, nodename)]
                         ignored_hosts.append(host)
             ignored_hosts_str = ', '.join(ignored_hosts)
-            msg = _('Host filter ignoring hosts: %s')
-            LOG.info(msg % ignored_hosts_str)
+            LOG.info(_LI('Host filter ignoring hosts: %s'), ignored_hosts_str)
 
         def _match_forced_hosts(host_map, hosts_to_force):
             forced_hosts = []
-            for (hostname, nodename) in host_map.keys():
+            for (hostname, nodename) in list(host_map.keys()):
                 if hostname not in hosts_to_force:
                     del host_map[(hostname, nodename)]
                 else:
                     forced_hosts.append(hostname)
             if host_map:
                 forced_hosts_str = ', '.join(forced_hosts)
-                msg = _('Host filter forcing available hosts to %s')
+                msg = _LI('Host filter forcing available hosts to %s')
             else:
                 forced_hosts_str = ', '.join(hosts_to_force)
-                msg = _("No hosts matched due to not matching "
-                        "'force_hosts' value of '%s'")
+                msg = _LI("No hosts matched due to not matching "
+                          "'force_hosts' value of '%s'")
             LOG.info(msg % forced_hosts_str)
 
         def _match_forced_nodes(host_map, nodes_to_force):
             forced_nodes = []
-            for (hostname, nodename) in host_map.keys():
+            for (hostname, nodename) in list(host_map.keys()):
                 if nodename not in nodes_to_force:
                     del host_map[(hostname, nodename)]
                 else:
                     forced_nodes.append(nodename)
             if host_map:
                 forced_nodes_str = ', '.join(forced_nodes)
-                msg = _('Host filter forcing available nodes to %s')
+                msg = _LI('Host filter forcing available nodes to %s')
             else:
                 forced_nodes_str = ', '.join(nodes_to_force)
-                msg = _("No nodes matched due to not matching "
-                        "'force_nodes' value of '%s'")
+                msg = _LI("No nodes matched due to not matching "
+                          "'force_nodes' value of '%s'")
             LOG.info(msg % forced_nodes_str)
 
         if filter_class_names is None:
@@ -507,7 +511,7 @@ class HostManager(object):
                 # NOTE(deva): Skip filters when forcing host or node
                 if name_to_cls_map:
                     return name_to_cls_map.values()
-            hosts = name_to_cls_map.itervalues()
+            hosts = six.itervalues(name_to_cls_map)
 
         return self.filter_handler.get_filtered_objects(filters,
                 hosts, filter_properties, index)
@@ -552,7 +556,7 @@ class HostManager(object):
             host_state.aggregates = [self.aggs_by_id[agg_id] for agg_id in
                                      self.host_aggregates_map[
                                          host_state.host]]
-            host_state.update_service(dict(service.iteritems()))
+            host_state.update_service(dict(service))
             self._add_instance_info(context, compute, host_state)
             seen_nodes.add(state_key)
 
@@ -564,7 +568,7 @@ class HostManager(object):
                          "from scheduler"), {'host': host, 'node': node})
             del self.host_state_map[state_key]
 
-        return self.host_state_map.itervalues()
+        return six.itervalues(self.host_state_map)
 
     def _add_instance_info(self, context, compute, host_state):
         """Adds the host instance info to the host_state object.

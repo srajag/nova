@@ -52,7 +52,7 @@ def upgrade(migrate_engine):
     # the missing indexes in PostgreSQL and SQLite have conflicting names
     # that MySQL allowed.
 
-    if migrate_engine.name in ('sqlite', 'postgresql'):
+    if migrate_engine.name in ('sqlite', 'postgresql', 'ibm_db_sa'):
         for table_name, index_name, column_names in INDEXES:
             ensure_index_exists(migrate_engine, table_name, index_name,
                                 column_names)
@@ -66,23 +66,4 @@ def upgrade(migrate_engine):
                              'network_id')
         ensure_index_exists(migrate_engine, 'virtual_interfaces',
                             'virtual_interfaces_network_id_idx',
-                            ['network_id'])
-
-
-def downgrade(migrate_engine):
-    """Remove indexes previously missing on SQLite and PostgreSQL."""
-
-    if migrate_engine.name in ('sqlite', 'postgresql'):
-        for table_name, index_name, column_names in INDEXES:
-            ensure_index_removed(migrate_engine, table_name, index_name)
-    elif migrate_engine.name == 'mysql':
-        # Rename some indexes with conflicting names back
-        ensure_index_removed(migrate_engine, 'dns_domains',
-                             'dns_domains_project_id_idx')
-        ensure_index_exists(migrate_engine, 'dns_domains', 'project_id',
-                            ['project_id'])
-
-        ensure_index_removed(migrate_engine, 'virtual_interfaces',
-                             'virtual_interfaces_network_id_idx')
-        ensure_index_exists(migrate_engine, 'virtual_interfaces', 'network_id',
                             ['network_id'])

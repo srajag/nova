@@ -21,6 +21,8 @@ import re
 
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import strutils
+import six
 import six.moves.urllib.parse as urlparse
 import webob
 from webob import exc
@@ -33,7 +35,9 @@ from nova import exception
 from nova.i18n import _
 from nova.i18n import _LE
 from nova.i18n import _LW
+from nova import objects
 from nova import quota
+from nova import utils
 
 osapi_opts = [
     cfg.IntOpt('osapi_max_limit',
@@ -97,7 +101,7 @@ _STATE_MAP = {
         'default': 'VERIFY_RESIZE',
         # Note(maoy): the OS API spec 1.1 doesn't have CONFIRMING_RESIZE
         # state so we comment that out for future reference only.
-        #task_states.RESIZE_CONFIRMING: 'CONFIRMING_RESIZE',
+        # task_states.RESIZE_CONFIRMING: 'CONFIRMING_RESIZE',
         task_states.RESIZE_REVERTING: 'REVERT_RESIZE',
     },
     vm_states.PAUSED: {
@@ -150,8 +154,8 @@ def task_and_vm_state_from_status(statuses):
     vm_states = set()
     task_states = set()
     lower_statuses = [status.lower() for status in statuses]
-    for state, task_map in _STATE_MAP.iteritems():
-        for task_state, mapped_state in task_map.iteritems():
+    for state, task_map in six.iteritems(_STATE_MAP):
+        for task_state, mapped_state in six.iteritems(task_map):
             status_string = mapped_state
             if status_string.lower() in lower_statuses:
                 vm_states.add(state)
@@ -218,13 +222,10 @@ def get_pagination_params(request):
 def _get_int_param(request, param):
     """Extract integer param from request or fail."""
     try:
-        int_param = int(request.GET[param])
-    except ValueError:
-        msg = _('%s param must be an integer') % param
-        raise webob.exc.HTTPBadRequest(explanation=msg)
-    if int_param < 0:
-        msg = _('%s param must be positive') % param
-        raise webob.exc.HTTPBadRequest(explanation=msg)
+        int_param = utils.validate_integer(request.GET[param], param,
+                                           min_value=0)
+    except exception.InvalidInput as e:
+        raise webob.exc.HTTPBadRequest(explanation=e.format_message())
     return int_param
 
 
@@ -245,25 +246,14 @@ def limited(items, request, max_limit=CONF.osapi_max_limit):
                     will cause exc.HTTPBadRequest() exceptions to be raised.
     :kwarg max_limit: The maximum number of items to return from 'items'
     """
-    try:
-        offset = int(request.GET.get('offset', 0))
-    except ValueError:
-        msg = _('offset param must be an integer')
-        raise webob.exc.HTTPBadRequest(explanation=msg)
+    offset = request.GET.get("offset", 0)
+    limit = request.GET.get('limit', max_limit)
 
     try:
-        limit = int(request.GET.get('limit', max_limit))
-    except ValueError:
-        msg = _('limit param must be an integer')
-        raise webob.exc.HTTPBadRequest(explanation=msg)
-
-    if limit < 0:
-        msg = _('limit param must be positive')
-        raise webob.exc.HTTPBadRequest(explanation=msg)
-
-    if offset < 0:
-        msg = _('offset param must be positive')
-        raise webob.exc.HTTPBadRequest(explanation=msg)
+        offset = utils.validate_integer(offset, "offset", min_value=0)
+        limit = utils.validate_integer(limit, "limit", min_value=0)
+    except exception.InvalidInput as e:
+        raise webob.exc.HTTPBadRequest(explanation=e.format_message())
 
     limit = min(max_limit, limit or max_limit)
     range_end = offset + limit
@@ -293,29 +283,26 @@ def get_id_from_href(href):
     return urlparse.urlsplit("%s" % href).path.split('/')[-1]
 
 
-def remove_version_from_href(href):
-    """Removes the first api version from the href.
+def remove_trailing_version_from_href(href):
+    """Removes the api version from the href.
 
-    Given: 'http://www.nova.com/v1.1/123'
-    Returns: 'http://www.nova.com/123'
+    Given: 'http://www.nova.com/compute/v1.1'
+    Returns: 'http://www.nova.com/compute'
 
     Given: 'http://www.nova.com/v1.1'
     Returns: 'http://www.nova.com'
 
     """
     parsed_url = urlparse.urlsplit(href)
-    url_parts = parsed_url.path.split('/', 2)
+    url_parts = parsed_url.path.rsplit('/', 1)
 
     # NOTE: this should match vX.X or vX
     expression = re.compile(r'^v([0-9]+|[0-9]+\.[0-9]+)(/.*|$)')
-    if expression.match(url_parts[1]):
-        del url_parts[1]
-
-    new_path = '/'.join(url_parts)
-
-    if new_path == parsed_url.path:
+    if not expression.match(url_parts.pop()):
         LOG.debug('href %s does not contain version' % href)
         raise ValueError(_('href %s does not contain version') % href)
+
+    new_path = '/'.join(url_parts)
 
     parsed_url = list(parsed_url)
     parsed_url[2] = new_path
@@ -333,7 +320,7 @@ def check_img_metadata_properties_quota(context, metadata):
 
     #  check the key length.
     if isinstance(metadata, dict):
-        for key, value in metadata.iteritems():
+        for key, value in six.iteritems(metadata):
             if len(key) == 0:
                 expl = _("Image metadata key cannot be blank")
                 raise webob.exc.HTTPBadRequest(explanation=expl)
@@ -343,16 +330,6 @@ def check_img_metadata_properties_quota(context, metadata):
     else:
         expl = _("Invalid image metadata")
         raise webob.exc.HTTPBadRequest(explanation=expl)
-
-
-def dict_to_query_str(params):
-    # TODO(throughnothing): we should just use urllib.urlencode instead of this
-    # But currently we don't work with urlencoded url's
-    param_str = ""
-    for key, val in params.iteritems():
-        param_str = param_str + '='.join([str(key), str(val)]) + '&'
-
-    return param_str.rstrip('&')
 
 
 def get_networks_for_instance_from_nw_info(nw_info):
@@ -456,7 +433,7 @@ class ViewBuilder(object):
         url = os.path.join(prefix,
                            self._get_project_id(request),
                            collection_name)
-        return "%s?%s" % (url, dict_to_query_str(params))
+        return "%s?%s" % (url, urlparse.urlencode(params))
 
     def _get_href_link(self, request, identifier, collection_name):
         """Return an href string pointing to this object."""
@@ -468,7 +445,7 @@ class ViewBuilder(object):
 
     def _get_bookmark_link(self, request, identifier, collection_name):
         """Create a URL that refers to a specific resource."""
-        base_url = remove_version_from_href(request.application_url)
+        base_url = remove_trailing_version_from_href(request.application_url)
         base_url = self._update_compute_link_prefix(base_url)
         return os.path.join(base_url,
                             self._get_project_id(request),
@@ -535,11 +512,52 @@ def get_instance(compute_api, context, instance_id, expected_attrs=None):
         raise exc.HTTPNotFound(explanation=e.format_message())
 
 
+def normalize_name(name):
+    # NOTE(alex_xu): This method is used by v2.1 legacy v2 compat mode.
+    # In the legacy v2 API, some of APIs strip the spaces and some of APIs not.
+    # The v2.1 disallow leading/trailing, for compatible v2 API and consistent,
+    # we enable leading/trailing spaces and strip spaces in legacy v2 compat
+    # mode. Althrough in legacy v2 API there are some APIs didn't strip spaces,
+    # but actually leading/trailing spaces(that means user depend on leading/
+    # trailing spaces distinguish different instance) is pointless usecase.
+    return name.strip()
+
+
+def raise_feature_not_supported(msg=None):
+    if msg is None:
+        msg = _("The requested functionality is not supported.")
+    raise webob.exc.HTTPNotImplemented(explanation=msg)
+
+
+def get_flavor(context, flavor_id):
+    try:
+        return objects.Flavor.get_by_flavor_id(context, flavor_id)
+    except exception.FlavorNotFound as error:
+        raise exc.HTTPNotFound(explanation=error.format_message())
+
+
 def check_cells_enabled(function):
     @functools.wraps(function)
     def inner(*args, **kwargs):
         if not CONF.cells.enable:
-            msg = _("Cells is not enabled.")
-            raise webob.exc.HTTPNotImplemented(explanation=msg)
+            raise_feature_not_supported()
         return function(*args, **kwargs)
     return inner
+
+
+def is_all_tenants(search_opts):
+    """Checks to see if the all_tenants flag is in search_opts
+
+    :param dict search_opts: The search options for a request
+    :returns: boolean indicating if all_tenants are being requested or not
+    """
+    all_tenants = search_opts.get('all_tenants')
+    if all_tenants:
+        try:
+            all_tenants = strutils.bool_from_string(all_tenants, True)
+        except ValueError as err:
+            raise exception.InvalidInput(six.text_type(err))
+    else:
+        # The empty string is considered enabling all_tenants
+        all_tenants = 'all_tenants' in search_opts
+    return all_tenants

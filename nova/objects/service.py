@@ -26,7 +26,40 @@ from nova import utils
 LOG = logging.getLogger(__name__)
 
 
+# NOTE(danms): This is the global service version counter
+SERVICE_VERSION = 2
+
+
+# NOTE(danms): This is our SERVICE_VERSION history. The idea is that any
+# time we bump the version, we will put an entry here to record the change,
+# along with any pertinent data. For things that we can programatically
+# detect that need a bump, we put something in _collect_things() below to
+# assemble a dict of things we can check. For example, we pretty much always
+# want to consider the compute RPC API version a thing that requires a service
+# bump so that we can drive version pins from it. We could include other
+# service RPC versions at some point, minimum object versions, etc.
+#
+# The TestServiceVersion test will fail if the calculated set of
+# things differs from the value in the last item of the list below,
+# indicating that a version bump is needed.
+#
+# Also note that there are other reasons we may want to bump this,
+# which will not be caught by the test. An example of this would be
+# triggering (or disabling) an online data migration once all services
+# in the cluster are at the same level.
+SERVICE_VERSION_HISTORY = (
+    # Version 0: Pre-history
+    None,
+
+    # Version 1: Introduction of SERVICE_VERSION
+    {'compute_rpc': '4.4'},
+    # Version 2: Changes to rebuild_instance signature in the compute_rpc
+    {'compute_rpc': '4.5'},
+)
+
+
 # TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
 class Service(base.NovaPersistentObject, base.NovaObject,
               base.NovaObjectDictCompat):
     # Version 1.0: Initial version
@@ -42,7 +75,13 @@ class Service(base.NovaPersistentObject, base.NovaObject,
     # Version 1.10: Changes behaviour of loading compute_node
     # Version 1.11: Added get_by_host_and_binary
     # Version 1.12: ComputeNode version 1.11
-    VERSION = '1.12'
+    # Version 1.13: Added last_seen_up
+    # Version 1.14: Added forced_down
+    # Version 1.15: ComputeNode version 1.12
+    # Version 1.16: Added version
+    # Version 1.17: ComputeNode version 1.13
+    # Version 1.18: ComputeNode version 1.14
+    VERSION = '1.18'
 
     fields = {
         'id': fields.IntegerField(read_only=True),
@@ -54,16 +93,45 @@ class Service(base.NovaPersistentObject, base.NovaObject,
         'disabled_reason': fields.StringField(nullable=True),
         'availability_zone': fields.StringField(nullable=True),
         'compute_node': fields.ObjectField('ComputeNode'),
-        }
+        'last_seen_up': fields.DateTimeField(nullable=True),
+        'forced_down': fields.BooleanField(),
+        'version': fields.IntegerField(),
+    }
 
     obj_relationships = {
         'compute_node': [('1.1', '1.4'), ('1.3', '1.5'), ('1.5', '1.6'),
                          ('1.7', '1.8'), ('1.8', '1.9'), ('1.9', '1.10'),
-                         ('1.12', '1.11')],
+                         ('1.12', '1.11'), ('1.15', '1.12'), ('1.17', '1.13'),
+                         ('1.18', '1.14')],
     }
 
+    def __init__(self, *args, **kwargs):
+        # NOTE(danms): We're going against the rules here and overriding
+        # init. The reason is that we want to *ensure* that we're always
+        # setting the current service version on our objects, overriding
+        # whatever else might be set in the database, or otherwise (which
+        # is the normal reason not to override init).
+        #
+        # We also need to do this here so that it's set on the client side
+        # all the time, such that create() and save() operations will
+        # include the current service version.
+        if 'version' in kwargs:
+            raise exception.ObjectActionError(
+                action='init',
+                reason='Version field is immutable')
+
+        super(Service, self).__init__(*args, **kwargs)
+        self.version = SERVICE_VERSION
+
     def obj_make_compatible(self, primitive, target_version):
+        super(Service, self).obj_make_compatible(primitive, target_version)
         _target_version = utils.convert_version_to_tuple(target_version)
+        if _target_version < (1, 16) and 'version' in primitive:
+            del primitive['version']
+        if _target_version < (1, 14) and 'forced_down' in primitive:
+            del primitive['forced_down']
+        if _target_version < (1, 13) and 'last_seen_up' in primitive:
+            del primitive['last_seen_up']
         if _target_version < (1, 10):
             target_compute_version = self.obj_calculate_child_version(
                 target_version, 'compute_node')
@@ -71,7 +139,6 @@ class Service(base.NovaPersistentObject, base.NovaObject,
             # when called
             self._do_compute_node(self._context, primitive,
                                   target_compute_version)
-        super(Service, self).obj_make_compatible(primitive, target_version)
 
     def _do_compute_node(self, context, primitive, target_version):
         try:
@@ -94,6 +161,10 @@ class Service(base.NovaPersistentObject, base.NovaObject,
             if key == 'compute_node':
                 #  NOTE(sbauza); We want to only lazy-load compute_node
                 continue
+            elif key == 'version':
+                # NOTE(danms): Special handling of the version field, since
+                # it is read_only and set in our init.
+                setattr(service, base.get_attrname(key), db_service[key])
             else:
                 service[key] = db_service[key]
         service._context = context
@@ -171,6 +242,11 @@ class Service(base.NovaPersistentObject, base.NovaObject,
     def save(self):
         updates = self.obj_get_changes()
         updates.pop('id', None)
+        if list(updates.keys()) == ['version']:
+            # NOTE(danms): Since we set/dirty version in init, don't
+            # do a save if that's all that has changed. This keeps the
+            # "save is a no-op if nothing has changed" behavior.
+            return
         db_service = db.service_update(self._context, self.id, updates)
         self._from_db_object(self._context, self, db_service)
 
@@ -179,6 +255,7 @@ class Service(base.NovaPersistentObject, base.NovaObject,
         db.service_destroy(self._context, self.id)
 
 
+@base.NovaObjectRegistry.register
 class ServiceList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     #              Service <= version 1.2
@@ -192,25 +269,26 @@ class ServiceList(base.ObjectListBase, base.NovaObject):
     # Version 1.8: Service version 1.10
     # Version 1.9: Added get_by_binary() and Service version 1.11
     # Version 1.10: Service version 1.12
-    VERSION = '1.10'
+    # Version 1.11: Service version 1.13
+    # Version 1.12: Service version 1.14
+    # Version 1.13: Service version 1.15
+    # Version 1.14: Service version 1.16
+    # Version 1.15: Service version 1.17
+    # Version 1.16: Service version 1.18
+    VERSION = '1.16'
 
     fields = {
         'objects': fields.ListOfObjectsField('Service'),
         }
-    child_versions = {
-        '1.0': '1.2',
-        # NOTE(danms): Service was at 1.2 before we added this
-        '1.1': '1.3',
-        '1.2': '1.4',
-        '1.3': '1.5',
-        '1.4': '1.6',
-        '1.5': '1.7',
-        '1.6': '1.8',
-        '1.7': '1.9',
-        '1.8': '1.10',
-        '1.9': '1.11',
-        '1.10': '1.12',
-        }
+    # NOTE(danms): Service was at 1.2 before we added this
+    obj_relationships = {
+        'objects': [('1.0', '1.2'), ('1.1', '1.3'), ('1.2', '1.4'),
+                    ('1.3', '1.5'), ('1.4', '1.6'), ('1.5', '1.7'),
+                    ('1.6', '1.8'), ('1.7', '1.9'), ('1.8', '1.10'),
+                    ('1.9', '1.11'), ('1.10', '1.12'), ('1.11', '1.13'),
+                    ('1.12', '1.14'), ('1.13', '1.15'), ('1.14', '1.16'),
+                    ('1.15', '1.17'), ('1.16', '1.18')],
+    }
 
     @base.remotable_classmethod
     def get_by_topic(cls, context, topic):

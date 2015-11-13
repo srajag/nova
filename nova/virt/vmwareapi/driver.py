@@ -24,19 +24,24 @@ import re
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
+from oslo_utils import excutils
 from oslo_vmware import api
 from oslo_vmware import exceptions as vexc
 from oslo_vmware import pbm
 from oslo_vmware import vim
 from oslo_vmware import vim_util
 
+from nova.compute import task_states
+from nova.compute import vm_states
 from nova import exception
-from nova.i18n import _, _LI, _LW
-from nova.openstack.common import versionutils
+from nova import utils
+from nova.i18n import _, _LI, _LE, _LW
+from nova import objects
 from nova.virt import driver
 from nova.virt.vmwareapi import constants
 from nova.virt.vmwareapi import error_util
 from nova.virt.vmwareapi import host
+from nova.virt.vmwareapi import vim_util as nova_vim_util
 from nova.virt.vmwareapi import vm_util
 from nova.virt.vmwareapi import vmops
 from nova.virt.vmwareapi import volumeops
@@ -45,18 +50,29 @@ LOG = logging.getLogger(__name__)
 
 vmwareapi_opts = [
     cfg.StrOpt('host_ip',
-               help='Hostname or IP address for connection to VMware VC '
-                    'host.'),
+               help='Hostname or IP address for connection to VMware '
+                    'vCenter host.'),
     cfg.IntOpt('host_port',
                default=443,
-               help='Port for connection to VMware VC host.'),
+               min=1,
+               max=65535,
+               help='Port for connection to VMware vCenter host.'),
     cfg.StrOpt('host_username',
-               help='Username for connection to VMware VC host.'),
+               help='Username for connection to VMware vCenter host.'),
     cfg.StrOpt('host_password',
-               help='Password for connection to VMware VC host.',
+               help='Password for connection to VMware vCenter host.',
                secret=True),
-    cfg.MultiStrOpt('cluster_name',
-                    help='Name of a VMware Cluster ComputeResource.'),
+    cfg.StrOpt('ca_file',
+               help='Specify a CA bundle file to use in verifying the '
+                    'vCenter server certificate.'),
+    cfg.BoolOpt('insecure',
+                default=False,
+                help='If true, the vCenter server certificate is not '
+                     'verified. If false, then the default CA truststore is '
+                     'used for verification. This option is ignored if '
+                     '"ca_file" is set.'),
+    cfg.StrOpt('cluster_name',
+               help='Name of a VMware Cluster ComputeResource.'),
     cfg.StrOpt('datastore_regex',
                help='Regex to match the name of a datastore.'),
     cfg.FloatOpt('task_poll_interval',
@@ -68,6 +84,8 @@ vmwareapi_opts = [
                     'socket error, etc.'),
     cfg.IntOpt('vnc_port',
                default=5900,
+               min=1,
+               max=65535,
                help='VNC starting port'),
     cfg.IntOpt('vnc_port_total',
                default=10000,
@@ -110,7 +128,15 @@ class VMwareVCDriver(driver.ComputeDriver):
     capabilities = {
         "has_imagecache": True,
         "supports_recreate": False,
-        }
+        "supports_migrate_to_same_host": True
+    }
+
+    # Legacy nodename is of the form: <mo id>(<cluster name>)
+    # e.g. domain-26(TestCluster)
+    # We assume <mo id> consists of alphanumeric, _ and -.
+    # We assume cluster name is everything between the first ( and the last ).
+    # We pull out <mo id> for re-use.
+    LEGACY_NODENAME = re.compile('([\w-]+)\(.+\)')
 
     # The vCenter driver includes API that acts on ESX hosts or groups
     # of ESX hosts in clusters or non-cluster logical-groupings.
@@ -139,53 +165,48 @@ class VMwareVCDriver(driver.ComputeDriver):
 
         self._session = VMwareAPISession(scheme=scheme)
 
+        self._check_min_version()
+
         # Update the PBM location if necessary
         if CONF.vmware.pbm_enabled:
             self._update_pbm_location()
 
         self._validate_configuration()
-
-        # Get the list of clusters to be used
-        self._cluster_names = CONF.vmware.cluster_name
-        if len(self._cluster_names) > 1:
-            versionutils.report_deprecated_feature(
-                LOG,
-                _LW('The "cluster_name" setting should have only one '
-                    'cluster name. The capability of allowing '
-                    'multiple clusters may be dropped in the '
-                    'Liberty release.'))
-
-        self.dict_mors = vm_util.get_all_cluster_refs_by_name(self._session,
-                                          self._cluster_names)
-        if not self.dict_mors:
-            raise exception.NotFound(_("All clusters specified %s were not"
-                                       " found in the vCenter")
-                                     % self._cluster_names)
-
-        # Check if there are any clusters that were specified in the nova.conf
-        # but are not in the vCenter, for missing clusters log a warning.
-        clusters_found = [v.get('name') for k, v in self.dict_mors.iteritems()]
-        missing_clusters = set(self._cluster_names) - set(clusters_found)
-        if missing_clusters:
-            LOG.warning(_LW("The following clusters could not be found in the "
-                            "vCenter %s"), list(missing_clusters))
-
-        # The _resources is used to maintain the vmops, volumeops and vcstate
-        # objects per cluster
-        self._resources = {}
-        self._resource_keys = set()
-        self._virtapi = virtapi
-        self._update_resources()
-
-        # The following initialization is necessary since the base class does
-        # not use VC state.
-        first_cluster = self._resources.keys()[0]
-        self._vmops = self._resources.get(first_cluster).get('vmops')
-        self._volumeops = self._resources.get(first_cluster).get('volumeops')
-        self._vc_state = self._resources.get(first_cluster).get('vcstate')
+        self._cluster_name = CONF.vmware.cluster_name
+        self._cluster_ref = vm_util.get_cluster_ref_by_name(self._session,
+                                                            self._cluster_name)
+        if self._cluster_ref is None:
+            raise exception.NotFound(_("The specified cluster '%s' was not "
+                                       "found in vCenter")
+                                     % self._cluster_name)
+        self._vcenter_uuid = self._get_vcenter_uuid()
+        self._nodename = self._create_nodename(self._cluster_ref.value)
+        self._volumeops = volumeops.VMwareVolumeOps(self._session,
+                                                    self._cluster_ref)
+        self._vmops = vmops.VMwareVMOps(self._session,
+                                        virtapi,
+                                        self._volumeops,
+                                        self._cluster_ref,
+                                        datastore_regex=self._datastore_regex)
+        self._vc_state = host.VCState(self._session,
+                                      self._nodename,
+                                      self._cluster_ref,
+                                      self._datastore_regex)
 
         # Register the OpenStack extension
         self._register_openstack_extension()
+
+    def _check_min_version(self):
+        min_version = utils.convert_version_to_int(constants.MIN_VC_VERSION)
+        vc_version = vim_util.get_vc_version(self._session)
+        LOG.info(_LI("VMware vCenter version: %s"), vc_version)
+        if min_version > utils.convert_version_to_int(vc_version):
+            # TODO(garyk): enforce this from M
+            LOG.warning(_LW('Running Nova with a VMware vCenter version less '
+                            'than %(version)s is deprecated. The required '
+                            'minimum version of vCenter will be raised to '
+                            '%(version)s in the 13.0.0 release.'),
+                        {'version': constants.MIN_VC_VERSION})
 
     @property
     def need_legacy_block_device_info(self):
@@ -200,9 +221,6 @@ class VMwareVCDriver(driver.ComputeDriver):
         self._session.pbm_wsdl_loc_set(pbm_wsdl_loc)
 
     def _validate_configuration(self):
-        if CONF.vmware.use_linked_clone is None:
-            raise vexc.UseLinkedCloneConfigurationFault()
-
         if CONF.vmware.pbm_enabled:
             if not CONF.vmware.pbm_default_policy:
                 raise error_util.PbmDefaultPolicyUnspecified()
@@ -261,13 +279,8 @@ class VMwareVCDriver(driver.ComputeDriver):
         return self._vmops.list_instances()
 
     def list_instances(self):
-        """List VM instances from all nodes."""
-        instances = []
-        nodes = self.get_available_nodes()
-        for node in nodes:
-            vmops = self._get_vmops_for_compute_node(node)
-            instances.extend(vmops.list_instances())
-        return instances
+        """List VM instances from the single compute node."""
+        return self._vmops.list_instances()
 
     def migrate_disk_and_power_off(self, context, instance, dest,
                                    flavor, network_info,
@@ -294,6 +307,7 @@ class VMwareVCDriver(driver.ComputeDriver):
                          network_info, image_meta, resize_instance,
                          block_device_info=None, power_on=True):
         """Completes a resize, turning on the migrated instance."""
+        image_meta = objects.ImageMeta.from_dict(image_meta)
         self._vmops.finish_migration(context, migration, instance, disk_info,
                                      network_info, image_meta, resize_instance,
                                      block_device_info, power_on)
@@ -323,90 +337,25 @@ class VMwareVCDriver(driver.ComputeDriver):
         # itself. You must talk to the VNC host underneath vCenter.
         return self._vmops.get_vnc_console(instance)
 
-    def _update_resources(self):
-        """This method creates a dictionary of VMOps, VolumeOps and VCState.
+    def get_mks_console(self, context, instance):
+        return self._vmops.get_mks_console(instance)
 
-        The VMwareVMOps, VMwareVolumeOps and VCState object is for each
-        cluster/rp. The dictionary is of the form
-        {
-            domain-1000 : {'vmops': vmops_obj,
-                          'volumeops': volumeops_obj,
-                          'vcstate': vcstate_obj,
-                          'name': MyCluster},
-            resgroup-1000 : {'vmops': vmops_obj,
-                              'volumeops': volumeops_obj,
-                              'vcstate': vcstate_obj,
-                              'name': MyRP},
-        }
+    def _get_vcenter_uuid(self):
+        """Retrieves the vCenter UUID."""
+
+        about = self._session._call_method(nova_vim_util, 'get_about_info')
+        return about.instanceUuid
+
+    def _create_nodename(self, mo_id):
+        """Return a nodename which uniquely describes a cluster.
+
+        The name will be of the form:
+          <mo id>.<vcenter uuid>
+        e.g.
+          domain-26.9d51f082-58a4-4449-beed-6fd205a5726b
         """
-        added_nodes = set(self.dict_mors.keys()) - set(self._resource_keys)
-        for node in added_nodes:
-            _volumeops = volumeops.VMwareVolumeOps(self._session,
-                                        self.dict_mors[node]['cluster_mor'])
-            _vmops = vmops.VMwareVMOps(self._session, self._virtapi,
-                                       _volumeops,
-                                       self.dict_mors[node]['cluster_mor'],
-                                       datastore_regex=self._datastore_regex)
-            name = self.dict_mors.get(node)['name']
-            nodename = self._create_nodename(node, name)
-            _vc_state = host.VCState(self._session, nodename,
-                                     self.dict_mors.get(node)['cluster_mor'],
-                                     self._datastore_regex)
-            self._resources[nodename] = {'vmops': _vmops,
-                                         'volumeops': _volumeops,
-                                         'vcstate': _vc_state,
-                                         'name': name,
-                                     }
-            self._resource_keys.add(node)
 
-        deleted_nodes = (set(self._resource_keys) -
-                            set(self.dict_mors.keys()))
-        for node in deleted_nodes:
-            name = self.dict_mors.get(node)['name']
-            nodename = self._create_nodename(node, name)
-            del self._resources[nodename]
-            self._resource_keys.discard(node)
-
-    def _create_nodename(self, mo_id, display_name):
-        """Creates the name that is stored in hypervisor_hostname column.
-
-        The name will be of the form similar to
-        domain-1000(MyCluster)
-        resgroup-1000(MyResourcePool)
-        """
-        return mo_id + '(' + display_name + ')'
-
-    def _get_resource_for_node(self, nodename):
-        """Gets the resource information for the specific node."""
-        resource = self._resources.get(nodename)
-        if not resource:
-            msg = _("The resource %s does not exist") % nodename
-            raise exception.NotFound(msg)
-        return resource
-
-    def _get_vmops_for_compute_node(self, nodename):
-        """Retrieve vmops object from mo_id stored in the node name.
-
-        Node name is of the form domain-1000(MyCluster)
-        """
-        resource = self._get_resource_for_node(nodename)
-        return resource['vmops']
-
-    def _get_volumeops_for_compute_node(self, nodename):
-        """Retrieve vmops object from mo_id stored in the node name.
-
-        Node name is of the form domain-1000(MyCluster)
-        """
-        resource = self._get_resource_for_node(nodename)
-        return resource['volumeops']
-
-    def _get_vc_state_for_compute_node(self, nodename):
-        """Retrieve VCState object from mo_id stored in the node name.
-
-        Node name is of the form domain-1000(MyCluster)
-        """
-        resource = self._get_resource_for_node(nodename)
-        return resource['vcstate']
+        return '%s.%s' % (mo_id, self._vcenter_uuid)
 
     def _get_available_resources(self, host_stats):
         return {'vcpus': host_stats['vcpus'],
@@ -438,60 +387,33 @@ class VMwareVCDriver(driver.ComputeDriver):
         :returns: dictionary describing resources
 
         """
-        stats_dict = {}
-        vc_state = self._get_vc_state_for_compute_node(nodename)
-        if vc_state:
-            host_stats = vc_state.get_host_stats(refresh=True)
-
-            # Updating host information
-            stats_dict = self._get_available_resources(host_stats)
-
-        else:
-            LOG.info(_LI("Invalid cluster or resource pool"
-                         " name : %s"), nodename)
-
+        host_stats = self._vc_state.get_host_stats(refresh=True)
+        stats_dict = self._get_available_resources(host_stats)
         return stats_dict
 
     def get_available_nodes(self, refresh=False):
         """Returns nodenames of all nodes managed by the compute service.
 
-        This method is for multi compute-nodes support. If a driver supports
-        multi compute-nodes, this method returns a list of nodenames managed
-        by the service. Otherwise, this method should return
-        [hypervisor_hostname].
+        This driver supports only one compute node.
         """
-        self.dict_mors = vm_util.get_all_cluster_refs_by_name(
-                                self._session,
-                                CONF.vmware.cluster_name)
-        node_list = []
-        self._update_resources()
-        for node in self.dict_mors.keys():
-            nodename = self._create_nodename(node,
-                                          self.dict_mors.get(node)['name'])
-            node_list.append(nodename)
-        LOG.debug("The available nodes are: %s", node_list)
-        return node_list
+        return [self._nodename]
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, network_info=None, block_device_info=None):
         """Create VM instance."""
-        _vmops = self._get_vmops_for_compute_node(instance.node)
-        _vmops.spawn(context, instance, image_meta, injected_files,
-              admin_password, network_info, block_device_info)
+        image_meta = objects.ImageMeta.from_dict(image_meta)
+        self._vmops.spawn(context, instance, image_meta, injected_files,
+                          admin_password, network_info, block_device_info)
 
     def attach_volume(self, context, connection_info, instance, mountpoint,
                       disk_bus=None, device_type=None, encryption=None):
         """Attach volume storage to VM instance."""
-        _volumeops = self._get_volumeops_for_compute_node(instance.node)
-        return _volumeops.attach_volume(connection_info,
-                                        instance)
+        return self._volumeops.attach_volume(connection_info, instance)
 
     def detach_volume(self, connection_info, instance, mountpoint,
                       encryption=None):
         """Detach volume storage to VM instance."""
-        _volumeops = self._get_volumeops_for_compute_node(instance.node)
-        return _volumeops.detach_volume(connection_info,
-                                        instance)
+        return self._volumeops.detach_volume(connection_info, instance)
 
     def get_volume_connector(self, instance):
         """Return volume connector information."""
@@ -510,6 +432,36 @@ class VMwareVCDriver(driver.ComputeDriver):
         """Reboot VM instance."""
         self._vmops.reboot(instance, network_info, reboot_type)
 
+    def _detach_instance_volumes(self, instance, block_device_info):
+        # We need to detach attached volumes
+        block_device_mapping = driver.block_device_info_get_mapping(
+            block_device_info)
+        if block_device_mapping:
+            # Certain disk types, for example 'IDE' do not support hot
+            # plugging. Hence we need to power off the instance and update
+            # the instance state.
+            self._vmops.power_off(instance)
+            # TODO(garyk): update the volumeops to read the state form the
+            # VM instead of relying on an instance flag
+            instance.vm_state = vm_states.STOPPED
+            for disk in block_device_mapping:
+                connection_info = disk['connection_info']
+                try:
+                    self.detach_volume(connection_info, instance,
+                                       disk.get('device_name'))
+                except exception.StorageError:
+                    # The volume does not exist
+                    # NOTE(garyk): change to warning after string freeze
+                    LOG.debug('%s does not exist!', disk.get('device_name'),
+                              instance=instance)
+                except Exception as e:
+                    with excutils.save_and_reraise_exception():
+                        LOG.error(_LE("Failed to detach %(device_name)s. "
+                                      "Exception: %(exc)s"),
+                                  {'device_name': disk.get('device_name'),
+                                   'exc': e},
+                                  instance=instance)
+
     def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True, migrate_data=None):
         """Destroy VM instance."""
@@ -520,6 +472,19 @@ class VMwareVCDriver(driver.ComputeDriver):
         if not instance.node:
             return
 
+        # A resize uses the same instance on the VC. We do not delete that
+        # VM in the event of a revert
+        if instance.task_state == task_states.RESIZE_REVERTING:
+            return
+
+        # We need to detach attached volumes
+        if block_device_info is not None:
+            try:
+                self._detach_instance_volumes(instance, block_device_info)
+            except vexc.ManagedObjectNotFoundException:
+                LOG.warning(_LW('Instance does not exists. Proceeding to '
+                                'delete instance properties on datastore'),
+                            instance=instance)
         self._vmops.destroy(instance, destroy_disks)
 
     def pause(self, instance):
@@ -541,6 +506,7 @@ class VMwareVCDriver(driver.ComputeDriver):
     def rescue(self, context, instance, network_info, image_meta,
                rescue_password):
         """Rescue the specified instance."""
+        image_meta = objects.ImageMeta.from_dict(image_meta)
         self._vmops.rescue(context, instance, network_info, image_meta)
 
     def unrescue(self, instance, network_info):
@@ -608,22 +574,7 @@ class VMwareVCDriver(driver.ComputeDriver):
 
     def manage_image_cache(self, context, all_instances):
         """Manage the local cache of images."""
-
-        # Running instances per cluster
-        cluster_instances = {}
-        for instance in all_instances:
-            instances = cluster_instances.get(instance.node)
-            if instances:
-                instances.append(instance)
-            else:
-                instances = [instance]
-            cluster_instances[instance.node] = instances
-
-        # Invoke the image aging per cluster
-        for resource in self._resources.keys():
-            instances = cluster_instances.get(resource, [])
-            _vmops = self._get_vmops_for_compute_node(resource)
-            _vmops.manage_image_cache(context, instances)
+        self._vmops.manage_image_cache(context, all_instances)
 
     def instance_exists(self, instance):
         """Efficient override of base instance_exists method."""
@@ -631,6 +582,7 @@ class VMwareVCDriver(driver.ComputeDriver):
 
     def attach_interface(self, instance, image_meta, vif):
         """Attach an interface to the instance."""
+        image_meta = objects.ImageMeta.from_dict(image_meta)
         self._vmops.attach_interface(instance, image_meta, vif)
 
     def detach_interface(self, instance, vif):
@@ -647,7 +599,9 @@ class VMwareAPISession(api.VMwareAPISession):
                  username=CONF.vmware.host_username,
                  password=CONF.vmware.host_password,
                  retry_count=CONF.vmware.api_retry_count,
-                 scheme="https"):
+                 scheme="https",
+                 cacert=CONF.vmware.ca_file,
+                 insecure=CONF.vmware.insecure):
         super(VMwareAPISession, self).__init__(
                 host=host_ip,
                 port=host_port,
@@ -657,8 +611,9 @@ class VMwareAPISession(api.VMwareAPISession):
                 task_poll_interval=CONF.vmware.task_poll_interval,
                 scheme=scheme,
                 create_session=True,
-                wsdl_loc=CONF.vmware.wsdl_location
-                )
+                wsdl_loc=CONF.vmware.wsdl_location,
+                cacert=cacert,
+                insecure=insecure)
 
     def _is_vim_object(self, module):
         """Check if the module is a VIM Object instance."""

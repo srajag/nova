@@ -99,11 +99,32 @@ def fake_db_instance(**updates):
     return db_instance
 
 
-def fake_instance_obj(context, **updates):
+def fake_instance_obj(context, obj_instance_class=None, **updates):
+    if obj_instance_class is None:
+        obj_instance_class = objects.Instance
     expected_attrs = updates.pop('expected_attrs', None)
-    return objects.Instance._from_db_object(context,
-               objects.Instance(), fake_db_instance(**updates),
+    flavor = updates.pop('flavor', None)
+    if not flavor:
+        flavor = objects.Flavor(id=1, name='flavor1',
+                                memory_mb=256, vcpus=1,
+                                root_gb=1, ephemeral_gb=1,
+                                flavorid='1',
+                                swap=0, rxtx_factor=1.0,
+                                vcpu_weight=1,
+                                disabled=False,
+                                is_public=True,
+                                extra_specs={},
+                                projects=[])
+        flavor.obj_reset_changes()
+    inst = obj_instance_class._from_db_object(context,
+               obj_instance_class(), fake_db_instance(**updates),
                expected_attrs=expected_attrs)
+    if flavor:
+        inst.flavor = flavor
+    inst.old_flavor = None
+    inst.new_flavor = None
+    inst.obj_reset_changes()
+    return inst
 
 
 def fake_fault_obj(context, instance_uuid, code=404,

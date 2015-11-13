@@ -30,7 +30,6 @@ from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import strutils
 import six
-import six.moves.urllib.parse as urlparse
 
 from nova import availability_zones as az
 from nova import exception
@@ -98,7 +97,6 @@ def cinderclient(context):
 
     url = None
     endpoint_override = None
-    version = None
 
     auth = context.get_auth_plugin()
     service_type, service_name, interface = CONF.cinder.catalog_info.split(':')
@@ -117,13 +115,13 @@ def cinderclient(context):
     # TODO(jamielennox): This should be using proper version discovery from
     # the cinder service rather than just inspecting the URL for certain string
     # values.
-    version = get_cinder_client_version(url)
+    version = cinder_client.get_volume_api_from_url(url)
 
     if version == '1' and not _V1_ERROR_RAISED:
         msg = _LW('Cinder V1 API is deprecated as of the Juno '
                   'release, and Nova is still configured to use it. '
                   'Enable the V2 API in Cinder and set '
-                  'cinder_catalog_info in nova.conf to use it.')
+                  'cinder.catalog_info in nova.conf to use it.')
         LOG.warn(msg)
         _V1_ERROR_RAISED = True
 
@@ -222,13 +220,13 @@ def translate_volume_exception(method):
                                         cinder_exception.BadRequest)):
                 exc_value = exception.InvalidInput(
                     reason=six.text_type(exc_value))
-            raise exc_value, None, exc_trace
+            six.reraise(exc_value, None, exc_trace)
         except (cinder_exception.ConnectionError,
                 keystone_exception.ConnectionError):
             exc_type, exc_value, exc_trace = sys.exc_info()
             exc_value = exception.CinderConnectionFailed(
                 reason=six.text_type(exc_value))
-            raise exc_value, None, exc_trace
+            six.reraise(exc_value, None, exc_trace)
         return res
     return wrapper
 
@@ -246,36 +244,15 @@ def translate_snapshot_exception(method):
             if isinstance(exc_value, (keystone_exception.NotFound,
                                       cinder_exception.NotFound)):
                 exc_value = exception.SnapshotNotFound(snapshot_id=snapshot_id)
-            raise exc_value, None, exc_trace
+            six.reraise(exc_value, None, exc_trace)
         except (cinder_exception.ConnectionError,
                 keystone_exception.ConnectionError):
             exc_type, exc_value, exc_trace = sys.exc_info()
             reason = six.text_type(exc_value)
             exc_value = exception.CinderConnectionFailed(reason=reason)
-            raise exc_value, None, exc_trace
+            six.reraise(exc_value, None, exc_trace)
         return res
     return wrapper
-
-
-def get_cinder_client_version(url):
-    """Parse cinder client version by endpoint url.
-
-    :param url: URL for cinder.
-    :return: str value(1 or 2).
-    """
-    # FIXME(jamielennox): Use cinder_client.get_volume_api_from_url when
-    # bug #1386232 is fixed.
-    valid_versions = ['v1', 'v2']
-    scheme, netloc, path, query, frag = urlparse.urlsplit(url)
-    components = path.split("/")
-
-    for version in valid_versions:
-        if version in components:
-            return version[1:]
-
-    msg = "Invalid client version '%s'. must be one of: %s" % (
-        (version, ', '.join(valid_versions)))
-    raise cinder_exception.UnsupportedVersion(msg)
 
 
 class API(object):
@@ -316,13 +293,7 @@ class API(object):
             msg = _("volume %s already attached") % volume['id']
             raise exception.InvalidVolume(reason=msg)
         if instance and not CONF.cinder.cross_az_attach:
-            # NOTE(sorrison): If instance is on a host we match against it's AZ
-            #                 else we check the intended AZ
-            if instance.get('host'):
-                instance_az = az.get_instance_availability_zone(
-                    context, instance)
-            else:
-                instance_az = instance['availability_zone']
+            instance_az = az.get_instance_availability_zone(context, instance)
             if instance_az != volume['availability_zone']:
                 msg = _("Instance %(instance)s and volume %(vol)s are not in "
                         "the same availability_zone. Instance is in "

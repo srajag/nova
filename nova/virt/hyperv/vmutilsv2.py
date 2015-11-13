@@ -28,6 +28,7 @@ from oslo_config import cfg
 from oslo_log import log as logging
 
 from nova.virt.hyperv import constants
+from nova.virt.hyperv import hostutils
 from nova.virt.hyperv import vmutils
 
 CONF = cfg.CONF
@@ -46,6 +47,7 @@ class VMUtilsV2(vmutils.VMUtils):
     _SCSI_CTRL_RES_SUB_TYPE = 'Microsoft:Hyper-V:Synthetic SCSI Controller'
     _SERIAL_PORT_RES_SUB_TYPE = 'Microsoft:Hyper-V:Serial Port'
 
+    _VIRTUAL_SYSTEM_SUBTYPE = 'VirtualSystemSubType'
     _VIRTUAL_SYSTEM_TYPE_REALIZED = 'Microsoft:Hyper-V:System:Realized'
     _VIRTUAL_SYSTEM_SUBTYPE_GEN2 = 'Microsoft:Hyper-V:SubType:2'
 
@@ -59,6 +61,8 @@ class VMUtilsV2(vmutils.VMUtils):
     _ETHERNET_PORT_ALLOCATION_SETTING_DATA_CLASS = \
     'Msvm_EthernetPortAllocationSettingData'
 
+    _VIRT_DISK_CONNECTION_ATTR = "HostResource"
+
     _AUTOMATIC_STARTUP_ACTION_NONE = 2
 
     _vm_power_states_map = {constants.HYPERV_VM_STATE_ENABLED: 2,
@@ -69,6 +73,12 @@ class VMUtilsV2(vmutils.VMUtils):
                             constants.HYPERV_VM_STATE_SUSPENDED: 6}
 
     def __init__(self, host='.'):
+        if sys.platform == 'win32':
+            # A separate WMI class for VM serial ports has been introduced
+            # in Windows 10 / Windows Server 2016
+            if hostutils.HostUtils().check_min_windows_version(10, 0):
+                self._SERIAL_PORT_SETTING_DATA_CLASS = (
+                    "Msvm_SerialPortSettingData")
         super(VMUtilsV2, self).__init__(host)
 
     def _init_hyperv_wmi_conn(self, host):
@@ -80,7 +90,9 @@ class VMUtilsV2(vmutils.VMUtils):
         for vs in self._conn.Msvm_VirtualSystemSettingData(
                 ['ElementName', 'Notes'],
                 VirtualSystemType=self._VIRTUAL_SYSTEM_TYPE_REALIZED):
-            instance_notes.append((vs.ElementName, [v for v in vs.Notes if v]))
+            if vs.Notes is not None:
+                instance_notes.append(
+                    (vs.ElementName, [v for v in vs.Notes if v]))
 
         return instance_notes
 
@@ -319,3 +331,16 @@ class VMUtilsV2(vmutils.VMUtils):
                      if sasd.ResourceSubType == self._DVD_DISK_RES_SUB_TYPE]
 
         return dvd_paths
+
+    def _get_instance_notes(self, vm_name):
+        vm = self._lookup_vm_check(vm_name)
+        vmsettings = self._get_vm_setting_data(vm)
+        return [note for note in vmsettings.Notes if note]
+
+    def get_vm_generation(self, vm_name):
+        vm = self._lookup_vm_check(vm_name)
+        vssd = self._get_vm_setting_data(vm)
+        if hasattr(vssd, self._VIRTUAL_SYSTEM_SUBTYPE):
+            # expected format: 'Microsoft:Hyper-V:SubType:2'
+            return int(vssd.VirtualSystemSubType.split(':')[-1])
+        return constants.VM_GEN_1

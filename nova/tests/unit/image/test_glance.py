@@ -15,6 +15,7 @@
 
 
 import datetime
+from six.moves import StringIO
 
 import glanceclient.exc
 import mock
@@ -156,22 +157,10 @@ class TestGlanceSerializer(test.NoDBTestCase):
                              'device_name': '/dev/fake'},
                             {'virtual_device': 'ephemeral0',
                              'device_name': '/dev/fake0'}]}}
-
-        converted_expected = {
-            'name': 'image1',
-            'is_public': True,
-            'foo': 'bar',
-            'properties': {
-                'prop1': 'propvalue1',
-                'mappings':
-                '[{"device": "bbb", "virtual": "aaa"}, '
-                '{"device": "yyy", "virtual": "xxx"}]',
-                'block_device_mapping':
-                '[{"virtual_device": "fake", "device_name": "/dev/fake"}, '
-                '{"virtual_device": "ephemeral0", '
-                '"device_name": "/dev/fake0"}]'}}
+        # NOTE(tdurakov): Assertion of serialized objects won't work
+        # during using of random PYTHONHASHSEED. Assertion of
+        # serialized/deserialized object and initial one is enough
         converted = glance._convert_to_string(metadata)
-        self.assertEqual(converted, converted_expected)
         self.assertEqual(glance._convert_from_string(converted), metadata)
 
 
@@ -217,7 +206,6 @@ class TestCreateGlanceClient(test.NoDBTestCase):
                 'X-User-Id': 'fake',
                 'X-Roles': '',
                 'X-Tenant-Id': 'fake',
-                'X-Service-Catalog': '[]',
                 'X-Identity-Status': 'Confirmed'
             },
             'token': 'token'
@@ -237,7 +225,6 @@ class TestCreateGlanceClient(test.NoDBTestCase):
                 'X-User-Id': 'fake',
                 'X-Roles': '',
                 'X-Tenant-Id': 'fake',
-                'X-Service-Catalog': '[]',
                 'X-Identity-Status': 'Confirmed'
             },
             'token': 'token'
@@ -296,6 +283,33 @@ class TestGlanceClientWrapper(test.NoDBTestCase):
         create_client_mock.assert_called_once_with(ctx, host, port, use_ssl, 1)
         self.assertRaises(exception.GlanceConnectionFailed,
                 client.call, ctx, 1, 'get', 'meow')
+        self.assertFalse(sleep_mock.called)
+
+    @mock.patch('nova.image.glance.LOG')
+    @mock.patch('time.sleep')
+    @mock.patch('nova.image.glance._create_glance_client')
+    def test_static_client_with_retries_negative(self, create_client_mock,
+                                                 sleep_mock, mock_log):
+        client_mock = mock.Mock(spec=glanceclient.Client)
+        images_mock = mock.Mock()
+        images_mock.get.side_effect = glanceclient.exc.ServiceUnavailable
+        client_mock.images = images_mock
+        create_client_mock.return_value = client_mock
+        self.flags(num_retries=-1, group='glance')
+
+        ctx = context.RequestContext('fake', 'fake')
+        host = 'host4'
+        port = 9295
+        use_ssl = False
+
+        client = glance.GlanceClientWrapper(context=ctx, host=host, port=port,
+                                            use_ssl=use_ssl)
+        create_client_mock.assert_called_once_with(ctx, host, port, use_ssl, 1)
+        self.assertRaises(exception.GlanceConnectionFailed,
+                client.call, ctx, 1, 'get', 'meow')
+        self.assertTrue(mock_log.warning.called)
+        msg = mock_log.warning.call_args_list[0]
+        self.assertIn('Treating negative config value', msg[0][0])
         self.assertFalse(sleep_mock.called)
 
     @mock.patch('time.sleep')
@@ -401,8 +415,10 @@ class TestGlanceClientWrapper(test.NoDBTestCase):
         )
         sleep_mock.assert_called_once_with(1)
 
+    @mock.patch('oslo_service.sslutils.is_enabled')
     @mock.patch('glanceclient.Client')
-    def test_create_glance_client_with_ssl(self, client_mock):
+    def test_create_glance_client_with_ssl(self, client_mock,
+                                           ssl_enable_mock):
         self.flags(ca_file='foo.cert', cert_file='bar.cert',
                    key_file='wut.key', group='ssl')
         ctxt = mock.sentinel.ctx
@@ -511,6 +527,26 @@ class TestDownloadNoDirectUri(test.NoDBTestCase):
                 ]
         )
         self.assertFalse(data.close.called)
+
+    @mock.patch('__builtin__.open')
+    @mock.patch('nova.image.glance.GlanceImageService.show')
+    def test_download_data_dest_path_write_fails(self, show_mock, open_mock):
+        client = mock.MagicMock()
+        client.call.return_value = [1, 2, 3]
+        ctx = mock.sentinel.ctx
+        service = glance.GlanceImageService(client)
+
+        # NOTE(mikal): data is a file like object, which in our case always
+        # raises an exception when we attempt to write to the file.
+        class FakeDiskException(Exception):
+            pass
+
+        class Exceptionator(StringIO):
+            def write(self, _):
+                raise FakeDiskException('Disk full!')
+
+        self.assertRaises(FakeDiskException, service.download, ctx,
+                          mock.sentinel.image_id, data=Exceptionator())
 
     @mock.patch('nova.image.glance.GlanceImageService._get_transfer_module')
     @mock.patch('nova.image.glance.GlanceImageService.show')
@@ -1039,7 +1075,7 @@ class TestCreate(test.NoDBTestCase):
         # Now verify that if we supply image data to the call,
         # that the client is also called with the data kwarg
         client.reset_mock()
-        image_meta = service.create(ctx, image_mock, data=mock.sentinel.data)
+        service.create(ctx, image_mock, data=mock.sentinel.data)
 
         client.call.assert_called_once_with(ctx, 1, 'create',
                                             image_id=mock.sentinel.image_id,
@@ -1100,8 +1136,8 @@ class TestUpdate(test.NoDBTestCase):
         # Now verify that if we supply image data to the call,
         # that the client is also called with the data kwarg
         client.reset_mock()
-        image_meta = service.update(ctx, mock.sentinel.image_id,
-                                    image_mock, data=mock.sentinel.data)
+        service.update(ctx, mock.sentinel.image_id,
+                       image_mock, data=mock.sentinel.data)
 
         client.call.assert_called_once_with(ctx, 1, 'update',
                                             mock.sentinel.image_id,

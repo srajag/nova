@@ -15,12 +15,11 @@
 
 from oslo_config import cfg
 from oslo_log import log as logging
+import oslo_messaging as messaging
 from oslo_utils import timeutils
 import six
 
-from nova import conductor
-from nova import context
-from nova.i18n import _, _LE
+from nova.i18n import _, _LI, _LW
 from nova.servicegroup import api
 from nova.servicegroup.drivers import base
 
@@ -34,16 +33,6 @@ LOG = logging.getLogger(__name__)
 class DbDriver(base.Driver):
 
     def __init__(self, *args, **kwargs):
-        """Creates an instance of the DB-based servicegroup driver.
-
-        Valid kwargs are:
-
-        db_allowed - Boolean. False if direct db access is not allowed and
-                     alternative data access (conductor) should be used
-                     instead.
-        """
-        self.db_allowed = kwargs.get('db_allowed', True)
-        self.conductor_api = conductor.API(use_local=self.db_allowed)
         self.service_down_time = CONF.service_down_time
 
     def join(self, member, group, service=None):
@@ -69,7 +58,10 @@ class DbDriver(base.Driver):
         """Moved from nova.utils
         Check whether a service is up based on last heartbeat.
         """
-        last_heartbeat = service_ref['updated_at'] or service_ref['created_at']
+        # Keep checking 'updated_at' if 'last_seen_up' isn't set.
+        # Should be able to use only 'last_seen_up' in the M release
+        last_heartbeat = (service_ref.get('last_seen_up') or
+            service_ref['updated_at'] or service_ref['created_at'])
         if isinstance(last_heartbeat, six.string_types):
             # NOTE(russellb) If this service_ref came in over rpc via
             # conductor, then the timestamp will be a string and needs to be
@@ -88,36 +80,23 @@ class DbDriver(base.Driver):
                       {'lhb': str(last_heartbeat), 'el': str(elapsed)})
         return is_up
 
-    def get_all(self, group_id):
-        """Returns ALL members of the given group
-        """
-        LOG.debug('DB_Driver: get_all members of the %s group', group_id)
-        rs = []
-        ctxt = context.get_admin_context()
-        services = self.conductor_api.service_get_all_by_topic(ctxt, group_id)
-        for service in services:
-            if self.is_up(service):
-                rs.append(service['host'])
-        return rs
-
     def _report_state(self, service):
         """Update the state of this service in the datastore."""
-        ctxt = context.get_admin_context()
-        state_catalog = {}
         try:
-            report_count = service.service_ref['report_count'] + 1
-            state_catalog['report_count'] = report_count
-
-            service.service_ref = self.conductor_api.service_update(ctxt,
-                    service.service_ref, state_catalog)
+            service.service_ref.report_count += 1
+            service.service_ref.save()
 
             # TODO(termie): make this pattern be more elegant.
             if getattr(service, 'model_disconnected', False):
                 service.model_disconnected = False
-                LOG.error(_LE('Recovered model server connection!'))
+                LOG.info(
+                    _LI('Recovered connection to nova-conductor '
+                        'for reporting service status.'))
 
-        # TODO(vish): this should probably only catch connection errors
-        except Exception:
+        # because we are communicating over conductor, a failure to
+        # connect is going to be a messaging failure, not a db error.
+        except messaging.MessagingTimeout:
             if not getattr(service, 'model_disconnected', False):
                 service.model_disconnected = True
-                LOG.exception(_LE('model server went away'))
+                LOG.warn(_LW('Lost connection to nova-conductor '
+                             'for reporting service status.'))

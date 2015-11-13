@@ -21,10 +21,12 @@ import time
 
 import mock
 from mox3 import mox
+import netifaces
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
+from oslo_utils import fileutils
 from oslo_utils import timeutils
 
 from nova import context
@@ -33,7 +35,6 @@ from nova import exception
 from nova.network import driver
 from nova.network import linux_net
 from nova import objects
-from nova.openstack.common import fileutils
 from nova import test
 from nova import utils
 
@@ -1127,11 +1128,20 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
         self._test_add_metadata_forward_rule(expected)
 
     def test_ensure_bridge_brings_up_interface(self):
+        # We have to bypass the CONF.fake_network check so that netifaces
+        # is actually called.
+        self.flags(fake_network=False)
+        fake_mac = 'aa:bb:cc:00:11:22'
+        fake_ifaces = {
+            netifaces.AF_LINK: [{'addr': fake_mac}]
+        }
         calls = {
             'device_exists': [mock.call('bridge')],
             '_execute': [
                 mock.call('brctl', 'addif', 'bridge', 'eth0',
                           run_as_root=True, check_exit_code=False),
+                mock.call('ip', 'link', 'set', 'bridge', 'address', fake_mac,
+                          run_as_root=True),
                 mock.call('ip', 'link', 'set', 'eth0', 'up',
                           run_as_root=True, check_exit_code=False),
                 mock.call('ip', 'route', 'show', 'dev', 'eth0'),
@@ -1141,12 +1151,15 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
             }
         with contextlib.nested(
             mock.patch.object(linux_net, 'device_exists', return_value=True),
-            mock.patch.object(linux_net, '_execute', return_value=('', ''))
-        ) as (device_exists, _execute):
+            mock.patch.object(linux_net, '_execute', return_value=('', '')),
+            mock.patch.object(netifaces, 'ifaddresses')
+        ) as (device_exists, _execute, ifaddresses):
+            ifaddresses.return_value = fake_ifaces
             driver = linux_net.LinuxBridgeInterfaceDriver()
             driver.ensure_bridge('bridge', 'eth0')
             device_exists.assert_has_calls(calls['device_exists'])
             _execute.assert_has_calls(calls['_execute'])
+            ifaddresses.assert_called_once_with('eth0')
 
     def test_ensure_bridge_brclt_addif_exception(self):
         def fake_execute(*cmd, **kwargs):
@@ -1163,6 +1176,22 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
             self.assertRaises(exception.NovaException,
                               driver.ensure_bridge, 'bridge', 'eth0')
             device_exists.assert_called_once_with('bridge')
+
+    def test_ensure_bridge_brclt_addbr_neutron_race(self):
+        def fake_execute(*cmd, **kwargs):
+            if ('brctl', 'addbr', 'brq1234567-89') == cmd:
+                return ('', "device brq1234567-89 already exists; "
+                            "can't create bridge with the same name\n")
+            else:
+                return ('', '')
+
+        with contextlib.nested(
+            mock.patch.object(linux_net, 'device_exists', return_value=False),
+            mock.patch.object(linux_net, '_execute', fake_execute)
+        ) as (device_exists, _):
+            driver = linux_net.LinuxBridgeInterfaceDriver()
+            driver.ensure_bridge('brq1234567-89', '')
+            device_exists.assert_called_once_with('brq1234567-89')
 
     def test_set_device_mtu_configured(self):
         self.flags(network_device_mtu=10000)
@@ -1364,6 +1393,38 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
 
         self.assertIn(expected_exists_args, mock_exists.mock_calls)
         self.assertEqual(expected_execute_args, mock_execute.mock_calls)
+
+    @mock.patch.object(linux_net, '_execute')
+    @mock.patch.object(linux_net, 'device_exists', return_value=False)
+    @mock.patch.object(linux_net, '_set_device_mtu')
+    def test_ensure_vlan(self, mock_set_device_mtu, mock_device_exists,
+                         mock_execute):
+        interface = linux_net.LinuxBridgeInterfaceDriver.ensure_vlan(
+                        1, 'eth0', 'MAC', 'MTU', "vlan_name")
+        self.assertEqual("vlan_name", interface)
+        mock_device_exists.assert_called_once_with('vlan_name')
+
+        expected_execute_args = [
+            mock.call('ip', 'link', 'add', 'link', 'eth0', 'name', 'vlan_name',
+                      'type', 'vlan', 'id', 1, check_exit_code=[0, 2, 254],
+                      run_as_root=True),
+            mock.call('ip', 'link', 'set', 'vlan_name', 'address', 'MAC',
+                       check_exit_code=[0, 2, 254], run_as_root=True),
+            mock.call('ip', 'link', 'set', 'vlan_name', 'up',
+                      check_exit_code=[0, 2, 254], run_as_root=True)]
+        self.assertEqual(expected_execute_args, mock_execute.mock_calls)
+        mock_set_device_mtu.assert_called_once_with('vlan_name', 'MTU')
+
+    @mock.patch.object(linux_net, '_execute')
+    @mock.patch.object(linux_net, 'device_exists', return_value=True)
+    @mock.patch.object(linux_net, '_set_device_mtu')
+    def test_ensure_vlan_device_exists(self, mock_set_device_mtu,
+                                       mock_device_exists, mock_execute):
+        interface = linux_net.LinuxBridgeInterfaceDriver.ensure_vlan(1, 'eth0')
+        self.assertEqual("vlan1", interface)
+        mock_device_exists.assert_called_once_with('vlan1')
+        self.assertFalse(mock_execute.called)
+        mock_set_device_mtu.assert_called_once_with('vlan1', None)
 
     @mock.patch('os.path.exists', return_value=True)
     @mock.patch('nova.utils.execute',

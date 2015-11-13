@@ -25,7 +25,9 @@ import time
 
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_log import versionutils
 from oslo_utils import timeutils
+import six
 
 from nova.api.ec2 import ec2utils
 from nova.api.ec2 import inst_state
@@ -47,7 +49,6 @@ from nova import network
 from nova.network.security_group import neutron_driver
 from nova.network.security_group import openstack_driver
 from nova import objects
-from nova.openstack.common import versionutils
 from nova import quota
 from nova import servicegroup
 from nova import utils
@@ -66,11 +67,14 @@ ec2_opts = [
                help='The internal IP address of the EC2 API server'),
     cfg.IntOpt('ec2_port',
                default=8773,
+               min=1,
+               max=65535,
                help='The port of the EC2 API server'),
     cfg.StrOpt('ec2_scheme',
                default='http',
+               choices=('http', 'https'),
                help='The protocol to use when connecting to the EC2 API '
-                    'server (http, https)'),
+                    'server'),
     cfg.StrOpt('ec2_path',
                default='/',
                help='The path prefix used to call the ec2 API server'),
@@ -587,7 +591,7 @@ class CloudController(vpc, object):
     def _cidr_args_split(self, kwargs):
         cidr_args_split = []
         cidrs = kwargs['ip_ranges']
-        for key, cidr in cidrs.iteritems():
+        for key, cidr in six.iteritems(cidrs):
             mykwargs = kwargs.copy()
             del mykwargs['ip_ranges']
             mykwargs['cidr_ip'] = cidr['cidr_ip']
@@ -597,7 +601,7 @@ class CloudController(vpc, object):
     def _groups_args_split(self, kwargs):
         groups_args_split = []
         groups = kwargs['groups']
-        for key, group in groups.iteritems():
+        for key, group in six.iteritems(groups):
             mykwargs = kwargs.copy()
             del mykwargs['groups']
             if 'group_name' in group:
@@ -754,7 +758,7 @@ class CloudController(vpc, object):
 
     def create_security_group(self, context, group_name, group_description,
                               vpc_id=None):
-        if isinstance(group_name, unicode):
+        if isinstance(group_name, six.text_type):
             group_name = utils.utf8(group_name)
         if CONF.ec2_strict_validation:
             # EC2 specification gives constraints for name and description:
@@ -1271,7 +1275,7 @@ class CloudController(vpc, object):
             i['keyName'] = instance.key_name
             i['tagSet'] = []
 
-            for k, v in utils.instance_meta(instance).iteritems():
+            for k, v in six.iteritems(utils.instance_meta(instance)):
                 i['tagSet'].append({'key': k, 'value': v})
 
             vpc_id = vpc._get_vpcid_from_tenantid(self, instance['project_id'], context)
@@ -1987,27 +1991,12 @@ class CloudController(vpc, object):
                               'task_state': instance.task_state})
                     raise exception.InternalError(message=err)
 
-        glance_uuid = instance.image_ref
-        ec2_image_id = ec2utils.glance_id_to_ec2_id(context, glance_uuid)
-        src_image = self._get_image(context, ec2_image_id)
-        image_meta = dict(src_image)
-
-        def _unmap_id_property(properties, name):
-            if properties[name]:
-                properties[name] = ec2utils.id_to_glance_id(context,
-                                                            properties[name])
-
-        # ensure the ID properties are unmapped back to the glance UUID
-        _unmap_id_property(image_meta['properties'], 'kernel_id')
-        _unmap_id_property(image_meta['properties'], 'ramdisk_id')
-
         # meaningful image name
         name_map = dict(instance=instance_uuid, now=timeutils.isotime())
         name = name or _('image of %(instance)s at %(now)s') % name_map
 
         new_image = self.compute_api.snapshot_volume_backed(context,
                                                             instance,
-                                                            image_meta,
                                                             name)
 
         ec2_id = ec2utils.glance_id_to_ec2_id(context, new_image['id'])

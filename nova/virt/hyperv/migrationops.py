@@ -24,6 +24,7 @@ from oslo_utils import units
 
 from nova import exception
 from nova.i18n import _, _LE
+from nova import objects
 from nova.virt import configdrive
 from nova.virt.hyperv import imagecache
 from nova.virt.hyperv import utilsfactory
@@ -56,7 +57,7 @@ class MigrationOps(object):
 
         instance_path = self._pathutils.get_instance_dir(instance_name)
         revert_path = self._pathutils.get_instance_migr_revert_dir(
-            instance_name, remove_dir=True)
+            instance_name, remove_dir=True, create_dir=True)
         dest_path = None
 
         try:
@@ -78,10 +79,10 @@ class MigrationOps(object):
                               {'disk_file': disk_file, 'dest_path': dest_path})
                     self._pathutils.copy(disk_file, dest_path)
 
-            self._pathutils.rename(instance_path, revert_path)
+            self._pathutils.move_folder_files(instance_path, revert_path)
 
             if same_host:
-                self._pathutils.rename(dest_path, instance_path)
+                self._pathutils.move_folder_files(dest_path, instance_path)
         except Exception:
             with excutils.save_and_reraise_exception():
                 self._cleanup_failed_disk_migration(instance_path, revert_path,
@@ -100,7 +101,7 @@ class MigrationOps(object):
             LOG.error(_LE("Cannot cleanup migration files"))
 
     def _check_target_flavor(self, instance, flavor):
-        new_root_gb = flavor['root_gb']
+        new_root_gb = flavor.root_gb
         curr_root_gb = instance.root_gb
 
         if new_root_gb < curr_root_gb:
@@ -173,7 +174,7 @@ class MigrationOps(object):
 
         eph_vhd_path = self._pathutils.lookup_ephemeral_vhd_path(instance_name)
 
-        image_meta = self._imagecache.get_image_details(context, instance)
+        image_meta = objects.ImageMeta.from_instance(instance)
         vm_gen = self._vmops.get_image_vm_generation(root_vhd_path, image_meta)
         self._vmops.create_instance(instance, network_info, block_device_info,
                                     root_vhd_path, eph_vhd_path, vm_gen)

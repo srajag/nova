@@ -40,13 +40,13 @@ import urllib
 
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_log import versionutils
+from oslo_utils import fileutils
 import routes
 import six
 import webob
 
 from nova.i18n import _LW
-from nova.openstack.common import fileutils
-from nova.openstack.common import versionutils
 from nova import paths
 from nova import utils
 from nova import wsgi
@@ -64,6 +64,8 @@ s3_opts = [
                help='IP address for S3 API to listen'),
     cfg.IntOpt('s3_listen_port',
                default=3333,
+               min=1,
+               max=65535,
                help='Port for S3 API to listen'),
 ]
 
@@ -202,7 +204,7 @@ class BaseRequestHandler(object):
         elif isinstance(value, datetime.datetime):
             parts.append(value.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
         elif isinstance(value, dict):
-            for name, subvalue in value.iteritems():
+            for name, subvalue in six.iteritems(value):
                 if not isinstance(subvalue, list):
                     subvalue = [subvalue]
                 for subsubvalue in subvalue:

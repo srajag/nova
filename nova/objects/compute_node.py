@@ -12,7 +12,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_config import cfg
 from oslo_serialization import jsonutils
+import six
 
 from nova import db
 from nova import exception
@@ -22,8 +24,13 @@ from nova.objects import fields
 from nova.objects import pci_device_pool
 from nova import utils
 
+CONF = cfg.CONF
+CONF.import_opt('cpu_allocation_ratio', 'nova.compute.resource_tracker')
+CONF.import_opt('ram_allocation_ratio', 'nova.compute.resource_tracker')
+
 
 # TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
 class ComputeNode(base.NovaPersistentObject, base.NovaObject,
                   base.NovaObjectDictCompat):
     # Version 1.0: Initial version
@@ -38,11 +45,14 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject,
     # Version 1.9: Added pci_device_pools
     # Version 1.10: Added get_first_node_by_host_for_old_compat()
     # Version 1.11: PciDevicePoolList version 1.1
-    VERSION = '1.11'
+    # Version 1.12: HVSpec version 1.1
+    # Version 1.13: Changed service_id field to be nullable
+    # Version 1.14: Added cpu_allocation_ratio and ram_allocation_ratio
+    VERSION = '1.14'
 
     fields = {
         'id': fields.IntegerField(read_only=True),
-        'service_id': fields.IntegerField(),
+        'service_id': fields.IntegerField(nullable=True),
         'host': fields.StringField(nullable=True),
         'vcpus': fields.IntegerField(),
         'memory_mb': fields.IntegerField(),
@@ -70,16 +80,36 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject,
         # pci_stats field in the database
         'pci_device_pools': fields.ObjectField('PciDevicePoolList',
                                                nullable=True),
+        'cpu_allocation_ratio': fields.FloatField(),
+        'ram_allocation_ratio': fields.FloatField(),
         }
 
     obj_relationships = {
         'pci_device_pools': [('1.9', '1.0'), ('1.11', '1.1')],
-        'supported_hv_specs': [('1.6', '1.0')],
+        'supported_hv_specs': [('1.6', '1.0'), ('1.12', '1.1')],
     }
 
     def obj_make_compatible(self, primitive, target_version):
         super(ComputeNode, self).obj_make_compatible(primitive, target_version)
         target_version = utils.convert_version_to_tuple(target_version)
+        if target_version < (1, 14):
+            if 'ram_allocation_ratio' in primitive:
+                del primitive['ram_allocation_ratio']
+            if 'cpu_allocation_ratio' in primitive:
+                del primitive['cpu_allocation_ratio']
+        if target_version < (1, 13) and primitive.get('service_id') is None:
+            # service_id is non-nullable in versions before 1.13
+            try:
+                service = objects.Service.get_by_compute_host(
+                    self._context, primitive['host'])
+                primitive['service_id'] = service.id
+            except (exception.ComputeHostNotFound, KeyError):
+                # NOTE(hanlind): In case anything goes wrong like service not
+                # found or host not being set, catch and set a fake value just
+                # to allow for older versions that demand a value to work.
+                # Setting to -1 will, if value is later used result in a
+                # ServiceNotFound, so should be safe.
+                primitive['service_id'] = -1
         if target_version < (1, 7) and 'host' in primitive:
             del primitive['host']
         if target_version < (1, 5) and 'numa_topology' in primitive:
@@ -129,7 +159,34 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject,
             ])
         fields = set(compute.fields) - special_cases
         for key in fields:
-            compute[key] = db_compute[key]
+            value = db_compute[key]
+            # NOTE(sbauza): Since all compute nodes don't possibly run the
+            # latest RT code updating allocation ratios, we need to provide
+            # a backwards compatible way of hydrating them.
+            # As we want to care about our operators and since we don't want to
+            # ask them to change their configuration files before upgrading, we
+            # prefer to hardcode the default values for the ratios here until
+            # the next release (Mitaka) where the opt default values will be
+            # restored for both cpu (16.0) and ram (1.5) allocation ratios.
+            # TODO(sbauza): Remove that in the next major version bump where
+            # we break compatibilility with old Kilo computes
+            if key == 'cpu_allocation_ratio' or key == 'ram_allocation_ratio':
+                if value == 0.0:
+                    # Operator has not yet provided a new value for that ratio
+                    # on the compute node
+                    value = None
+                if value is None:
+                    # ResourceTracker is not updating the value (old node)
+                    # or the compute node is updated but the default value has
+                    # not been changed
+                    value = getattr(CONF, key)
+                    if value == 0.0 and key == 'cpu_allocation_ratio':
+                        # It's not specified either on the controller
+                        value = 16.0
+                    if value == 0.0 and key == 'ram_allocation_ratio':
+                        # It's not specified either on the controller
+                        value = 1.5
+            compute[key] = value
 
         stats = db_compute['stats']
         if stats:
@@ -158,6 +215,8 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject,
         db_compute = db.compute_node_get(context, compute_id)
         return cls._from_db_object(context, cls(), db_compute)
 
+    # NOTE(hanlind): This is deprecated and should be removed on the next
+    # major version bump
     @base.remotable_classmethod
     def get_by_service_id(cls, context, service_id):
         db_computes = db.compute_nodes_get_by_service_id(context, service_id)
@@ -263,14 +322,31 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject,
     def destroy(self):
         db.compute_node_delete(self._context, self.id)
 
-    @property
-    def service(self):
-        if not hasattr(self, '_cached_service'):
-            self._cached_service = objects.Service.get_by_id(self._context,
-                                                             self.service_id)
-        return self._cached_service
+    def update_from_virt_driver(self, resources):
+        # NOTE(pmurray): the virt driver provides a dict of values that
+        # can be copied into the compute node. The names and representation
+        # do not exactly match.
+        # TODO(pmurray): the resources dict should be formalized.
+        keys = ["vcpus", "memory_mb", "local_gb", "cpu_info",
+                "vcpus_used", "memory_mb_used", "local_gb_used",
+                "numa_topology", "hypervisor_type",
+                "hypervisor_version", "hypervisor_hostname",
+                "disk_available_least", "host_ip"]
+        for key in keys:
+            if key in resources:
+                self[key] = resources[key]
+
+        # supported_instances has a different name in compute_node
+        # TODO(pmurray): change virt drivers not to json encode
+        # values they add to the resources dict
+        if 'supported_instances' in resources:
+            si = resources['supported_instances']
+            if isinstance(si, six.string_types):
+                si = jsonutils.loads(si)
+            self.supported_hv_specs = [objects.HVSpec.from_list(s) for s in si]
 
 
+@base.NovaObjectRegistry.register
 class ComputeNodeList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     #              ComputeNode <= version 1.2
@@ -285,24 +361,20 @@ class ComputeNodeList(base.ObjectListBase, base.NovaObject):
     # Version 1.9 ComputeNode version 1.9
     # Version 1.10 ComputeNode version 1.10
     # Version 1.11 ComputeNode version 1.11
-    VERSION = '1.11'
+    # Version 1.12 ComputeNode version 1.12
+    # Version 1.13 ComputeNode version 1.13
+    # Version 1.14 ComputeNode version 1.14
+    VERSION = '1.14'
     fields = {
         'objects': fields.ListOfObjectsField('ComputeNode'),
         }
-    child_versions = {
-        '1.0': '1.2',
-        # NOTE(danms): ComputeNode was at 1.2 before we added this
-        '1.1': '1.3',
-        '1.2': '1.3',
-        '1.3': '1.4',
-        '1.4': '1.5',
-        '1.5': '1.5',
-        '1.6': '1.6',
-        '1.7': '1.7',
-        '1.8': '1.8',
-        '1.9': '1.9',
-        '1.10': '1.10',
-        '1.11': '1.11',
+    # NOTE(danms): ComputeNode was at 1.2 before we added this
+    obj_relationships = {
+        'objects': [('1.0', '1.2'), ('1.1', '1.3'), ('1.2', '1.3'),
+                    ('1.3', '1.4'), ('1.4', '1.5'), ('1.5', '1.5'),
+                    ('1.6', '1.6'), ('1.7', '1.7'), ('1.8', '1.8'),
+                    ('1.9', '1.9'), ('1.10', '1.10'), ('1.11', '1.11'),
+                    ('1.12', '1.12'), ('1.13', '1.13'), ('1.14', '1.14')],
         }
 
     @base.remotable_classmethod
@@ -318,6 +390,8 @@ class ComputeNodeList(base.ObjectListBase, base.NovaObject):
         return base.obj_make_list(context, cls(context), objects.ComputeNode,
                                   db_computes)
 
+    # NOTE(hanlind): This is deprecated and should be removed on the next
+    # major version bump
     @base.remotable_classmethod
     def _get_by_service(cls, context, service_id, use_slave=False):
         try:
@@ -329,10 +403,6 @@ class ComputeNodeList(base.ObjectListBase, base.NovaObject):
             db_computes = []
         return base.obj_make_list(context, cls(context), objects.ComputeNode,
                                   db_computes)
-
-    @classmethod
-    def get_by_service(cls, context, service, use_slave=False):
-        return cls._get_by_service(context, service.id, use_slave=use_slave)
 
     @base.remotable_classmethod
     def get_all_by_host(cls, context, host, use_slave=False):

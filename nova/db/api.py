@@ -488,25 +488,26 @@ def migration_get_all_by_filters(context, filters):
 
 
 def fixed_ip_associate(context, address, instance_uuid, network_id=None,
-                       reserved=False):
+                       reserved=False, virtual_interface_id=None):
     """Associate fixed ip to instance.
 
     Raises if fixed ip is not available.
 
     """
     return IMPL.fixed_ip_associate(context, address, instance_uuid, network_id,
-                                   reserved)
+                                   reserved, virtual_interface_id)
 
 
 def fixed_ip_associate_pool(context, network_id, instance_uuid=None,
-                            host=None):
+                            host=None, virtual_interface_id=None):
     """Find free ip in network and associate it to instance or host.
 
     Raises if one is not available.
 
     """
     return IMPL.fixed_ip_associate_pool(context, network_id,
-                                        instance_uuid, host)
+                                        instance_uuid, host,
+                                        virtual_interface_id)
 
 
 def fixed_ip_create(context, values):
@@ -633,16 +634,9 @@ def instance_create(context, values):
     return IMPL.instance_create(context, values)
 
 
-def instance_destroy(context, instance_uuid, constraint=None,
-        update_cells=True):
+def instance_destroy(context, instance_uuid, constraint=None):
     """Destroy the instance or raise if it does not exist."""
-    rv = IMPL.instance_destroy(context, instance_uuid, constraint)
-    if update_cells:
-        try:
-            cells_rpcapi.CellsAPI().instance_destroy_at_top(context, rv)
-        except Exception:
-            LOG.exception(_LE("Failed to notify cells of instance destroy"))
-    return rv
+    return IMPL.instance_destroy(context, instance_uuid, constraint)
 
 
 def instance_get_by_uuid(context, uuid, columns_to_join=None, use_slave=False):
@@ -726,6 +720,11 @@ def instance_get_all_by_host_and_not_type(context, host, type_id=None):
     return IMPL.instance_get_all_by_host_and_not_type(context, host, type_id)
 
 
+def instance_get_all_by_grantee_security_groups(context, group_ids):
+    """Get instances with rules granted to them by a list of secgroups ids."""
+    return IMPL.instance_get_all_by_grantee_security_groups(context, group_ids)
+
+
 def instance_floating_address_get_all(context, instance_uuid):
     """Get all floating ip addresses of an instance."""
     return IMPL.instance_floating_address_get_all(context, instance_uuid)
@@ -737,27 +736,18 @@ def instance_get_all_hung_in_rebooting(context, reboot_window):
     return IMPL.instance_get_all_hung_in_rebooting(context, reboot_window)
 
 
-def instance_update(context, instance_uuid, values, update_cells=True):
+def instance_update(context, instance_uuid, values, expected=None):
     """Set the given properties on an instance and update it.
 
     Raises NotFound if instance does not exist.
 
     """
-    rv = IMPL.instance_update(context, instance_uuid, values)
-    if update_cells:
-        try:
-            cells_rpcapi.CellsAPI().instance_update_at_top(context, rv)
-        except Exception:
-            LOG.exception(_LE("Failed to notify cells of instance update"))
-    return rv
+    return IMPL.instance_update(context, instance_uuid, values,
+                                expected=expected)
 
 
-# FIXME(comstud): 'update_cells' is temporary as we transition to using
-# objects.  When everything is using Instance.save(), we can remove the
-# argument and the RPC to nova-cells.
 def instance_update_and_get_original(context, instance_uuid, values,
-                                     update_cells=True,
-                                     columns_to_join=None):
+                                     columns_to_join=None, expected=None):
     """Set the given properties on an instance and update it. Return
     a shallow copy of the original instance reference, as well as the
     updated one.
@@ -771,12 +761,8 @@ def instance_update_and_get_original(context, instance_uuid, values,
     Raises NotFound if instance does not exist.
     """
     rv = IMPL.instance_update_and_get_original(context, instance_uuid, values,
-                                               columns_to_join=columns_to_join)
-    if update_cells:
-        try:
-            cells_rpcapi.CellsAPI().instance_update_at_top(context, rv[1])
-        except Exception:
-            LOG.exception(_LE("Failed to notify cells of instance update"))
+                                               columns_to_join=columns_to_join,
+                                               expected=expected)
     return rv
 
 
@@ -849,23 +835,6 @@ def instance_group_member_delete(context, group_uuid, instance_id):
 def instance_group_members_get(context, group_uuid):
     """Get the members from the group."""
     return IMPL.instance_group_members_get(context, group_uuid)
-
-
-def instance_group_policies_add(context, group_uuid, policies,
-                                set_delete=False):
-    """Add policies to the group."""
-    return IMPL.instance_group_policies_add(context, group_uuid, policies,
-                                            set_delete=set_delete)
-
-
-def instance_group_policy_delete(context, group_uuid, policy):
-    """Delete a specific policy from the group."""
-    return IMPL.instance_group_policy_delete(context, group_uuid, policy)
-
-
-def instance_group_policies_get(context, group_uuid):
-    """Get the policies from the group."""
-    return IMPL.instance_group_policies_get(context, group_uuid)
 
 
 ###################
@@ -1334,13 +1303,6 @@ def security_group_rule_get_by_security_group(context, security_group_id,
         context, security_group_id, columns_to_join=columns_to_join)
 
 
-def security_group_rule_get_by_security_group_grantee(context,
-                                                      security_group_id):
-    """Get all rules that grant access to the given security group."""
-    return IMPL.security_group_rule_get_by_security_group_grantee(context,
-                                                             security_group_id)
-
-
 def security_group_rule_destroy(context, security_group_rule_id):
     """Deletes a security group rule."""
     return IMPL.security_group_rule_destroy(context, security_group_rule_id)
@@ -1751,12 +1713,6 @@ def aggregate_metadata_get_by_host(context, host, key=None):
     return IMPL.aggregate_metadata_get_by_host(context, host, key)
 
 
-def aggregate_metadata_get_by_metadata_key(context, aggregate_id, key):
-    """Get metadata for an aggregate by metadata key."""
-    return IMPL.aggregate_metadata_get_by_metadata_key(context, aggregate_id,
-                                                        key)
-
-
 def aggregate_get_by_metadata_key(context, key):
     return IMPL.aggregate_get_by_metadata_key(context, key)
 
@@ -1952,19 +1908,6 @@ def archive_deleted_rows_for_table(context, tablename, max_rows=None):
                                                max_rows=max_rows)
 
 
-def migrate_flavor_data(context, max_count, flavor_cache):
-    """Migrate instance flavor data from system_metadata to instance_extra.
-
-    :param max_count: The maximum number of instances to consider in this
-                      run.
-    :param flavor_cache: A dict to persist flavor information in across
-                         calls (just pass an empty dict here)
-    :returns: number of instances needing migration, number of instances
-              migrated (both will always be less than max_count)
-    """
-    return IMPL.migrate_flavor_data(context, max_count, flavor_cache)
-
-
 ####################
 
 
@@ -1991,3 +1934,8 @@ def instance_tag_delete(context, instance_uuid, tag):
 def instance_tag_delete_all(context, instance_uuid):
     """Delete all tags from the instance."""
     return IMPL.instance_tag_delete_all(context, instance_uuid)
+
+
+def instance_tag_exists(context, instance_uuid, tag):
+    """Check if specified tag exist on the instance."""
+    return IMPL.instance_tag_exists(context, instance_uuid, tag)

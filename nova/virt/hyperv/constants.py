@@ -20,6 +20,7 @@ Constants used in ops classes
 from nova.compute import arch
 from nova.compute import power_state
 
+HYPERV_VM_STATE_OTHER = 1
 HYPERV_VM_STATE_ENABLED = 2
 HYPERV_VM_STATE_DISABLED = 3
 HYPERV_VM_STATE_SHUTTING_DOWN = 4
@@ -93,9 +94,13 @@ HOST_POWER_ACTION_SHUTDOWN = "shutdown"
 HOST_POWER_ACTION_REBOOT = "reboot"
 HOST_POWER_ACTION_STARTUP = "startup"
 
-IMAGE_PROP_VM_GEN = "hw_machine_type"
 IMAGE_PROP_VM_GEN_1 = "hyperv-gen1"
 IMAGE_PROP_VM_GEN_2 = "hyperv-gen2"
 
 VM_GEN_1 = 1
 VM_GEN_2 = 2
+
+JOB_STATE_COMPLETED = 7
+JOB_STATE_TERMINATED = 8
+JOB_STATE_KILLED = 9
+JOB_STATE_COMPLETED_WITH_WARNINGS = 32768

@@ -100,6 +100,13 @@ represented in target_provision_state.
 CLEANING = 'cleaning'
 """ Node is being automatically cleaned to prepare it for provisioning. """
 
+CLEANWAIT = 'clean wait'
+""" Node is waiting for a clean step to be finished.
+
+This will be the node's `provision_state` while the node is waiting for
+the driver to finish a cleaning step.
+"""
+
 CLEANFAIL = 'clean failed'
 """ Node failed cleaning. This requires operator intervention to resolve. """
 
@@ -121,7 +128,6 @@ This is the provision state used when inspection is started. A successfully
 inspected node shall transition to MANAGEABLE status.
 """
 
-
 INSPECTFAIL = 'inspect failed'
 """ Node inspection failed. """
 
@@ -138,3 +144,13 @@ POWER_OFF = 'power off'
 
 REBOOT = 'rebooting'
 """ Node is rebooting. """
+
+##################
+# Helper constants
+##################
+
+PROVISION_STATE_LIST = (NOSTATE, MANAGEABLE, AVAILABLE, ACTIVE, DEPLOYWAIT,
+                        DEPLOYING, DEPLOYFAIL, DEPLOYDONE, DELETING, DELETED,
+                        CLEANING, CLEANWAIT, CLEANFAIL, ERROR, REBUILD,
+                        INSPECTING, INSPECTFAIL)
+""" A list of all provision states. """

@@ -26,6 +26,7 @@ from nova.compute import flavors
 from nova.compute import task_states
 from nova.compute import vm_states
 from nova import context
+from nova import exception
 from nova.network import api as network_api
 from nova import notifications
 from nova import objects
@@ -68,6 +69,8 @@ class NotificationsTestCase(test.TestCase):
         self.context = context.RequestContext(self.user_id, self.project_id)
 
         self.instance = self._wrapped_create()
+
+        self.decorated_function_called = False
 
     def _wrapped_create(self, params=None):
         instance_type = flavors.get_flavor_by_name('m1.tiny')
@@ -431,6 +434,57 @@ class NotificationsTestCase(test.TestCase):
 
         notifications.send_update(self.context, self.instance, self.instance)
         self.assertEqual(0, len(fake_notifier.NOTIFICATIONS))
+
+    @mock.patch.object(notifications.LOG, 'exception')
+    def test_fail_sending_update_instance_not_found(self, mock_log_exception):
+        # Tests that InstanceNotFound is handled as an expected exception and
+        # not logged as an error.
+        notfound = exception.InstanceNotFound(instance_id=self.instance.uuid)
+        with mock.patch.object(notifications,
+                               '_send_instance_update_notification',
+                               side_effect=notfound):
+            notifications.send_update(
+                self.context, self.instance, self.instance)
+        self.assertEqual(0, len(fake_notifier.NOTIFICATIONS))
+        self.assertEqual(0, mock_log_exception.call_count)
+
+    @mock.patch.object(notifications.LOG, 'exception')
+    def test_fail_send_update_with_states_inst_not_found(self,
+                                                         mock_log_exception):
+        # Tests that InstanceNotFound is handled as an expected exception and
+        # not logged as an error.
+        notfound = exception.InstanceNotFound(instance_id=self.instance.uuid)
+        with mock.patch.object(notifications,
+                               '_send_instance_update_notification',
+                               side_effect=notfound):
+            notifications.send_update_with_states(
+                self.context, self.instance,
+                vm_states.BUILDING, vm_states.ERROR,
+                task_states.NETWORKING, new_task_state=None)
+        self.assertEqual(0, len(fake_notifier.NOTIFICATIONS))
+        self.assertEqual(0, mock_log_exception.call_count)
+
+    def _decorated_function(self, arg1, arg2):
+        self.decorated_function_called = True
+
+    def test_notify_decorator(self):
+        func_name = self._decorated_function.__name__
+
+        # Decorated with notify_decorator like monkey_patch
+        self._decorated_function = notifications.notify_decorator(
+            func_name,
+            self._decorated_function)
+
+        ctxt = o_context.RequestContext()
+
+        self._decorated_function(1, ctxt)
+
+        self.assertEqual(1, len(fake_notifier.NOTIFICATIONS))
+        n = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(n.priority, 'INFO')
+        self.assertEqual(n.event_type, func_name)
+        self.assertEqual(n.context, ctxt)
+        self.assertTrue(self.decorated_function_called)
 
 
 class NotificationsFormatTestCase(test.NoDBTestCase):

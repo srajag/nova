@@ -15,6 +15,8 @@
 
 import mock
 
+from six.moves import range
+
 from nova import exception
 from nova import test
 from nova.virt.hyperv import constants
@@ -119,7 +121,7 @@ class VMUtilsTestCase(test.NoDBTestCase):
 
     def test_lookup_vm_none(self):
         self._vmutils._conn.Msvm_ComputerSystem.return_value = []
-        self.assertRaises(exception.NotFound,
+        self.assertRaises(exception.InstanceNotFound,
                           self._vmutils._lookup_vm_check,
                           self._FAKE_VM_NAME)
 
@@ -255,27 +257,31 @@ class VMUtilsTestCase(test.NoDBTestCase):
 
     @mock.patch("nova.virt.hyperv.vmutils.VMUtils.get_attached_disks")
     def test_get_free_controller_slot(self, mock_get_attached_disks):
-        mock_disk = mock.MagicMock()
-        mock_disk.AddressOnParent = 3
-        mock_get_attached_disks.return_value = [mock_disk]
+        with mock.patch.object(self._vmutils,
+                               '_get_disk_resource_address') as mock_get_addr:
+            mock_get_addr.return_value = 3
+            mock_get_attached_disks.return_value = [mock.sentinel.disk]
 
-        response = self._vmutils.get_free_controller_slot(
-            self._FAKE_CTRL_PATH)
+            response = self._vmutils.get_free_controller_slot(
+                self._FAKE_CTRL_PATH)
 
-        mock_get_attached_disks.assert_called_once_with(
-            self._FAKE_CTRL_PATH)
+            mock_get_attached_disks.assert_called_once_with(
+                self._FAKE_CTRL_PATH)
 
-        self.assertEqual(response, 0)
+            self.assertEqual(response, 0)
 
     def test_get_free_controller_slot_exception(self):
-        fake_drive = mock.MagicMock()
-        type(fake_drive).AddressOnParent = mock.PropertyMock(
-            side_effect=xrange(constants.SCSI_CONTROLLER_SLOTS_NUMBER))
+        mock_get_address = mock.Mock()
+        mock_get_address.side_effect = range(
+            constants.SCSI_CONTROLLER_SLOTS_NUMBER)
 
-        with mock.patch.object(self._vmutils,
-                'get_attached_disks') as fake_get_attached_disks:
-            fake_get_attached_disks.return_value = (
-                [fake_drive] * constants.SCSI_CONTROLLER_SLOTS_NUMBER)
+        mock_get_attached_disks = mock.Mock()
+        mock_get_attached_disks.return_value = (
+            [mock.sentinel.drive] * constants.SCSI_CONTROLLER_SLOTS_NUMBER)
+
+        with mock.patch.multiple(self._vmutils,
+                                 get_attached_disks=mock_get_attached_disks,
+                                 _get_disk_resource_address=mock_get_address):
             self.assertRaises(vmutils.HyperVException,
                               self._vmutils.get_free_controller_slot,
                               mock.sentinel.scsi_controller_path)
@@ -390,6 +396,17 @@ class VMUtilsTestCase(test.NoDBTestCase):
 
             mock_add_virt_res.assert_called_with(mock_nic, self._FAKE_VM_PATH)
 
+    @mock.patch.object(vmutils.VMUtils, '_get_nic_data_by_name')
+    def test_destroy_nic(self, mock_get_nic_data_by_name):
+        self._lookup_vm()
+        fake_nic_data = mock_get_nic_data_by_name.return_value
+        with mock.patch.object(self._vmutils,
+                '_remove_virt_resource') as mock_rem_virt_res:
+            self._vmutils.destroy_nic(self._FAKE_VM_NAME,
+                                      mock.sentinel.FAKE_NIC_NAME)
+            mock_rem_virt_res.assert_called_once_with(fake_nic_data,
+                                                      self._FAKE_VM_PATH)
+
     def test_set_vm_state(self):
         mock_vm = self._lookup_vm()
         mock_vm.RequestStateChange.return_value = (
@@ -426,6 +443,11 @@ class VMUtilsTestCase(test.NoDBTestCase):
 
     def test_wait_for_job_done(self):
         mockjob = self._prepare_wait_for_job(constants.WMI_JOB_STATE_COMPLETED)
+        job = self._vmutils._wait_for_job(self._FAKE_JOB_PATH)
+        self.assertEqual(mockjob, job)
+
+    def test_wait_for_job_killed(self):
+        mockjob = self._prepare_wait_for_job(constants.JOB_STATE_KILLED)
         job = self._vmutils._wait_for_job(self._FAKE_JOB_PATH)
         self.assertEqual(mockjob, job)
 
@@ -555,16 +577,24 @@ class VMUtilsTestCase(test.NoDBTestCase):
 
             mock_rm_virt_res.assert_called_with(mock_disk, self._FAKE_VM_PATH)
 
-    def test_get_mounted_disk_resource_from_path(self):
+    def _test_get_mounted_disk_resource_from_path(self, is_physical):
         mock_disk_1 = mock.MagicMock()
         mock_disk_2 = mock.MagicMock()
-        mock_disk_2.HostResource = [self._FAKE_MOUNTED_DISK_PATH]
+        conn_attr = (self._vmutils._PHYS_DISK_CONNECTION_ATTR if is_physical
+                     else self._vmutils._VIRT_DISK_CONNECTION_ATTR)
+        setattr(mock_disk_2, conn_attr, [self._FAKE_MOUNTED_DISK_PATH])
         self._vmutils._conn.query.return_value = [mock_disk_1, mock_disk_2]
 
-        physical_disk = self._vmutils._get_mounted_disk_resource_from_path(
-            self._FAKE_MOUNTED_DISK_PATH, True)
+        mounted_disk = self._vmutils._get_mounted_disk_resource_from_path(
+            self._FAKE_MOUNTED_DISK_PATH, is_physical)
 
-        self.assertEqual(mock_disk_2, physical_disk)
+        self.assertEqual(mock_disk_2, mounted_disk)
+
+    def test_get_physical_mounted_disk_resource_from_path(self):
+        self._test_get_mounted_disk_resource_from_path(is_physical=True)
+
+    def test_get_virtual_mounted_disk_resource_from_path(self):
+        self._test_get_mounted_disk_resource_from_path(is_physical=False)
 
     def test_get_controller_volume_paths(self):
         self._prepare_mock_disk()
@@ -627,6 +657,9 @@ class VMUtilsTestCase(test.NoDBTestCase):
         ret_val = self._vmutils.get_vm_serial_port_connection(
             self._FAKE_VM_NAME, update_connection=new_connection)
 
+        mock_vmsettings[0].associators.assert_called_once_with(
+            wmi_result_class=self._vmutils._SERIAL_PORT_SETTING_DATA_CLASS)
+
         if new_connection:
             self.assertEqual(new_connection, ret_val)
             fake_modify.assert_called_once_with(fake_serial_port,
@@ -645,7 +678,9 @@ class VMUtilsTestCase(test.NoDBTestCase):
         attrs = {'ElementName': 'fake_name',
                  'Notes': '4f54fb69-d3a2-45b7-bb9b-b6e6b3d893b3'}
         vs.configure_mock(**attrs)
-        self._vmutils._conn.Msvm_VirtualSystemSettingData.return_value = [vs]
+        vs2 = mock.MagicMock(ElementName='fake_name2', Notes=None)
+        self._vmutils._conn.Msvm_VirtualSystemSettingData.return_value = [vs,
+                                                                          vs2]
         response = self._vmutils.list_instance_notes()
 
         self.assertEqual([(attrs['ElementName'], [attrs['Notes']])], response)
@@ -783,3 +818,101 @@ class VMUtilsTestCase(test.NoDBTestCase):
 
         self._vmutils._conn.query.assert_called_once_with(expected_query)
         self.assertEqual(expected_disks, ret_disks)
+
+    def _get_fake_instance_notes(self):
+        return self._FAKE_VM_UUID
+
+    def test_instance_notes(self):
+        self._lookup_vm()
+        mock_vm_settings = mock.Mock()
+        mock_vm_settings.Notes = self._get_fake_instance_notes()
+        self._vmutils._get_vm_setting_data = mock.Mock(
+            return_value=mock_vm_settings)
+
+        notes = self._vmutils._get_instance_notes(mock.sentinel.vm_name)
+
+        self.assertEqual(notes[0], self._FAKE_VM_UUID)
+
+    def test_get_event_wql_query(self):
+        cls = self._vmutils._COMPUTER_SYSTEM_CLASS
+        field = self._vmutils._VM_ENABLED_STATE_PROP
+        timeframe = 10
+        filtered_states = [constants.HYPERV_VM_STATE_ENABLED,
+                           constants.HYPERV_VM_STATE_DISABLED]
+
+        expected_checks = ' OR '.join(
+            ["TargetInstance.%s = '%s'" % (field, state)
+             for state in filtered_states])
+        expected_query = (
+            "SELECT %(field)s, TargetInstance "
+            "FROM __InstanceModificationEvent "
+            "WITHIN %(timeframe)s "
+            "WHERE TargetInstance ISA '%(class)s' "
+            "AND TargetInstance.%(field)s != "
+            "PreviousInstance.%(field)s "
+            "AND (%(checks)s)" %
+                {'class': cls,
+                 'field': field,
+                 'timeframe': timeframe,
+                 'checks': expected_checks})
+
+        query = self._vmutils._get_event_wql_query(
+            cls=cls, field=field, timeframe=timeframe,
+            filtered_states=filtered_states)
+        self.assertEqual(expected_query, query)
+
+    def test_get_vm_power_state_change_listener(self):
+        with mock.patch.object(self._vmutils,
+                               '_get_event_wql_query') as mock_get_query:
+            listener = self._vmutils.get_vm_power_state_change_listener(
+                mock.sentinel.timeframe,
+                mock.sentinel.filtered_states)
+
+            mock_get_query.assert_called_once_with(
+                cls=self._vmutils._COMPUTER_SYSTEM_CLASS,
+                field=self._vmutils._VM_ENABLED_STATE_PROP,
+                timeframe=mock.sentinel.timeframe,
+                filtered_states=mock.sentinel.filtered_states)
+            watcher = self._vmutils._conn.Msvm_ComputerSystem.watch_for
+            watcher.assert_called_once_with(
+                raw_wql=mock_get_query.return_value,
+                fields=[self._vmutils._VM_ENABLED_STATE_PROP])
+
+            self.assertEqual(watcher.return_value, listener)
+
+    def test_get_vm_generation_gen1(self):
+        ret = self._vmutils.get_vm_generation(mock.sentinel.FAKE_VM_NAME)
+        self.assertEqual(constants.VM_GEN_1, ret)
+
+    def test_stop_vm_jobs(self):
+        mock_vm = self._lookup_vm()
+
+        mock_job1 = mock.MagicMock(Cancellable=True)
+        mock_job2 = mock.MagicMock(Cancellable=True)
+        mock_job3 = mock.MagicMock(Cancellable=True)
+
+        mock_job1.JobState = 2
+        mock_job2.JobState = 3
+        mock_job3.JobState = constants.JOB_STATE_KILLED
+
+        mock_vm_jobs = [mock_job1, mock_job2, mock_job3]
+
+        mock_vm.associators.return_value = mock_vm_jobs
+
+        self._vmutils.stop_vm_jobs(mock.sentinel.FAKE_VM_NAME)
+
+        mock_job1.RequestStateChange.assert_called_once_with(
+            self._vmutils._KILL_JOB_STATE_CHANGE_REQUEST)
+        mock_job2.RequestStateChange.assert_called_once_with(
+            self._vmutils._KILL_JOB_STATE_CHANGE_REQUEST)
+        self.assertFalse(mock_job3.RequestStateChange.called)
+
+    def test_is_job_completed_true(self):
+        job = mock.MagicMock(JobState=constants.JOB_STATE_COMPLETED)
+
+        self.assertTrue(self._vmutils._is_job_completed(job))
+
+    def test_is_job_completed_false(self):
+        job = mock.MagicMock(JobState=constants.WMI_JOB_STATE_RUNNING)
+
+        self.assertFalse(self._vmutils._is_job_completed(job))

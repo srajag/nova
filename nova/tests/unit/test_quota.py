@@ -18,6 +18,7 @@ import datetime
 
 from oslo_config import cfg
 from oslo_utils import timeutils
+from six.moves import range
 
 from nova import compute
 from nova.compute import flavors
@@ -86,9 +87,12 @@ class QuotaIntegrationTestCase(test.TestCase):
                                     instance_type=inst_type,
                                     image_href=image_uuid)
         except exception.QuotaError as e:
-            expected_kwargs = {'code': 413, 'resource': 'cores', 'req': 1,
-                          'used': 4, 'allowed': 4, 'overs': 'cores,instances'}
-            self.assertEqual(e.kwargs, expected_kwargs)
+            expected_kwargs = {'code': 413,
+                               'req': '1, 1',
+                               'used': '4, 2',
+                               'allowed': '4, 2',
+                               'overs': 'cores, instances'}
+            self.assertEqual(expected_kwargs, e.kwargs)
         else:
             self.fail('Expected QuotaError exception')
         for instance_uuid in instance_uuids:
@@ -103,9 +107,12 @@ class QuotaIntegrationTestCase(test.TestCase):
                                     instance_type=inst_type,
                                     image_href=image_uuid)
         except exception.QuotaError as e:
-            expected_kwargs = {'code': 413, 'resource': 'cores', 'req': 1,
-                          'used': 4, 'allowed': 4, 'overs': 'cores'}
-            self.assertEqual(e.kwargs, expected_kwargs)
+            expected_kwargs = {'code': 413,
+                               'req': '1',
+                               'used': '4',
+                               'allowed': '4',
+                               'overs': 'cores'}
+            self.assertEqual(expected_kwargs, e.kwargs)
         else:
             self.fail('Expected QuotaError exception')
         db.instance_destroy(self.context, instance['uuid'])
@@ -174,39 +181,39 @@ class QuotaIntegrationTestCase(test.TestCase):
 
     def test_max_injected_files(self):
         files = []
-        for i in xrange(CONF.quota_injected_files):
+        for i in range(CONF.quota_injected_files):
             files.append(('/my/path%d' % i, 'config = test\n'))
         self._create_with_injected_files(files)  # no QuotaError
 
     def test_too_many_injected_files(self):
         files = []
-        for i in xrange(CONF.quota_injected_files + 1):
+        for i in range(CONF.quota_injected_files + 1):
             files.append(('/my/path%d' % i, 'my\ncontent%d\n' % i))
         self.assertRaises(exception.QuotaError,
                           self._create_with_injected_files, files)
 
     def test_max_injected_file_content_bytes(self):
         max = CONF.quota_injected_file_content_bytes
-        content = ''.join(['a' for i in xrange(max)])
+        content = ''.join(['a' for i in range(max)])
         files = [('/test/path', content)]
         self._create_with_injected_files(files)  # no QuotaError
 
     def test_too_many_injected_file_content_bytes(self):
         max = CONF.quota_injected_file_content_bytes
-        content = ''.join(['a' for i in xrange(max + 1)])
+        content = ''.join(['a' for i in range(max + 1)])
         files = [('/test/path', content)]
         self.assertRaises(exception.QuotaError,
                           self._create_with_injected_files, files)
 
     def test_max_injected_file_path_bytes(self):
         max = CONF.quota_injected_file_path_length
-        path = ''.join(['a' for i in xrange(max)])
+        path = ''.join(['a' for i in range(max)])
         files = [(path, 'config = quotatest')]
         self._create_with_injected_files(files)  # no QuotaError
 
     def test_too_many_injected_file_path_bytes(self):
         max = CONF.quota_injected_file_path_length
-        path = ''.join(['a' for i in xrange(max + 1)])
+        path = ''.join(['a' for i in range(max + 1)])
         files = [(path, 'config = quotatest')]
         self.assertRaises(exception.QuotaError,
                           self._create_with_injected_files, files)
