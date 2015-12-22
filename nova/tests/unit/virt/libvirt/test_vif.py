@@ -332,6 +332,16 @@ class LibvirtVifTestCase(test.NoDBTestCase):
               ovs_interfaceid='aaa-bbb-ccc'
               )
 
+    vif_vhostuser_vrouter = network_model.VIF(id='vif-xxx-yyy-zzz',
+              address='ca:fe:de:ad:be:ef',
+              network=network_bridge,
+              type=network_model.VIF_TYPE_VHOSTUSER,
+              details = {network_model.VIF_DETAILS_VHOSTUSER_MODE: 'client',
+                       network_model.VIF_DETAILS_VHOSTUSER_SOCKET:
+                                                        '/tmp/usv-xxx-yyy-zzz',
+                       network_model.VIF_DETAILS_VHOSTUSER_VROUTER_PLUG: True},
+              )
+
     vif_vhostuser_no_path = network_model.VIF(id='vif-xxx-yyy-zzz',
           address='ca:fe:de:ad:be:ef',
           network=network_bridge,
@@ -361,7 +371,8 @@ class LibvirtVifTestCase(test.NoDBTestCase):
           type=network_model.VIF_TYPE_MACVTAP)
 
     instance = objects.Instance(id=1,
-                                uuid='f0000000-0000-0000-0000-000000000001')
+                                uuid='f0000000-0000-0000-0000-000000000001',
+                                project_id=1, display_name='Instance 1')
 
     bandwidth = {
         'quota:vif_inbound_peak': '200',
@@ -952,6 +963,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
                     '--mac=ca:fe:de:ad:be:ef '
                     '--tap_name=tap-xxx-yyy-zzz '
                     '--port_type=NovaVMPort '
+                    '--vif_type=Vrouter '
                     '--tx_vlan_id=-1 '
                     '--rx_vlan_id=-1', run_as_root=True)])
 
@@ -1446,3 +1458,87 @@ class LibvirtVifTestCase(test.NoDBTestCase):
             execute.assert_has_calls(calls['execute'])
             delete_ovs_vif_port.assert_has_calls(calls['delete_ovs_vif_port'])
             delete_fp_dev.assert_has_calls(calls['delete_fp_dev'])
+
+    def test_vhostuser_driver_vrouter(self):
+        d = vif.LibvirtGenericVIFDriver()
+        xml = self._get_instance_xml(d,
+                                     self.vif_vhostuser_vrouter)
+        node = self._get_node(xml)
+        self.assertEqual(node.get("type"),
+                         network_model.VIF_TYPE_VHOSTUSER)
+
+        self._assertTypeEquals(node, network_model.VIF_TYPE_VHOSTUSER,
+                               "source", "mode", "client")
+        self._assertTypeEquals(node, network_model.VIF_TYPE_VHOSTUSER,
+                               "source", "path", "/tmp/usv-xxx-yyy-zzz")
+        self._assertTypeEquals(node, network_model.VIF_TYPE_VHOSTUSER,
+                               "source", "type", "unix")
+        self._assertMacEquals(node, self.vif_vhostuser_vrouter)
+        self._assertModel(xml, network_model.VIF_MODEL_VIRTIO)
+
+    def test_vhostuser_vrouter_plug(self):
+        calls = {
+            '_vrouter_port_add': [mock.call(self.instance,
+                                  self.vif_vhostuser_vrouter)]
+        }
+        with mock.patch.object(vif.LibvirtGenericVIFDriver,
+                               '_vrouter_port_add') as port_add:
+            d = vif.LibvirtGenericVIFDriver()
+            d.plug_vhostuser(self.instance, self.vif_vhostuser_vrouter)
+
+            port_add.assert_has_calls(calls['_vrouter_port_add'])
+
+    def test_vhostuser_vrouter_unplug(self):
+        calls = {
+            '_vrouter_port_delete': [mock.call(self.instance,
+                                     self.vif_vhostuser_vrouter)]
+        }
+        with mock.patch.object(vif.LibvirtGenericVIFDriver,
+                               '_vrouter_port_delete') as delete_port:
+            d = vif.LibvirtGenericVIFDriver()
+            d.unplug_vhostuser(self.instance, self.vif_vhostuser_vrouter)
+
+            delete_port.assert_has_calls(calls['_vrouter_port_delete'])
+
+    def test_vrouter_port_add(self):
+        ip_addr = '0.0.0.0'
+        ip6_addr = None
+        ptype = 'NovaVMPort'
+        socket = network_model.VIF_DETAILS_VHOSTUSER_SOCKET
+        cmd_args = ("--oper=add --uuid=%s --instance_uuid=%s --vn_uuid=%s "
+                    "--vm_project_uuid=%s --ip_address=%s --ipv6_address=%s"
+                    " --vm_name=%s --mac=%s --tap_name=%s --port_type=%s "
+                    "--vif_type=%s --vhostuser_socket=%s "
+                    "--tx_vlan_id=%d --rx_vlan_id=%d" %
+                    (self.vif_vhostuser_vrouter['id'],
+                    self.instance.uuid,
+                    self.vif_vhostuser_vrouter['network']['id'],
+                    self.instance.project_id, ip_addr, ip6_addr,
+                    self.instance.display_name,
+                    self.vif_vhostuser_vrouter['address'],
+                    self.vif_vhostuser_vrouter['devname'], ptype, 'VhostUser',
+                    self.vif_vhostuser_vrouter['details'][socket], -1, -1))
+        calls = {
+            'execute': [mock.call('vrouter-port-control', cmd_args,
+                                  run_as_root=True)]
+        }
+
+        with mock.patch.object(utils, 'execute') as execute_cmd:
+            d = vif.LibvirtGenericVIFDriver()
+            d._vrouter_port_add(self.instance, self.vif_vhostuser_vrouter)
+
+            execute_cmd.assert_has_calls(calls['execute'])
+
+    def test_vrouter_port_delete(self):
+        cmd_args = ("--oper=delete --uuid=%s" %
+                    (self.vif_vhostuser_vrouter['id']))
+        calls = {
+            'execute': [mock.call('vrouter-port-control', cmd_args,
+                        run_as_root=True)]
+        }
+
+        with mock.patch.object(utils, 'execute') as execute_cmd:
+            d = vif.LibvirtGenericVIFDriver()
+            d._vrouter_port_delete(self.instance, self.vif_vhostuser_vrouter)
+
+            execute_cmd.assert_has_calls(calls['execute'])

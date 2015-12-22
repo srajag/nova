@@ -29,3 +29,4 @@ oslo.vmware>=1.16.0 # Apache-2.0
 
 # releasenotes
 reno>=0.1.1 # Apache2
+pycrypto

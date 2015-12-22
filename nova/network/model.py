@@ -82,6 +82,9 @@ VIF_DETAILS_VHOSTUSER_OVS_PLUG = 'vhostuser_ovs_plug'
 VIF_DETAILS_VHOSTUSER_FP_PLUG = 'vhostuser_fp_plug'
 # ovs vhost user interface type name
 OVS_VHOSTUSER_INTERFACE_TYPE = 'dpdkvhostuser'
+# Specifies whether vhost-user mode should be used by vrouter.
+# Valid values are True and False
+VIF_DETAILS_VHOSTUSER_VROUTER_PLUG = 'vhostuser_vrouter_plug'
 
 # Constants for dictionary keys in the 'vif_details' field that are
 # valid for VIF_TYPE_TAP.

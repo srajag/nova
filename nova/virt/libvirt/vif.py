@@ -683,24 +683,8 @@ class LibvirtGenericVIFDriver(object):
             instance.uuid, mtu,
             interface_type=network_model.OVS_VHOSTUSER_INTERFACE_TYPE)
 
-    def plug_vhostuser(self, instance, vif):
-        fp_plug = vif['details'].get(
-                                network_model.VIF_DETAILS_VHOSTUSER_FP_PLUG,
-                                False)
-        ovs_plug = vif['details'].get(
-                                network_model.VIF_DETAILS_VHOSTUSER_OVS_PLUG,
-                                False)
-        if fp_plug:
-            self.plug_vhostuser_fp(instance, vif)
-        elif ovs_plug:
-            self.plug_vhostuser_ovs(instance, vif)
-
-    def plug_vrouter(self, instance, vif):
-        """Plug into Contrail's network port
-
-        Bind the vif to a Contrail virtual port.
-        """
-        dev = self.get_vif_devname(vif)
+    @staticmethod
+    def _vrouter_port_add(instance, vif):
         ip_addr = '0.0.0.0'
         ip6_addr = None
         subnets = vif['network']['subnets']
@@ -721,17 +705,61 @@ class LibvirtGenericVIFDriver(object):
         if (cfg.CONF.libvirt.virt_type == 'lxc'):
             ptype = 'NameSpacePort'
 
+        vif_type = 'Vrouter'
+        vhostuser_socket = ''
+        if vif['type'] == network_model.VIF_TYPE_VHOSTUSER:
+            vif_type = 'VhostUser'
+            vhostuser_socket = ' --vhostuser_socket=%s' % \
+                vif['details'][network_model.VIF_DETAILS_VHOSTUSER_SOCKET]
+
         cmd_args = ("--oper=add --uuid=%s --instance_uuid=%s --vn_uuid=%s "
                     "--vm_project_uuid=%s --ip_address=%s --ipv6_address=%s"
                     " --vm_name=%s --mac=%s --tap_name=%s --port_type=%s "
-                    "--tx_vlan_id=%d --rx_vlan_id=%d" % (vif['id'],
-                    instance.uuid, vif['network']['id'],
+                    "--vif_type=%s%s --tx_vlan_id=%d --rx_vlan_id=%d" %
+                    (vif['id'], instance.uuid, vif['network']['id'],
                     instance.project_id, ip_addr, ip6_addr,
                     instance.display_name, vif['address'],
-                    vif['devname'], ptype, -1, -1))
+                    vif['devname'], ptype, vif_type, vhostuser_socket, -1, -1))
+
+        try:
+            utils.execute('vrouter-port-control', cmd_args, run_as_root=True)
+        except processutils.ProcessExecutionError as e:
+            raise exception.VirtualInterfacePlugException(_("Failed to create "
+                "the vRouter port with the command: vrouter-port-control %s" %
+                cmd_args))
+
+    def plug_vhostuser_vrouter(self, instance, vif):
+        try:
+            self._vrouter_port_add(instance, vif)
+        except processutils.ProcessExecutionError:
+            LOG.exception(_LE("Failed while plugging vif"), instance=instance)
+
+    def plug_vhostuser(self, instance, vif):
+        fp_plug = vif['details'].get(
+                                network_model.VIF_DETAILS_VHOSTUSER_FP_PLUG,
+                                False)
+        ovs_plug = vif['details'].get(
+                                network_model.VIF_DETAILS_VHOSTUSER_OVS_PLUG,
+                                False)
+        vrouter_plug = vif['details'].get(
+                           network_model.VIF_DETAILS_VHOSTUSER_VROUTER_PLUG,
+                           False)
+        if fp_plug:
+            self.plug_vhostuser_fp(instance, vif)
+        elif ovs_plug:
+            self.plug_vhostuser_ovs(instance, vif)
+        elif vrouter_plug:
+            self.plug_vhostuser_vrouter(instance, vif)
+
+    def plug_vrouter(self, instance, vif):
+        """Plug into Contrail's network port
+
+        Bind the vif to a Contrail virtual port.
+        """
+        dev = self.get_vif_devname(vif)
         try:
             linux_net.create_tap_dev(dev)
-            utils.execute('vrouter-port-control', cmd_args, run_as_root=True)
+            self._vrouter_port_add(instance, vif)
         except processutils.ProcessExecutionError:
             LOG.exception(_LE("Failed while plugging vif"), instance=instance)
 
@@ -906,7 +934,6 @@ class LibvirtGenericVIFDriver(object):
         ovs_plug = vif['details'].get(
                         network_model.VIF_DETAILS_VHOSTUSER_OVS_PLUG,
                         False)
-
         try:
             if ovs_plug:
                 if vif.is_hybrid_plug_enabled():
@@ -926,6 +953,18 @@ class LibvirtGenericVIFDriver(object):
         linux_net.delete_ovs_vif_port(self.get_bridge_name(vif),
                                       port_name)
 
+    @staticmethod
+    def _vrouter_port_delete(instance, vif):
+        cmd_args = ("--oper=delete --uuid=%s" % (vif['id']))
+        utils.execute('vrouter-port-control', cmd_args, run_as_root=True)
+
+    def unplug_vhostuser_vrouter(self, instance, vif):
+        try:
+            self._vrouter_port_delete(instance, vif)
+        except processutils.ProcessExecutionError:
+            LOG.exception(
+                _LE("Failed while unplugging vif"), instance=instance)
+
     def unplug_vhostuser(self, instance, vif):
         fp_plug = vif['details'].get(
                         network_model.VIF_DETAILS_VHOSTUSER_FP_PLUG,
@@ -933,10 +972,15 @@ class LibvirtGenericVIFDriver(object):
         ovs_plug = vif['details'].get(
                         network_model.VIF_DETAILS_VHOSTUSER_OVS_PLUG,
                         False)
+        vrouter_plug = vif['details'].get(
+                           network_model.VIF_DETAILS_VHOSTUSER_VROUTER_PLUG,
+                           False)
         if fp_plug:
             self.unplug_vhostuser_fp(instance, vif)
         elif ovs_plug:
             self.unplug_vhostuser_ovs(instance, vif)
+        elif vrouter_plug:
+            self.unplug_vhostuser_vrouter(instance, vif)
 
     def unplug_vrouter(self, instance, vif):
         """Unplug Contrail's network port
@@ -944,9 +988,8 @@ class LibvirtGenericVIFDriver(object):
         Unbind the vif from a Contrail virtual port.
         """
         dev = self.get_vif_devname(vif)
-        cmd_args = ("--oper=delete --uuid=%s" % (vif['id']))
         try:
-            utils.execute('vrouter-port-control', cmd_args, run_as_root=True)
+            self._vrouter_port_delete(instance, vif)
             linux_net.delete_net_dev(dev)
         except processutils.ProcessExecutionError:
             LOG.exception(
