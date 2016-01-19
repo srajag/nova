@@ -242,3 +242,74 @@ class TestNotificationBase(test.NoDBTestCase):
              'nova_object.data': {'extra_field': u'test string'},
              'nova_object.version': '1.0',
              'nova_object.namespace': 'nova'})
+
+    def test_sample_decorator(self):
+        self.assertEqual(2, len(self.TestNotification.samples))
+        self.assertIn('test-update-1.json', self.TestNotification.samples)
+        self.assertIn('test-update-2.json', self.TestNotification.samples)
+
+
+notification_object_data = {
+    'EventType': '1.1-8291570eed00192197c7fa02ac677cd4',
+    'ExceptionNotification': '1.0-a73147b93b520ff0061865849d3dfa56',
+    'ExceptionPayload': '1.0-4516ae282a55fe2fd5c754967ee6248b',
+    'NotificationPublisher': '1.0-bbbc1402fb0e443a3eb227cc52b61545',
+    'ServiceStatusNotification': '1.0-a73147b93b520ff0061865849d3dfa56',
+    'ServiceStatusPayload': '1.0-a5e7b4fd6cc5581be45b31ff1f3a3f7f',
+}
+
+
+class TestNotificationObjectVersions(test.NoDBTestCase):
+    def setUp(self):
+        super(test.NoDBTestCase, self).setUp()
+        base.NovaObjectRegistry.register_notification_objects()
+
+    def test_versions(self):
+        checker = fixture.ObjectVersionChecker(
+            test_objects.get_nova_objects())
+        notification_object_data.update(test_objects.object_data)
+        expected, actual = checker.test_hashes(notification_object_data)
+        self.assertEqual(expected, actual,
+                         'Some notification objects have changed; please make '
+                         'sure the versions have been bumped, and then update '
+                         'their hashes here.')
+
+    def test_notification_payload_version_depends_on_the_schema(self):
+        @base.NovaObjectRegistry.register_if(False)
+        class TestNotificationPayload(notification.NotificationPayloadBase):
+            VERSION = '1.0'
+
+            SCHEMA = {
+                'field_1': ('source_field', 'field_1'),
+                'field_2': ('source_field', 'field_2'),
+            }
+
+            fields = {
+                'extra_field': fields.StringField(),  # filled by ctor
+                'field_1': fields.StringField(),  # filled by the schema
+                'field_2': fields.IntegerField(),   # filled by the schema
+            }
+
+        checker = fixture.ObjectVersionChecker(
+            {'TestNotificationPayload': (TestNotificationPayload,)})
+
+        old_hash = checker.get_hashes(extra_data_func=get_extra_data)
+        TestNotificationPayload.SCHEMA['field_3'] = ('source_field',
+                                                     'field_3')
+        new_hash = checker.get_hashes(extra_data_func=get_extra_data)
+
+        self.assertNotEqual(old_hash, new_hash)
+
+
+def get_extra_data(obj_class):
+    extra_data = tuple()
+
+    # Get the SCHEMA items to add to the fingerprint
+    # if we are looking at a notification
+    if issubclass(obj_class, notification.NotificationPayloadBase):
+        schema_data = collections.OrderedDict(
+            sorted(obj_class.SCHEMA.items()))
+
+        extra_data += (schema_data,)
+
+    return extra_data

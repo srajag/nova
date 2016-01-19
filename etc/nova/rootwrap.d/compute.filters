@@ -215,6 +215,12 @@ drv_cfg: CommandFilter, /opt/emc/scaleio/sdc/bin/drv_cfg, root, /opt/emc/scaleio
 # out stale brick values from this file.
 scsi_id: CommandFilter, /lib/udev/scsi_id, root
 
+# Allow use of privsep, needed for various features
+# including os-brick and os-vif plugins.
+# This line ties the superuser privs with the config files, context name,
+# and (implicitly) the actual python code invoked.
+privsep-rootwrap: RegExpFilter, privsep-helper, root, privsep-helper, --config-file, /etc/(?!\.\.).*, --privsep_context, .*, --privsep_sock_path, /tmp/.*
+
 # nova/storage/linuxscsi.py: sg_scan device
 sg_scan: CommandFilter, sg_scan, root
 

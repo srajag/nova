@@ -1198,6 +1198,18 @@ object_data = {
 }
 
 
+def get_nova_objects():
+    all_classes = base.NovaObjectRegistry.obj_classes()
+    nova_classes = {}
+    for name in all_classes:
+        objclasses = all_classes[name]
+        if (objclasses[0].OBJ_PROJECT_NAMESPACE !=
+            base.NovaObject.OBJ_PROJECT_NAMESPACE):
+            continue
+        nova_classes[name] = objclasses
+    return nova_classes
+
+
 class TestObjectVersions(test.NoDBTestCase):
     def test_versions(self):
         checker = fixture.ObjectVersionChecker(
