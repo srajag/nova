@@ -20,9 +20,8 @@ import functools
 import traceback
 
 import netaddr
-from oslo_log import log as logging
 import oslo_messaging as messaging
-from oslo_utils import timeutils
+from oslo_utils import versionutils
 from oslo_versionedobjects import base as ovoo_base
 from oslo_versionedobjects import exception as ovoo_exc
 import six
@@ -31,9 +30,6 @@ from nova import exception
 from nova import objects
 from nova.objects import fields as obj_fields
 from nova import utils
-
-
-LOG = logging.getLogger('object')
 
 
 def get_attrname(name):
@@ -48,11 +44,11 @@ class NovaObjectRegistry(ovoo_base.VersionedObjectRegistry):
         # NOTE(danms): This is called when an object is registered,
         # and is responsible for maintaining nova.objects.$OBJECT
         # as the highest-versioned implementation of a given object.
-        version = utils.convert_version_to_tuple(cls.VERSION)
+        version = versionutils.convert_version_to_tuple(cls.VERSION)
         if not hasattr(objects, cls.obj_name()):
             setattr(objects, cls.obj_name(), cls)
         else:
-            cur_version = utils.convert_version_to_tuple(
+            cur_version = versionutils.convert_version_to_tuple(
                 getattr(objects, cls.obj_name()).VERSION)
             if version >= cur_version:
                 setattr(objects, cls.obj_name(), cls)
@@ -74,6 +70,16 @@ class NovaObject(ovoo_base.VersionedObject):
 
     OBJ_SERIAL_NAMESPACE = 'nova_object'
     OBJ_PROJECT_NAMESPACE = 'nova'
+
+    # NOTE(ndipanov): This is nova-specific
+    @staticmethod
+    def should_migrate_data():
+        """A check that can be used to inhibit online migration behavior
+
+        This is usually used to check if all services that will be accessing
+        the db directly are ready for the new format.
+        """
+        raise NotImplementedError()
 
     # NOTE(danms): This has some minor change between the nova and o.vo
     # version, so avoid inheriting it for the moment so we can make that
@@ -356,7 +362,7 @@ def obj_make_list(context, list_obj, item_cls, db_list, **extra_args):
 def serialize_args(fn):
     """Decorator that will do the arguments serialization before remoting."""
     def wrapper(obj, *args, **kwargs):
-        args = [timeutils.strtime(at=arg) if isinstance(arg, datetime.datetime)
+        args = [utils.strtime(arg) if isinstance(arg, datetime.datetime)
                 else arg for arg in args]
         for k, v in six.iteritems(kwargs):
             if k == 'exc_val' and v:
@@ -364,7 +370,7 @@ def serialize_args(fn):
             elif k == 'exc_tb' and v and not isinstance(v, six.string_types):
                 kwargs[k] = ''.join(traceback.format_tb(v))
             elif isinstance(v, datetime.datetime):
-                kwargs[k] = timeutils.strtime(at=v)
+                kwargs[k] = utils.strtime(v)
         if hasattr(fn, '__call__'):
             return fn(obj, *args, **kwargs)
         # NOTE(danms): We wrap a descriptor, so use that protocol

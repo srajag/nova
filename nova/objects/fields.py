@@ -13,10 +13,8 @@
 #    under the License.
 
 from collections import OrderedDict
-from distutils import versionpredicate
 
 import netaddr
-from oslo_utils import strutils
 from oslo_versionedobjects import fields
 import six
 
@@ -45,6 +43,7 @@ IntegerField = fields.IntegerField
 UUIDField = fields.UUIDField
 FloatField = fields.FloatField
 StringField = fields.StringField
+SensitiveStringField = fields.SensitiveStringField
 EnumField = fields.EnumField
 DateTimeField = fields.DateTimeField
 DictOfStringsField = fields.DictOfStringsField
@@ -57,6 +56,9 @@ ListOfDictOfNullableStringsField = fields.ListOfDictOfNullableStringsField
 DictProxyField = fields.DictProxyField
 ObjectField = fields.ObjectField
 ListOfObjectsField = fields.ListOfObjectsField
+VersionPredicateField = fields.VersionPredicateField
+FlexibleBooleanField = fields.FlexibleBooleanField
+DictOfListOfStringsField = fields.DictOfListOfStringsField
 
 
 # NOTE(danms): These are things we need to import for some of our
@@ -155,6 +157,30 @@ class CPUAllocationPolicy(Enum):
             valid_values=CPUAllocationPolicy.ALL)
 
 
+class CPUThreadAllocationPolicy(Enum):
+
+    # prefer (default): The host may or may not have hyperthreads. This
+    #  retains the legacy behavior, whereby siblings are preferred when
+    #  available. This is the default if no policy is specified.
+    PREFER = "prefer"
+    # isolate: The host may or many not have hyperthreads. If hyperthreads are
+    #  present, each vCPU will be placed on a different core and no vCPUs from
+    #  other guests will be able to be placed on the same core, i.e. one
+    #  thread sibling is guaranteed to always be unused. If hyperthreads are
+    #  not present, each vCPU will still be placed on a different core and
+    #  there are no thread siblings to be concerned with.
+    ISOLATE = "isolate"
+    # require: The host must have hyperthreads. Each vCPU will be allocated on
+    #   thread siblings.
+    REQUIRE = "require"
+
+    ALL = (PREFER, ISOLATE, REQUIRE)
+
+    def __init__(self):
+        super(CPUThreadAllocationPolicy, self).__init__(
+            valid_values=CPUThreadAllocationPolicy.ALL)
+
+
 class CPUMode(Enum):
     # TODO(berrange): move all constants out of 'nova.compute.cpumodel'
     # into fields on this class
@@ -198,6 +224,18 @@ class DiskBus(Enum):
             valid_values=DiskBus.ALL)
 
 
+class FirmwareType(Enum):
+
+    UEFI = "uefi"
+    BIOS = "bios"
+
+    ALL = (UEFI, BIOS)
+
+    def __init__(self):
+        super(FirmwareType, self).__init__(
+            valid_values=FirmwareType.ALL)
+
+
 class HVType(Enum):
     # TODO(berrange): move all constants out of 'nova.compute.hv_type'
     # into fields on this class
@@ -212,6 +250,27 @@ class HVType(Enum):
             msg = _("Hypervisor virt type '%s' is not valid") % value
             raise ValueError(msg)
         return super(HVType, self).coerce(obj, attr, value)
+
+
+class ImageSignatureHashType(Enum):
+    # Represents the possible hash methods used for image signing
+    def __init__(self):
+        self.hashes = ('SHA-224', 'SHA-256', 'SHA-384', 'SHA-512')
+        super(ImageSignatureHashType, self).__init__(
+            valid_values=self.hashes
+        )
+
+
+class ImageSignatureKeyType(Enum):
+    # Represents the possible keypair types used for image signing
+    def __init__(self):
+        self.key_types = (
+            'DSA', 'ECC_SECT571K1', 'ECC_SECT409K1', 'ECC_SECT571R1',
+            'ECC_SECT409R1', 'ECC_SECP521R1', 'ECC_SECP384R1', 'RSA-PSS'
+        )
+        super(ImageSignatureKeyType, self).__init__(
+            valid_values=self.key_types
+        )
 
 
 class OSType(Enum):
@@ -230,6 +289,40 @@ class OSType(Enum):
         # so canonicalize to all lower case
         value = value.lower()
         return super(OSType, self).coerce(obj, attr, value)
+
+
+class ResourceClass(Enum):
+    """Classes of resources provided to consumers."""
+
+    VCPU = 'VCPU'
+    MEMORY_MB = 'MEMORY_MB'
+    DISK_GB = 'DISK_GB'
+    PCI_DEVICE = 'PCI_DEVICE'
+    SRIOV_NET_VF = 'SRIOV_NET_VF'
+    NUMA_SOCKET = 'NUMA_SOCKET'
+    NUMA_CORE = 'NUMA_CORE'
+    NUMA_THREAD = 'NUMA_THREAD'
+    NUMA_MEMORY_MB = 'NUMA_MEMORY_MB'
+    IPV4_ADDRESS = 'IPV4_ADDRESS'
+
+    # The ordering here is relevant. If you must add a value, only
+    # append.
+    ALL = (VCPU, MEMORY_MB, DISK_GB, PCI_DEVICE, SRIOV_NET_VF, NUMA_SOCKET,
+           NUMA_CORE, NUMA_THREAD, NUMA_MEMORY_MB, IPV4_ADDRESS)
+
+    def __init__(self):
+        super(ResourceClass, self).__init__(
+            valid_values=ResourceClass.ALL)
+
+    @classmethod
+    def index(cls, value):
+        """Return an index into the Enum given a value."""
+        return cls.ALL.index(value)
+
+    @classmethod
+    def from_index(cls, index):
+        """Return the Enum value at a given index."""
+        return cls.ALL[index]
 
 
 class RNGModel(Enum):
@@ -383,17 +476,19 @@ class MonitorMetricType(Enum):
             valid_values=MonitorMetricType.ALL)
 
 
-# NOTE(sbauza): Remove this on next release of oslo.versionedobjects
-class VersionPredicate(fields.String):
-    @staticmethod
-    def coerce(obj, attr, value):
-        try:
-            versionpredicate.VersionPredicate('check (%s)' % value)
-        except ValueError:
-            raise ValueError(_('Version %(val)s is not a valid predicate in '
-                               'field %(attr)s') %
-                             {'val': value, 'attr': attr})
-        return value
+class HostStatus(Enum):
+
+    UP = "UP"  # The nova-compute is up.
+    DOWN = "DOWN"  # The nova-compute is forced_down.
+    MAINTENANCE = "MAINTENANCE"  # The nova-compute is disabled.
+    UNKNOWN = "UNKNOWN"  # The nova-compute has not reported.
+    NONE = ""  # No host or nova-compute.
+
+    ALL = (UP, DOWN, MAINTENANCE, UNKNOWN, NONE)
+
+    def __init__(self):
+        super(HostStatus, self).__init__(
+            valid_values=HostStatus.ALL)
 
 
 class PciDeviceStatus(Enum):
@@ -403,8 +498,11 @@ class PciDeviceStatus(Enum):
     ALLOCATED = "allocated"
     REMOVED = "removed"  # The device has been hot-removed and not yet deleted
     DELETED = "deleted"  # The device is marked not available/deleted.
+    UNCLAIMABLE = "unclaimable"
+    UNAVAILABLE = "unavailable"
 
-    ALL = (AVAILABLE, CLAIMED, ALLOCATED, REMOVED, DELETED)
+    ALL = (AVAILABLE, CLAIMED, ALLOCATED, REMOVED, DELETED, UNAVAILABLE,
+           UNCLAIMABLE)
 
     def __init__(self):
         super(PciDeviceStatus, self).__init__(
@@ -426,11 +524,60 @@ class PciDeviceType(Enum):
             valid_values=PciDeviceType.ALL)
 
 
-# NOTE(danms): Remove this on next release of oslo.versionedobjects
-class FlexibleBoolean(fields.Boolean):
-    @staticmethod
-    def coerce(obj, attr, value):
-        return strutils.bool_from_string(value)
+class DiskFormat(Enum):
+    RBD = "rbd"
+    LVM = "lvm"
+    QCOW2 = "qcow2"
+    RAW = "raw"
+    PLOOP = "ploop"
+    VHD = "vhd"
+    VMDK = "vmdk"
+    VDI = "vdi"
+    ISO = "iso"
+
+    ALL = (RBD, LVM, QCOW2, RAW, PLOOP, VHD, VMDK, VDI, ISO)
+
+    def __init__(self):
+        super(DiskFormat, self).__init__(
+            valid_values=DiskFormat.ALL)
+
+
+class NotificationPriority(Enum):
+    AUDIT = 'audit'
+    CRITICAL = 'critical'
+    DEBUG = 'debug'
+    INFO = 'info'
+    ERROR = 'error'
+    SAMPLE = 'sample'
+    WARN = 'warn'
+
+    ALL = (AUDIT, CRITICAL, DEBUG, INFO, ERROR, SAMPLE, WARN)
+
+    def __init__(self):
+        super(NotificationPriority, self).__init__(
+            valid_values=NotificationPriority.ALL)
+
+
+class NotificationPhase(Enum):
+    START = 'start'
+    END = 'end'
+    ERROR = 'error'
+
+    ALL = (START, END, ERROR)
+
+    def __init__(self):
+        super(NotificationPhase, self).__init__(
+            valid_values=NotificationPhase.ALL)
+
+
+class NotificationAction(Enum):
+    UPDATE = 'update'
+
+    ALL = (UPDATE,)
+
+    def __init__(self):
+        super(NotificationAction, self).__init__(
+            valid_values=NotificationAction.ALL)
 
 
 class IPAddress(FieldType):
@@ -615,6 +762,10 @@ class CPUAllocationPolicyField(BaseEnumField):
     AUTO_TYPE = CPUAllocationPolicy()
 
 
+class CPUThreadAllocationPolicyField(BaseEnumField):
+    AUTO_TYPE = CPUThreadAllocationPolicy()
+
+
 class CPUModeField(BaseEnumField):
     AUTO_TYPE = CPUMode()
 
@@ -631,12 +782,36 @@ class DiskBusField(BaseEnumField):
     AUTO_TYPE = DiskBus()
 
 
+class FirmwareTypeField(BaseEnumField):
+    AUTO_TYPE = FirmwareType()
+
+
 class HVTypeField(BaseEnumField):
     AUTO_TYPE = HVType()
 
 
+class ImageSignatureHashTypeField(BaseEnumField):
+    AUTO_TYPE = ImageSignatureHashType()
+
+
+class ImageSignatureKeyTypeField(BaseEnumField):
+    AUTO_TYPE = ImageSignatureKeyType()
+
+
 class OSTypeField(BaseEnumField):
     AUTO_TYPE = OSType()
+
+
+class ResourceClassField(BaseEnumField):
+    AUTO_TYPE = ResourceClass()
+
+    def index(self, value):
+        """Return an index into the Enum given a value."""
+        return self._type.index(value)
+
+    def from_index(self, index):
+        """Return the Enum value at a given index."""
+        return self._type.from_index(index)
 
 
 class RNGModelField(BaseEnumField):
@@ -667,11 +842,6 @@ class MonitorMetricTypeField(BaseEnumField):
     AUTO_TYPE = MonitorMetricType()
 
 
-# FIXME(sbauza): Remove this after oslo.versionedobjects gets it
-class VersionPredicateField(AutoTypedField):
-    AUTO_TYPE = VersionPredicate()
-
-
 class PciDeviceStatusField(BaseEnumField):
     AUTO_TYPE = PciDeviceStatus()
 
@@ -680,14 +850,20 @@ class PciDeviceTypeField(BaseEnumField):
     AUTO_TYPE = PciDeviceType()
 
 
-# FIXME(danms): Remove this after oslo.versionedobjects gets it
-# This is a flexible interpretation of boolean
-# values using common user friendly semantics for
-# truth/falsehood. ie strings like 'yes', 'no',
-# 'on', 'off', 't', 'f' get mapped to values you
-# would expect.
-class FlexibleBooleanField(AutoTypedField):
-    AUTO_TYPE = FlexibleBoolean()
+class DiskFormatField(BaseEnumField):
+    AUTO_TYPE = DiskFormat()
+
+
+class NotificationPriorityField(BaseEnumField):
+    AUTO_TYPE = NotificationPriority()
+
+
+class NotificationPhaseField(BaseEnumField):
+    AUTO_TYPE = NotificationPhase()
+
+
+class NotificationActionField(BaseEnumField):
+    AUTO_TYPE = NotificationAction()
 
 
 class IPAddressField(AutoTypedField):
@@ -720,11 +896,6 @@ class IPV6NetworkField(AutoTypedField):
 
 class ListOfIntegersField(AutoTypedField):
     AUTO_TYPE = List(fields.Integer())
-
-
-# FIXME(sbauza): Remove this after oslo.versionedobjects releases it
-class DictOfListOfStringsField(AutoTypedField):
-    AUTO_TYPE = Dict(List(fields.String()))
 
 
 class NonNegativeFloatField(AutoTypedField):

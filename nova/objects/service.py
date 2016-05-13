@@ -13,6 +13,7 @@
 #    under the License.
 
 from oslo_log import log as logging
+from oslo_utils import versionutils
 
 from nova import availability_zones
 from nova import db
@@ -21,14 +22,14 @@ from nova.i18n import _LW
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
-from nova import utils
+from nova.objects import notification
 
 
 LOG = logging.getLogger(__name__)
 
 
 # NOTE(danms): This is the global service version counter
-SERVICE_VERSION = 2
+SERVICE_VERSION = 9
 
 
 # NOTE(danms): This is our SERVICE_VERSION history. The idea is that any
@@ -56,6 +57,20 @@ SERVICE_VERSION_HISTORY = (
     {'compute_rpc': '4.4'},
     # Version 2: Changes to rebuild_instance signature in the compute_rpc
     {'compute_rpc': '4.5'},
+    # Version 3: Add trigger_crash_dump method to compute rpc api
+    {'compute_rpc': '4.6'},
+    # Version 4: Add PciDevice.parent_addr (data migration needed)
+    {'compute_rpc': '4.6'},
+    # Version 5: Add attachment_id kwarg to detach_volume()
+    {'compute_rpc': '4.7'},
+    # Version 6: Compute RPC version 4.8
+    {'compute_rpc': '4.8'},
+    # Version 7: Add live_migration_force_complete in the compute_rpc
+    {'compute_rpc': '4.9'},
+    # Version 8: Add live_migration_abort in the compute_rpc
+    {'compute_rpc': '4.10'},
+    # Version 9: Allow block_migration and disk_over_commit be None
+    {'compute_rpc': '4.11'},
 )
 
 
@@ -100,6 +115,9 @@ class Service(base.NovaPersistentObject, base.NovaObject,
         'version': fields.IntegerField(),
     }
 
+    _MIN_VERSION_CACHE = {}
+    _SERVICE_VERSION_CACHING = False
+
     def __init__(self, *args, **kwargs):
         # NOTE(danms): We're going against the rules here and overriding
         # init. The reason is that we want to *ensure* that we're always
@@ -122,7 +140,7 @@ class Service(base.NovaPersistentObject, base.NovaObject,
                                           version_manifest):
         super(Service, self).obj_make_compatible_from_manifest(
             primitive, target_version, version_manifest)
-        _target_version = utils.convert_version_to_tuple(target_version)
+        _target_version = versionutils.convert_version_to_tuple(target_version)
         if _target_version < (1, 16) and 'version' in primitive:
             del primitive['version']
         if _target_version < (1, 14) and 'forced_down' in primitive:
@@ -173,7 +191,7 @@ class Service(base.NovaPersistentObject, base.NovaObject,
             raise exception.OrphanedObjectError(method='obj_load_attr',
                                                 objtype=self.obj_name())
 
-        LOG.debug("Lazy-loading `%(attr)s' on %(name)s id %(id)s",
+        LOG.debug("Lazy-loading '%(attr)s' on %(name)s id %(id)s",
                   {'attr': attrname,
                    'name': self.obj_name(),
                    'id': self.id,
@@ -214,9 +232,15 @@ class Service(base.NovaPersistentObject, base.NovaObject,
             return
         return cls._from_db_object(context, cls(), db_service)
 
+    @staticmethod
+    @db.select_db_reader_mode
+    def _db_service_get_by_compute_host(context, host, use_slave=False):
+        return db.service_get_by_compute_host(context, host)
+
     @base.remotable_classmethod
     def get_by_compute_host(cls, context, host, use_slave=False):
-        db_service = db.service_get_by_compute_host(context, host)
+        db_service = cls._db_service_get_by_compute_host(context, host,
+                                                         use_slave=use_slave)
         return cls._from_db_object(context, cls(), db_service)
 
     # NOTE(ndipanov): This is deprecated and should be removed on the next
@@ -273,9 +297,41 @@ class Service(base.NovaPersistentObject, base.NovaObject,
         db_service = db.service_update(self._context, self.id, updates)
         self._from_db_object(self._context, self, db_service)
 
+        self._send_status_update_notification(updates)
+
+    def _send_status_update_notification(self, updates):
+        # Note(gibi): We do not trigger notification on version as that field
+        # is always dirty, which would cause that nova sends notification on
+        # every other field change. See the comment in save() too.
+        if set(updates.keys()).intersection(
+                {'disabled', 'disabled_reason', 'forced_down'}):
+            payload = ServiceStatusPayload(self)
+            ServiceStatusNotification(
+                publisher=notification.NotificationPublisher.from_service_obj(
+                    self),
+                event_type=notification.EventType(
+                    object='service',
+                    action=fields.NotificationAction.UPDATE),
+                priority=fields.NotificationPriority.INFO,
+                payload=payload).emit(self._context)
+
     @base.remotable
     def destroy(self):
         db.service_destroy(self._context, self.id)
+
+    @classmethod
+    def enable_min_version_cache(cls):
+        cls.clear_min_version_cache()
+        cls._SERVICE_VERSION_CACHING = True
+
+    @classmethod
+    def clear_min_version_cache(cls):
+        cls._MIN_VERSION_CACHE = {}
+
+    @staticmethod
+    @db.select_db_reader_mode
+    def _db_service_get_minimum_version(context, binary, use_slave=False):
+        return db.service_get_minimum_version(context, binary)
 
     @base.remotable_classmethod
     def get_minimum_version(cls, context, binary, use_slave=False):
@@ -284,13 +340,21 @@ class Service(base.NovaPersistentObject, base.NovaObject,
                             'binary `%s\''), binary)
             raise exception.ObjectActionError(action='get_minimum_version',
                                               reason='Invalid binary prefix')
-        version = db.service_get_minimum_version(context, binary,
-                                                 use_slave=use_slave)
+
+        if cls._SERVICE_VERSION_CACHING:
+            cached_version = cls._MIN_VERSION_CACHE.get(binary)
+            if cached_version:
+                return cached_version
+        version = cls._db_service_get_minimum_version(context, binary,
+                                                      use_slave=use_slave)
         if version is None:
             return 0
         # NOTE(danms): Since our return value is not controlled by object
         # schema, be explicit here.
-        return int(version)
+        version = int(version)
+        cls._MIN_VERSION_CACHE[binary] = version
+
+        return version
 
 
 @base.NovaObjectRegistry.register
@@ -314,7 +378,8 @@ class ServiceList(base.ObjectListBase, base.NovaObject):
     # Version 1.15: Service version 1.17
     # Version 1.16: Service version 1.18
     # Version 1.17: Service version 1.19
-    VERSION = '1.17'
+    # Version 1.18: Added include_disabled parameter to get_by_binary()
+    VERSION = '1.18'
 
     fields = {
         'objects': fields.ListOfObjectsField('Service'),
@@ -326,9 +391,12 @@ class ServiceList(base.ObjectListBase, base.NovaObject):
         return base.obj_make_list(context, cls(context), objects.Service,
                                   db_services)
 
+    # NOTE(paul-carlton2): In v2.0 of the object the include_disabled flag
+    # will be removed so both enabled and disabled hosts are returned
     @base.remotable_classmethod
-    def get_by_binary(cls, context, binary):
-        db_services = db.service_get_all_by_binary(context, binary)
+    def get_by_binary(cls, context, binary, include_disabled=False):
+        db_services = db.service_get_all_by_binary(
+            context, binary, include_disabled=include_disabled)
         return base.obj_make_list(context, cls(context), objects.Service,
                                   db_services)
 
@@ -346,3 +414,48 @@ class ServiceList(base.ObjectListBase, base.NovaObject):
                 context, db_services)
         return base.obj_make_list(context, cls(context), objects.Service,
                                   db_services)
+
+
+@notification.notification_sample('service-update.json')
+@base.NovaObjectRegistry.register
+class ServiceStatusNotification(notification.NotificationBase):
+    # Version 1.0: Initial version
+    VERSION = '1.0'
+
+    fields = {
+        'payload': fields.ObjectField('ServiceStatusPayload')
+    }
+
+
+@base.NovaObjectRegistry.register
+class ServiceStatusPayload(notification.NotificationPayloadBase):
+    SCHEMA = {
+        'host': ('service', 'host'),
+        'binary': ('service', 'binary'),
+        'topic': ('service', 'topic'),
+        'report_count': ('service', 'report_count'),
+        'disabled': ('service', 'disabled'),
+        'disabled_reason': ('service', 'disabled_reason'),
+        'availability_zone': ('service', 'availability_zone'),
+        'last_seen_up': ('service', 'last_seen_up'),
+        'forced_down': ('service', 'forced_down'),
+        'version': ('service', 'version')
+    }
+    # Version 1.0: Initial version
+    VERSION = '1.0'
+    fields = {
+        'host': fields.StringField(nullable=True),
+        'binary': fields.StringField(nullable=True),
+        'topic': fields.StringField(nullable=True),
+        'report_count': fields.IntegerField(),
+        'disabled': fields.BooleanField(),
+        'disabled_reason': fields.StringField(nullable=True),
+        'availability_zone': fields.StringField(nullable=True),
+        'last_seen_up': fields.DateTimeField(nullable=True),
+        'forced_down': fields.BooleanField(),
+        'version': fields.IntegerField(),
+    }
+
+    def __init__(self, service):
+        super(ServiceStatusPayload, self).__init__()
+        self.populate_schema(service=service)

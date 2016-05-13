@@ -16,13 +16,14 @@ import datetime
 
 import iso8601
 import netaddr
-from oslo_utils import timeutils
 from oslo_versionedobjects import exception as ovo_exc
 import six
 
 from nova.network import model as network_model
 from nova.objects import fields
+from nova import signature_utils
 from nova import test
+from nova import utils
 
 
 class FakeFieldType(fields.FieldType):
@@ -109,7 +110,7 @@ class TestString(TestField):
         self.field = fields.StringField()
         self.coerce_good_values = [('foo', 'foo'), (1, '1'), (True, 'True')]
         if six.PY2:
-            self.coerce_good_values.append((long(1), '1'))
+            self.coerce_good_values.append((int(1), '1'))
         self.coerce_bad_values = [None]
         self.to_primitive_values = self.coerce_good_values[0:1]
         self.from_primitive_values = self.coerce_good_values[0:1]
@@ -150,7 +151,7 @@ class TestEnum(TestField):
             valid_values=['foo', 'bar', 1, 1, True])
         self.coerce_good_values = [('foo', 'foo'), (1, '1'), (True, 'True')]
         if six.PY2:
-            self.coerce_good_values.append((long(1), '1'))
+            self.coerce_good_values.append((int(1), '1'))
         self.coerce_bad_values = ['boo', 2, False]
         self.to_primitive_values = self.coerce_good_values[0:1]
         self.from_primitive_values = self.coerce_good_values[0:1]
@@ -342,6 +343,24 @@ class TestCPUAllocationPolicy(TestField):
         self.assertRaises(ValueError, self.field.stringify, 'acme')
 
 
+class TestCPUThreadAllocationPolicy(TestField):
+    def setUp(self):
+        super(TestCPUThreadAllocationPolicy, self).setUp()
+        self.field = fields.CPUThreadAllocationPolicyField()
+        self.coerce_good_values = [('prefer', 'prefer'),
+                                   ('isolate', 'isolate'),
+                                   ('require', 'require')]
+        self.coerce_bad_values = ['acme']
+        self.to_primitive_values = self.coerce_good_values[0:1]
+        self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'prefer'", self.field.stringify('prefer'))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'acme')
+
+
 class TestPciDeviceType(TestField):
     def setUp(self):
         super(TestPciDeviceType, self).setUp()
@@ -404,6 +423,25 @@ class TestHVType(TestField):
         self.assertRaises(ValueError, self.field.stringify, 'acme')
 
 
+class TestImageSignatureTypes(TestField):
+    # Ensure that the object definition is updated
+    # in step with the signature_utils module
+    def setUp(self):
+        super(TestImageSignatureTypes, self).setUp()
+        self.hash_field = fields.ImageSignatureHashType()
+        self.key_type_field = fields.ImageSignatureKeyType()
+
+    def test_hashes(self):
+        for hash_name in list(signature_utils.HASH_METHODS.keys()):
+            self.assertIn(hash_name, self.hash_field.hashes)
+
+    def test_key_types(self):
+        key_type_dict = signature_utils.SignatureKeyType._REGISTERED_TYPES
+        key_types = list(key_type_dict.keys())
+        for key_type in key_types:
+            self.assertIn(key_type, self.key_type_field.key_types)
+
+
 class TestOSType(TestField):
     def setUp(self):
         super(TestOSType, self).setUp()
@@ -420,6 +458,60 @@ class TestOSType(TestField):
 
     def test_stringify_invalid(self):
         self.assertRaises(ValueError, self.field.stringify, 'acme')
+
+
+class TestResourceClass(TestField):
+    def setUp(self):
+        super(TestResourceClass, self).setUp()
+        self.field = fields.ResourceClassField()
+        self.coerce_good_values = [
+            ('VCPU', 'VCPU'),
+            ('MEMORY_MB', 'MEMORY_MB'),
+            ('DISK_GB', 'DISK_GB'),
+            ('PCI_DEVICE', 'PCI_DEVICE'),
+            ('SRIOV_NET_VF', 'SRIOV_NET_VF'),
+            ('NUMA_SOCKET', 'NUMA_SOCKET'),
+            ('NUMA_CORE', 'NUMA_CORE'),
+            ('NUMA_THREAD', 'NUMA_THREAD'),
+            ('NUMA_MEMORY_MB', 'NUMA_MEMORY_MB'),
+            ('IPV4_ADDRESS', 'IPV4_ADDRESS'),
+        ]
+        self.expected_indexes = [
+            ('VCPU', 0),
+            ('MEMORY_MB', 1),
+            ('DISK_GB', 2),
+            ('PCI_DEVICE', 3),
+            ('SRIOV_NET_VF', 4),
+            ('NUMA_SOCKET', 5),
+            ('NUMA_CORE', 6),
+            ('NUMA_THREAD', 7),
+            ('NUMA_MEMORY_MB', 8),
+            ('IPV4_ADDRESS', 9),
+        ]
+        self.coerce_bad_values = ['acme']
+        self.to_primitive_values = self.coerce_good_values[0:1]
+        self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'VCPU'", self.field.stringify(
+            fields.ResourceClass.VCPU))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'cow')
+
+    def test_index(self):
+        for name, index in self.expected_indexes:
+            self.assertEqual(index, self.field.index(name))
+
+    def test_index_invalid(self):
+        self.assertRaises(ValueError, self.field.index, 'cow')
+
+    def test_from_index(self):
+        for name, index in self.expected_indexes:
+            self.assertEqual(name, self.field.from_index(index))
+
+    def test_from_index_invalid(self):
+        self.assertRaises(IndexError, self.field.from_index, 999)
 
 
 class TestRNGModel(TestField):
@@ -582,16 +674,29 @@ class TestMonitorMetricType(TestField):
         self.assertRaises(ValueError, self.field.stringify, 'cpufrequency')
 
 
-class TestVersionPredicate(TestString):
+class TestDiskFormat(TestField):
     def setUp(self):
-        super(TestVersionPredicate, self).setUp()
-        self.field = fields.VersionPredicateField()
-        self.coerce_good_values = [('>=1.0', '>=1.0'),
-                                   ('==1.1', '==1.1'),
-                                   ('<1.1.0', '<1.1.0')]
-        self.coerce_bad_values = ['1', 'foo', '>1', 1.0, '1.0', '=1.0']
+        super(TestDiskFormat, self).setUp()
+        self.field = fields.DiskFormatField()
+        self.coerce_good_values = [('qcow2', 'qcow2'),
+                                   ('raw', 'raw'),
+                                   ('lvm', 'lvm'),
+                                   ('rbd', 'rbd'),
+                                   ('ploop', 'ploop'),
+                                   ('vhd', 'vhd'),
+                                   ('vmdk', 'vmdk'),
+                                   ('vdi', 'vdi'),
+                                   ('iso', 'iso')]
+
+        self.coerce_bad_values = ['acme']
         self.to_primitive_values = self.coerce_good_values[0:1]
         self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'rbd'", self.field.stringify('rbd'))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'acme')
 
 
 class TestInteger(TestField):
@@ -639,33 +744,16 @@ class TestBoolean(TestField):
         self.from_primitive_values = self.coerce_good_values[0:2]
 
 
-class TestFlexibleBoolean(TestField):
-    def setUp(self):
-        super(TestFlexibleBoolean, self).setUp()
-        self.field = fields.FlexibleBooleanField()
-        self.coerce_good_values = [(True, True), (False, False),
-                                   ("true", True), ("false", False),
-                                   ("t", True), ("f", False),
-                                   ("yes", True), ("no", False),
-                                   ("y", True), ("n", False),
-                                   ("on", True), ("off", False),
-                                   (1, True), (0, False),
-                                   ('frog', False), ('', False)]
-        self.coerce_bad_values = []
-        self.to_primitive_values = self.coerce_good_values[0:2]
-        self.from_primitive_values = self.coerce_good_values[0:2]
-
-
 class TestDateTime(TestField):
     def setUp(self):
         super(TestDateTime, self).setUp()
         self.dt = datetime.datetime(1955, 11, 5, tzinfo=iso8601.iso8601.Utc())
         self.field = fields.DateTimeField()
         self.coerce_good_values = [(self.dt, self.dt),
-                                   (timeutils.isotime(self.dt), self.dt)]
+                                   (utils.isotime(self.dt), self.dt)]
         self.coerce_bad_values = [1, 'foo']
-        self.to_primitive_values = [(self.dt, timeutils.isotime(self.dt))]
-        self.from_primitive_values = [(timeutils.isotime(self.dt), self.dt)]
+        self.to_primitive_values = [(self.dt, utils.isotime(self.dt))]
+        self.from_primitive_values = [(utils.isotime(self.dt), self.dt)]
 
     def test_stringify(self):
         self.assertEqual(
@@ -869,22 +957,6 @@ class TestListOfSetsOfIntegers(TestField):
         self.assertEqual('[set([1,2])]', self.field.stringify([set([1, 2])]))
 
 
-class TestDictOfListOfStrings(TestField):
-    def setUp(self):
-        super(TestDictOfListOfStrings, self).setUp()
-        self.field = fields.DictOfListOfStringsField()
-        self.coerce_good_values = [({'foo': ['1', '2']}, {'foo': ['1', '2']}),
-                                   ({'foo': [1]}, {'foo': ['1']})]
-        self.coerce_bad_values = [{'foo': [None, None]}, 'foo']
-        self.to_primitive_values = [({'foo': ['1', '2']}, {'foo': ['1', '2']})]
-        self.from_primitive_values = [({'foo': ['1', '2']},
-                                       {'foo': ['1', '2']})]
-
-    def test_stringify(self):
-        self.assertEqual("{foo=['1','2']}",
-                         self.field.stringify({'foo': ['1', '2']}))
-
-
 class TestNetworkModel(TestField):
     def setUp(self):
         super(TestNetworkModel, self).setUp()
@@ -943,3 +1015,58 @@ class TestIPV6Network(TestField):
                                     for x in good]
         self.from_primitive_values = [(x, netaddr.IPNetwork(x))
                                       for x in good]
+
+
+class TestNotificationPriority(TestField):
+    def setUp(self):
+        super(TestNotificationPriority, self).setUp()
+        self.field = fields.NotificationPriorityField()
+        self.coerce_good_values = [('audit', 'audit'),
+                                   ('critical', 'critical'),
+                                   ('debug', 'debug'),
+                                   ('error', 'error'),
+                                   ('sample', 'sample'),
+                                   ('warn', 'warn')]
+        self.coerce_bad_values = ['warning']
+        self.to_primitive_values = self.coerce_good_values[0:1]
+        self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'warn'", self.field.stringify('warn'))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'warning')
+
+
+class TestNotificationPhase(TestField):
+    def setUp(self):
+        super(TestNotificationPhase, self).setUp()
+        self.field = fields.NotificationPhaseField()
+        self.coerce_good_values = [('start', 'start'),
+                                   ('end', 'end'),
+                                   ('error', 'error')]
+        self.coerce_bad_values = ['begin']
+        self.to_primitive_values = self.coerce_good_values[0:1]
+        self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'error'", self.field.stringify('error'))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'begin')
+
+
+class TestNotificationAction(TestField):
+    def setUp(self):
+        super(TestNotificationAction, self).setUp()
+        self.field = fields.NotificationActionField()
+        self.coerce_good_values = [('update', 'update')]
+        self.coerce_bad_values = ['magic']
+        self.to_primitive_values = self.coerce_good_values[0:1]
+        self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'update'", self.field.stringify('update'))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'magic')

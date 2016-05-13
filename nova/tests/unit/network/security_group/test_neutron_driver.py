@@ -24,7 +24,10 @@ from nova import context
 from nova import exception
 from nova.network.neutronv2 import api as neutronapi
 from nova.network.security_group import neutron_driver
+from nova.network.security_group import openstack_driver
+from nova import objects
 from nova import test
+from nova.tests import uuidsentinel as uuids
 
 
 class TestNeutronDriver(test.NoDBTestCase):
@@ -392,12 +395,14 @@ class TestNeutronDriver(test.NoDBTestCase):
 
     def test_instance_empty_security_groups(self):
 
-        port_list = {'ports': [{'id': 1, 'device_id': '1',
+        port_list = {'ports': [{'id': 1, 'device_id': uuids.instance,
                      'security_groups': []}]}
-        self.moxed_client.list_ports(device_id=['1']).AndReturn(port_list)
+        self.moxed_client.list_ports(
+            device_id=[uuids.instance]).AndReturn(port_list)
         self.mox.ReplayAll()
         sg_api = neutron_driver.SecurityGroupAPI()
-        result = sg_api.get_instance_security_groups(self.context, '1')
+        result = sg_api.get_instance_security_groups(
+            self.context, objects.Instance(uuid=uuids.instance))
         self.assertEqual([], result)
 
 
@@ -412,3 +417,25 @@ class TestNeutronDriverWithoutMock(test.NoDBTestCase):
                           'a' * 256, 'name', None)
         self.assertRaises(exception.Invalid, sg_api.validate_property,
                           None, 'name', None)
+
+    def test_populate_security_groups(self):
+        sg_api = neutron_driver.SecurityGroupAPI()
+        r = sg_api.populate_security_groups('ignore')
+        self.assertIsInstance(r, objects.SecurityGroupList)
+        self.assertEqual(0, len(r))
+
+
+class TestGetter(test.NoDBTestCase):
+    @mock.patch('nova.network.security_group.openstack_driver.'
+                '_get_openstack_security_group_driver')
+    def test_caches(self, mock_get):
+        getter = openstack_driver.get_openstack_security_group_driver
+        openstack_driver.DRIVER_CACHE = {}
+        getter(False)
+        getter(False)
+        getter(True)
+        getter(False)
+        self.assertEqual(2, len(mock_get.call_args_list))
+        self.assertEqual({True: mock_get.return_value,
+                          False: mock_get.return_value},
+                         openstack_driver.DRIVER_CACHE)

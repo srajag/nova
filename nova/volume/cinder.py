@@ -18,14 +18,16 @@
 Handles all requests relating to volumes + cinder.
 """
 
+import collections
 import copy
+import functools
 import sys
 
 from cinderclient import client as cinder_client
 from cinderclient import exceptions as cinder_exception
 from cinderclient.v1 import client as v1_client
-from keystoneclient import exceptions as keystone_exception
-from keystoneclient import session
+from keystoneauth1 import exceptions as keystone_exception
+from keystoneauth1 import loading as ks_loading
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import excutils
@@ -82,9 +84,9 @@ deprecated = {'timeout': [cfg.DeprecatedOpt('http_timeout',
               'insecure': [cfg.DeprecatedOpt('api_insecure',
                                              group=CINDER_OPT_GROUP)]}
 
-session.Session.register_conf_options(CONF,
-                                      CINDER_OPT_GROUP,
-                                      deprecated_opts=deprecated)
+ks_loading.register_session_conf_options(CONF,
+                                         CINDER_OPT_GROUP,
+                                         deprecated_opts=deprecated)
 
 LOG = logging.getLogger(__name__)
 
@@ -104,8 +106,8 @@ def cinderclient(context):
     global _V1_ERROR_RAISED
 
     if not _SESSION:
-        _SESSION = session.Session.load_from_conf_options(CONF,
-                                                          CINDER_OPT_GROUP)
+        _SESSION = ks_loading.load_session_from_conf_options(CONF,
+                                                             CINDER_OPT_GROUP)
 
     url = None
     endpoint_override = None
@@ -160,12 +162,18 @@ def _untranslate_volume_summary_view(context, vol):
     #            removed.
     d['attach_time'] = ""
     d['mountpoint'] = ""
+    d['multiattach'] = getattr(vol, 'multiattach', False)
 
     if vol.attachments:
-        att = vol.attachments[0]
+        d['attachments'] = collections.OrderedDict()
+        for attachment in vol.attachments:
+            a = {attachment['server_id']:
+                 {'attachment_id': attachment.get('attachment_id'),
+                  'mountpoint': attachment.get('device')}
+                 }
+            d['attachments'].update(a.items())
+
         d['attach_status'] = 'attached'
-        d['instance_uuid'] = att['server_id']
-        d['mountpoint'] = att['device']
     else:
         d['attach_status'] = 'detached'
     # NOTE(dzyu) volume(cinder) v2 API uses 'name' instead of 'display_name',
@@ -216,6 +224,33 @@ def _untranslate_snapshot_summary_view(context, snapshot):
     return d
 
 
+def translate_cinder_exception(method):
+    """Transforms a cinder exception but keeps its traceback intact."""
+    @functools.wraps(method)
+    def wrapper(self, ctx, *args, **kwargs):
+        try:
+            res = method(self, ctx, *args, **kwargs)
+        except (cinder_exception.ConnectionError,
+                keystone_exception.ConnectionError):
+            exc_type, exc_value, exc_trace = sys.exc_info()
+            exc_value = exception.CinderConnectionFailed(
+                reason=six.text_type(exc_value))
+            six.reraise(exc_value, None, exc_trace)
+        except (keystone_exception.BadRequest,
+                cinder_exception.BadRequest):
+            exc_type, exc_value, exc_trace = sys.exc_info()
+            exc_value = exception.InvalidInput(
+                reason=six.text_type(exc_value))
+            six.reraise(exc_value, None, exc_trace)
+        except (keystone_exception.Forbidden,
+                cinder_exception.Forbidden):
+            exc_type, exc_value, exc_trace = sys.exc_info()
+            exc_value = exception.Forbidden(message=six.text_type(exc_value))
+            six.reraise(exc_value, None, exc_trace)
+        return res
+    return wrapper
+
+
 def translate_volume_exception(method):
     """Transforms the exception for the volume but keeps its traceback intact.
     """
@@ -228,19 +263,9 @@ def translate_volume_exception(method):
             if isinstance(exc_value, (keystone_exception.NotFound,
                                       cinder_exception.NotFound)):
                 exc_value = exception.VolumeNotFound(volume_id=volume_id)
-            elif isinstance(exc_value, (keystone_exception.BadRequest,
-                                        cinder_exception.BadRequest)):
-                exc_value = exception.InvalidInput(
-                    reason=six.text_type(exc_value))
-            six.reraise(exc_value, None, exc_trace)
-        except (cinder_exception.ConnectionError,
-                keystone_exception.ConnectionError):
-            exc_type, exc_value, exc_trace = sys.exc_info()
-            exc_value = exception.CinderConnectionFailed(
-                reason=six.text_type(exc_value))
             six.reraise(exc_value, None, exc_trace)
         return res
-    return wrapper
+    return translate_cinder_exception(wrapper)
 
 
 def translate_snapshot_exception(method):
@@ -257,14 +282,8 @@ def translate_snapshot_exception(method):
                                       cinder_exception.NotFound)):
                 exc_value = exception.SnapshotNotFound(snapshot_id=snapshot_id)
             six.reraise(exc_value, None, exc_trace)
-        except (cinder_exception.ConnectionError,
-                keystone_exception.ConnectionError):
-            exc_type, exc_value, exc_trace = sys.exc_info()
-            reason = six.text_type(exc_value)
-            exc_value = exception.CinderConnectionFailed(reason=reason)
-            six.reraise(exc_value, None, exc_trace)
         return res
-    return wrapper
+    return translate_cinder_exception(wrapper)
 
 
 class API(object):
@@ -275,6 +294,7 @@ class API(object):
         item = cinderclient(context).volumes.get(volume_id)
         return _untranslate_volume_summary_view(context, item)
 
+    @translate_cinder_exception
     def get_all(self, context, search_opts=None):
         search_opts = search_opts or {}
         items = cinderclient(context).volumes.list(detailed=True,
@@ -316,11 +336,23 @@ class API(object):
                             'vol_zone': volume['availability_zone']}
                 raise exception.InvalidVolume(reason=msg)
 
-    def check_detach(self, context, volume):
+    def check_detach(self, context, volume, instance=None):
         # TODO(vish): abstract status checking?
         if volume['status'] == "available":
             msg = _("volume %s already detached") % volume['id']
             raise exception.InvalidVolume(reason=msg)
+
+        if volume['attach_status'] == 'detached':
+            msg = _("Volume must be attached in order to detach.")
+            raise exception.InvalidVolume(reason=msg)
+
+        # NOTE(ildikov):Preparation for multiattach support, when a volume
+        # can be attached to multiple hosts and/or instances,
+        # so just check the attachment specific to this instance
+        if instance is not None and instance.uuid not in volume['attachments']:
+            # TODO(ildikov): change it to a better exception, when enable
+            # multi-attach.
+            raise exception.VolumeUnattached(volume_id=volume['id'])
 
     @translate_volume_exception
     def reserve_volume(self, context, volume_id):
@@ -344,14 +376,42 @@ class API(object):
                                              mountpoint, mode=mode)
 
     @translate_volume_exception
-    def detach(self, context, volume_id):
-        cinderclient(context).volumes.detach(volume_id)
+    def detach(self, context, volume_id, instance_uuid=None,
+               attachment_id=None):
+        if attachment_id is None:
+            volume = self.get(context, volume_id)
+            if volume['multiattach']:
+                attachments = volume.get('attachments', {})
+                if instance_uuid:
+                    attachment_id = attachments.get(instance_uuid, {}).\
+                            get('attachment_id')
+                    if not attachment_id:
+                        LOG.warning(_LW("attachment_id couldn't be retrieved "
+                                        "for volume %(volume_id)s with "
+                                        "instance_uuid %(instance_id)s. The "
+                                        "volume has the 'multiattach' flag "
+                                        "enabled, without the attachment_id "
+                                        "Cinder most probably cannot perform "
+                                        "the detach."),
+                                    {'volume_id': volume_id,
+                                     'instance_id': instance_uuid})
+                else:
+                    LOG.warning(_LW("attachment_id couldn't be retrieved for "
+                                    "volume %(volume_id)s. The volume has the "
+                                    "'multiattach' flag enabled, without the "
+                                    "attachment_id Cinder most probably "
+                                    "cannot perform the detach."),
+                                {'volume_id': volume_id})
+
+        cinderclient(context).volumes.detach(volume_id, attachment_id)
 
     @translate_volume_exception
     def initialize_connection(self, context, volume_id, connector):
         try:
-            return cinderclient(context).volumes.initialize_connection(
-                volume_id, connector)
+            connection_info = cinderclient(
+                context).volumes.initialize_connection(volume_id, connector)
+            connection_info['connector'] = connector
+            return connection_info
         except cinder_exception.ClientException as ex:
             with excutils.save_and_reraise_exception():
                 LOG.error(_LE('Initialize connection failed for volume '
@@ -381,11 +441,13 @@ class API(object):
         return cinderclient(context).volumes.terminate_connection(volume_id,
                                                                   connector)
 
+    @translate_cinder_exception
     def migrate_volume_completion(self, context, old_volume_id, new_volume_id,
                                   error=False):
         return cinderclient(context).volumes.migrate_volume_completion(
             old_volume_id, new_volume_id, error)
 
+    @translate_cinder_exception
     def create(self, context, size, name, description, snapshot=None,
                image_id=None, volume_type=None, metadata=None,
                availability_zone=None):
@@ -416,9 +478,6 @@ class API(object):
             return _untranslate_volume_summary_view(context, item)
         except cinder_exception.OverLimit:
             raise exception.OverQuota(overs='volumes')
-        except (cinder_exception.BadRequest,
-                keystone_exception.BadRequest) as e:
-            raise exception.InvalidInput(reason=e)
 
     @translate_volume_exception
     def delete(self, context, volume_id):
@@ -433,6 +492,7 @@ class API(object):
         item = cinderclient(context).volume_snapshots.get(snapshot_id)
         return _untranslate_snapshot_summary_view(context, item)
 
+    @translate_cinder_exception
     def get_all_snapshots(self, context):
         items = cinderclient(context).volume_snapshots.list(detailed=True)
         rvals = []
@@ -463,6 +523,7 @@ class API(object):
     def delete_snapshot(self, context, snapshot_id):
         cinderclient(context).volume_snapshots.delete(snapshot_id)
 
+    @translate_cinder_exception
     def get_volume_encryption_metadata(self, context, volume_id):
         return cinderclient(context).volumes.get_encryption_metadata(volume_id)
 

@@ -27,11 +27,11 @@ except ImportError:
 
 
 import iso8601
-from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import timeutils
 import six
 
+import nova.conf
 from nova import context as context_module
 from nova import exception
 from nova.i18n import _LI, _LW
@@ -42,38 +42,8 @@ from nova.scheduler import weights
 from nova import utils
 from nova.virt import hardware
 
-host_manager_opts = [
-    cfg.MultiStrOpt('scheduler_available_filters',
-            default=['nova.scheduler.filters.all_filters'],
-            help='Filter classes available to the scheduler which may '
-                    'be specified more than once.  An entry of '
-                    '"nova.scheduler.filters.all_filters" '
-                    'maps to all filters included with nova.'),
-    cfg.ListOpt('scheduler_default_filters',
-                default=[
-                  'RetryFilter',
-                  'AvailabilityZoneFilter',
-                  'RamFilter',
-                  'DiskFilter',
-                  'ComputeFilter',
-                  'ComputeCapabilitiesFilter',
-                  'ImagePropertiesFilter',
-                  'ServerGroupAntiAffinityFilter',
-                  'ServerGroupAffinityFilter',
-                  ],
-                help='Which filter class names to use for filtering hosts '
-                      'when not specified in the request.'),
-    cfg.ListOpt('scheduler_weight_classes',
-                default=['nova.scheduler.weights.all_weighers'],
-                help='Which weight class names to use for weighing hosts'),
-    cfg.BoolOpt('scheduler_tracks_instance_changes',
-               default=True,
-               help='Determines if the Scheduler tracks changes to instances '
-                    'to help with its filtering decisions.'),
-]
 
-CONF = cfg.CONF
-CONF.register_opts(host_manager_opts)
+CONF = nova.conf.CONF
 
 LOG = logging.getLogger(__name__)
 HOST_INSTANCE_SEMAPHORE = "host_instance"
@@ -136,9 +106,10 @@ class HostState(object):
     previously used and lock down access.
     """
 
-    def __init__(self, host, node, compute=None):
+    def __init__(self, host, node):
         self.host = host
         self.nodename = node
+        self._lock_name = (host, node)
 
         # Mutable available resources.
         # These will change as resources are virtually "consumed".
@@ -179,15 +150,36 @@ class HostState(object):
         # Allocation ratios for this host
         self.ram_allocation_ratio = None
         self.cpu_allocation_ratio = None
+        self.disk_allocation_ratio = None
 
         self.updated = None
-        if compute:
-            self.update_from_compute_node(compute)
 
-    def update_service(self, service):
-        self.service = ReadOnlyDict(service)
+    def update(self, compute=None, service=None, aggregates=None,
+            inst_dict=None):
+        """Update all information about a host."""
 
-    def update_from_compute_node(self, compute):
+        @utils.synchronized(self._lock_name)
+        def _locked_update(self, compute, service, aggregates, inst_dict):
+            # Scheduler API is inherently multi-threaded as every incoming RPC
+            # message will be dispatched in it's own green thread. So the
+            # shared host state should be updated in a consistent way to make
+            # sure its data is valid under concurrent write operations.
+            if compute is not None:
+                LOG.debug("Update host state from compute node: %s", compute)
+                self._update_from_compute_node(compute)
+            if aggregates is not None:
+                LOG.debug("Update host state with aggregates: %s", aggregates)
+                self.aggregates = aggregates
+            if service is not None:
+                LOG.debug("Update host state with service dict: %s", service)
+                self.service = ReadOnlyDict(service)
+            if inst_dict is not None:
+                LOG.debug("Update host state with instances: %s", inst_dict)
+                self.instances = inst_dict
+
+        return _locked_update(self, compute, service, aggregates, inst_dict)
+
+    def _update_from_compute_node(self, compute):
         """Update information about a host from a ComputeNode object."""
         if (self.updated and compute.updated_at
                 and self.updated > compute.updated_at):
@@ -250,10 +242,23 @@ class HostState(object):
         # update allocation ratios given by the ComputeNode object
         self.cpu_allocation_ratio = compute.cpu_allocation_ratio
         self.ram_allocation_ratio = compute.ram_allocation_ratio
+        self.disk_allocation_ratio = compute.disk_allocation_ratio
 
-    @set_update_time_on_success
     def consume_from_request(self, spec_obj):
-        """Incrementally update host state from an RequestSpec object."""
+        """Incrementally update host state from a RequestSpec object."""
+
+        @utils.synchronized(self._lock_name)
+        @set_update_time_on_success
+        def _locked(self, spec_obj):
+            # Scheduler API is inherently multi-threaded as every incoming RPC
+            # message will be dispatched in it's own green thread. So the
+            # shared host state should be consumed in a consistent way to make
+            # sure its data is valid under concurrent write operations.
+            self._locked_consume_from_request(spec_obj)
+
+        return _locked(self, spec_obj)
+
+    def _locked_consume_from_request(self, spec_obj):
         disk_mb = (spec_obj.root_gb +
                    spec_obj.ephemeral_gb) * 1024
         ram_mb = spec_obj.memory_mb
@@ -305,9 +310,13 @@ class HostState(object):
         self.num_io_ops += 1
 
     def __repr__(self):
-        return ("(%s, %s) ram:%s disk:%s io_ops:%s instances:%s" %
-                (self.host, self.nodename, self.free_ram_mb, self.free_disk_mb,
-                 self.num_io_ops, self.num_instances))
+        return ("(%(host)s, %(node)s) ram: %(free_ram)sMB "
+                "disk: %(free_disk)sMB io_ops: %(num_io_ops)s "
+                "instances: %(num_instances)s" %
+                {'host': self.host, 'node': self.nodename,
+                 'free_ram': self.free_ram_mb, 'free_disk': self.free_disk_mb,
+                 'num_io_ops': self.num_io_ops,
+                 'num_instances': self.num_instances})
 
 
 class HostManager(object):
@@ -315,7 +324,7 @@ class HostManager(object):
 
     # Can be overridden in a subclass
     def host_state_cls(self, host, node, **kwargs):
-        return HostState(host, node, **kwargs)
+        return HostState(host, node)
 
     def __init__(self):
         self.host_state_map = {}
@@ -405,7 +414,8 @@ class HostManager(object):
                 start_node += batch_size
                 end_node += batch_size
                 filters = {"host": [curr_node.host
-                                    for curr_node in curr_nodes]}
+                                    for curr_node in curr_nodes],
+                           "deleted": False}
                 result = objects.InstanceList.get_by_filters(context,
                                                              filters)
                 instances = result.objects
@@ -449,7 +459,7 @@ class HostManager(object):
             raise exception.SchedulerHostFilterNotFound(filter_name=msg)
         return good_filters
 
-    def get_filtered_hosts(self, hosts, filter_properties,
+    def get_filtered_hosts(self, hosts, spec_obj,
             filter_class_names=None, index=0):
         """Filter hosts and return only ones passing all filters."""
 
@@ -457,7 +467,7 @@ class HostManager(object):
             ignored_hosts = []
             for host in hosts_to_ignore:
                 for (hostname, nodename) in list(host_map.keys()):
-                    if host == hostname:
+                    if host.lower() == hostname.lower():
                         del host_map[(hostname, nodename)]
                         ignored_hosts.append(host)
             ignored_hosts_str = ', '.join(ignored_hosts)
@@ -465,8 +475,9 @@ class HostManager(object):
 
         def _match_forced_hosts(host_map, hosts_to_force):
             forced_hosts = []
+            lowered_hosts_to_force = [host.lower() for host in hosts_to_force]
             for (hostname, nodename) in list(host_map.keys()):
-                if hostname not in hosts_to_force:
+                if hostname.lower() not in lowered_hosts_to_force:
                     del host_map[(hostname, nodename)]
                 else:
                     forced_hosts.append(hostname)
@@ -499,9 +510,9 @@ class HostManager(object):
             filters = self.default_filters
         else:
             filters = self._choose_host_filters(filter_class_names)
-        ignore_hosts = filter_properties.get('ignore_hosts', [])
-        force_hosts = filter_properties.get('force_hosts', [])
-        force_nodes = filter_properties.get('force_nodes', [])
+        ignore_hosts = spec_obj.ignore_hosts or []
+        force_hosts = spec_obj.force_hosts or []
+        force_nodes = spec_obj.force_nodes or []
 
         if ignore_hosts or force_hosts or force_nodes:
             # NOTE(deva): we can't assume "host" is unique because
@@ -520,15 +531,17 @@ class HostManager(object):
                 # NOTE(deva): Skip filters when forcing host or node
                 if name_to_cls_map:
                     return name_to_cls_map.values()
+                else:
+                    return []
             hosts = six.itervalues(name_to_cls_map)
 
         return self.filter_handler.get_filtered_objects(filters,
-                hosts, filter_properties, index)
+                hosts, spec_obj, index)
 
-    def get_weighed_hosts(self, hosts, weight_properties):
+    def get_weighed_hosts(self, hosts, spec_obj):
         """Weigh the hosts."""
         return self.weight_handler.get_weighed_objects(self.weighers,
-                hosts, weight_properties)
+                hosts, spec_obj)
 
     def get_all_host_states(self, context):
         """Returns a list of HostStates that represents all the hosts
@@ -538,7 +551,7 @@ class HostManager(object):
 
         service_refs = {service.host: service
                         for service in objects.ServiceList.get_by_binary(
-                            context, 'nova-compute')}
+                            context, 'nova-compute', include_disabled=True)}
         # Get resource usage across the available compute nodes:
         compute_nodes = objects.ComputeNodeList.get_all(context)
         seen_nodes = set()
@@ -554,19 +567,17 @@ class HostManager(object):
             node = compute.hypervisor_hostname
             state_key = (host, node)
             host_state = self.host_state_map.get(state_key)
-            if host_state:
-                host_state.update_from_compute_node(compute)
-            else:
+            if not host_state:
                 host_state = self.host_state_cls(host, node, compute=compute)
                 self.host_state_map[state_key] = host_state
             # We force to update the aggregates info each time a new request
             # comes in, because some changes on the aggregates could have been
             # happening after setting this field for the first time
-            host_state.aggregates = [self.aggs_by_id[agg_id] for agg_id in
-                                     self.host_aggregates_map[
-                                         host_state.host]]
-            host_state.update_service(dict(service))
-            self._add_instance_info(context, compute, host_state)
+            host_state.update(compute,
+                              dict(service),
+                              self._get_aggregates_info(host),
+                              self._get_instance_info(context, compute))
+
             seen_nodes.add(state_key)
 
         # remove compute nodes from host_state_map if they are not active
@@ -579,8 +590,12 @@ class HostManager(object):
 
         return six.itervalues(self.host_state_map)
 
-    def _add_instance_info(self, context, compute, host_state):
-        """Adds the host instance info to the host_state object.
+    def _get_aggregates_info(self, host):
+        return [self.aggs_by_id[agg_id] for agg_id in
+                self.host_aggregates_map[host]]
+
+    def _get_instance_info(self, context, compute):
+        """Gets the host instance info from the compute host.
 
         Some older compute nodes may not be sending instance change updates to
         the Scheduler; other sites may disable this feature for performance
@@ -598,7 +613,7 @@ class HostManager(object):
             inst_list = objects.InstanceList.get_by_host(context, host_name)
             inst_dict = {instance.uuid: instance
                          for instance in inst_list.objects}
-        host_state.instances = inst_dict
+        return inst_dict
 
     def _recreate_instance_info(self, context, host_name):
         """Get the InstanceList for the specified host, and store it in the

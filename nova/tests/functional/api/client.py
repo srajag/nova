@@ -117,13 +117,17 @@ class TestOpenStackClient(object):
     """
 
     def __init__(self, auth_user, auth_key, auth_uri,
-                 project_id='openstack'):
+                 project_id=None):
         super(TestOpenStackClient, self).__init__()
         self.auth_result = None
         self.auth_user = auth_user
         self.auth_key = auth_key
         self.auth_uri = auth_uri
-        self.project_id = project_id
+        if project_id is None:
+            self.project_id = "6f70656e737461636b20342065766572"
+        else:
+            self.project_id = project_id
+        self.microversion = None
 
     def request(self, url, method='GET', body=None, headers=None):
         _headers = {'Content-Type': 'application/json'}
@@ -167,6 +171,8 @@ class TestOpenStackClient(object):
 
         headers = kwargs.setdefault('headers', {})
         headers['X-Auth-Token'] = auth_result['x-auth-token']
+        if self.microversion:
+            headers['X-OpenStack-Nova-API-Version'] = self.microversion
 
         response = self.request(full_uri, **kwargs)
 
@@ -352,3 +358,7 @@ class TestOpenStackClient(object):
 
     def delete_server_group(self, group_id):
         self.api_delete('/os-server-groups/%s' % group_id)
+
+    def get_instance_actions(self, server_id):
+        return self.api_get('/servers/%s/os-instance-actions' %
+                            (server_id)).body['instanceActions']

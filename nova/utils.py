@@ -23,7 +23,6 @@ import datetime
 import errno
 import functools
 import hashlib
-import hmac
 import inspect
 import logging as std_logging
 import os
@@ -57,6 +56,8 @@ from six.moves import range
 
 from nova import exception
 from nova.i18n import _, _LE, _LI, _LW
+import nova.network
+from nova import safe_utils
 
 notify_decorator = 'nova.notifications.notify_decorator'
 
@@ -66,7 +67,6 @@ monkey_patch_opts = [
                 help='Whether to apply monkey patching'),
     cfg.ListOpt('monkey_patch_modules',
                 default=[
-                  'nova.api.ec2.cloud:%s' % (notify_decorator),
                   'nova.compute.api:%s' % (notify_decorator)
                   ],
                 help='List of modules/decorators to monkey patch'),
@@ -154,7 +154,6 @@ Then this is a good place for your workaround.
 CONF = cfg.CONF
 CONF.register_opts(monkey_patch_opts)
 CONF.register_opts(utils_opts)
-CONF.import_opt('network_api_class', 'nova.network')
 CONF.register_opts(workarounds_opts, group='workarounds')
 
 LOG = logging.getLogger(__name__)
@@ -409,11 +408,6 @@ def trycmd(*args, **kwargs):
     return processutils.trycmd(*args, **kwargs)
 
 
-def novadir():
-    import nova
-    return os.path.abspath(nova.__file__).split('nova/__init__.py')[0]
-
-
 def generate_uid(topic, size=8):
     characters = '01234567890abcdefghijklmnopqrstuvwxyz'
     choices = [random.choice(characters) for _x in range(size)]
@@ -587,14 +581,17 @@ def xhtml_escape(value):
 def utf8(value):
     """Try to turn a string into utf-8 if possible.
 
-    Code is directly from the utf8 function in
+    The original code was copied from the utf8 function in
     http://github.com/facebook/tornado/blob/master/tornado/escape.py
 
     """
-    if isinstance(value, six.text_type):
-        return value.encode('utf-8')
-    assert isinstance(value, str)
-    return value
+    if value is None or isinstance(value, six.binary_type):
+        return value
+
+    if not isinstance(value, six.text_type):
+        value = six.text_type(value)
+
+    return value.encode('utf-8')
 
 
 def check_isinstance(obj, cls):
@@ -719,12 +716,12 @@ def monkey_patch():
     # If CONF.monkey_patch is not True, this function do nothing.
     if not CONF.monkey_patch:
         return
-    if six.PY3:
+    if six.PY2:
+        is_method = inspect.ismethod
+    else:
         def is_method(obj):
             # Unbound methods became regular functions on Python 3
             return inspect.ismethod(obj) or inspect.isfunction(obj)
-    else:
-        is_method = inspect.ismethod
     # Get list of modules and decorators
     for module_and_decorator in CONF.monkey_patch_modules:
         module, decorator_name = module_and_decorator.split(':')
@@ -745,15 +742,6 @@ def monkey_patch():
                 func = importutils.import_class("%s.%s" % (module, key))
                 setattr(sys.modules[module], key,
                     decorator("%s.%s" % (module, key), func))
-
-
-def convert_to_list_dict(lst, label):
-    """Convert a value or list into a list of dicts."""
-    if not lst:
-        return None
-    if not isinstance(lst, list):
-        lst = [lst]
-    return [{label: x} for x in lst]
 
 
 def make_dev_path(dev, partition=None, base='/dev'):
@@ -799,6 +787,7 @@ def sanitize_hostname(hostname, default_name=None):
         if six.PY3:
             hostname = hostname.decode('latin-1')
 
+    hostname = truncate_hostname(hostname)
     hostname = re.sub('[ _]', '-', hostname)
     hostname = re.sub('[^\w.-]+', '', hostname)
     hostname = hostname.lower()
@@ -807,8 +796,7 @@ def sanitize_hostname(hostname, default_name=None):
     # empty hostname
     if hostname == "" and default_name is not None:
         return truncate_hostname(default_name)
-
-    return truncate_hostname(hostname)
+    return hostname
 
 
 @contextlib.contextmanager
@@ -1041,32 +1029,11 @@ def instance_sys_meta(instance):
                                 include_deleted=True)
 
 
-def get_wrapped_function(function):
-    """Get the method at the bottom of a stack of decorators."""
-    if not hasattr(function, '__closure__') or not function.__closure__:
-        return function
-
-    def _get_wrapped_function(function):
-        if not hasattr(function, '__closure__') or not function.__closure__:
-            return None
-
-        for closure in function.__closure__:
-            func = closure.cell_contents
-
-            deeper_func = _get_wrapped_function(func)
-            if deeper_func:
-                return deeper_func
-            elif hasattr(closure.cell_contents, '__call__'):
-                return closure.cell_contents
-
-    return _get_wrapped_function(function)
-
-
 def expects_func_args(*args):
     def _decorator_checker(dec):
         @functools.wraps(dec)
         def _decorator(f):
-            base_f = get_wrapped_function(f)
+            base_f = safe_utils.get_wrapped_function(f)
             arg_names, a, kw, _default = inspect.getargspec(base_f)
             if a or kw or set(args) <= set(arg_names):
                 # NOTE (ndipanov): We can't really tell if correct stuff will
@@ -1212,50 +1179,16 @@ def is_none_string(val):
     return val.lower() == 'none'
 
 
-def convert_version_to_int(version):
-    try:
-        if isinstance(version, six.string_types):
-            version = convert_version_to_tuple(version)
-        if isinstance(version, tuple):
-            return six.moves.reduce(lambda x, y: (x * 1000) + y, version)
-    except Exception:
-        msg = _("Hypervisor version %s is invalid.") % version
-        raise exception.NovaException(msg)
-
-
-def convert_version_to_str(version_int):
-    version_numbers = []
-    factor = 1000
-    while version_int != 0:
-        version_number = version_int - (version_int // factor * factor)
-        version_numbers.insert(0, str(version_number))
-        version_int = version_int // factor
-
-    return six.moves.reduce(lambda x, y: "%s.%s" % (x, y), version_numbers)
-
-
-def convert_version_to_tuple(version_str):
-    return tuple(int(part) for part in version_str.split('.'))
-
-
 def is_neutron():
     global _IS_NEUTRON
 
     if _IS_NEUTRON is not None:
         return _IS_NEUTRON
 
-    try:
-        # compatibility with Folsom/Grizzly configs
-        cls_name = CONF.network_api_class
-        if cls_name == 'nova.network.quantumv2.api.API':
-            cls_name = 'nova.network.neutronv2.api.API'
-
-        from nova.network.neutronv2 import api as neutron_api
-        _IS_NEUTRON = issubclass(importutils.import_class(cls_name),
-                                 neutron_api.API)
-    except ImportError:
-        _IS_NEUTRON = False
-
+    # TODO(sdague): As long as network_api_class is importable
+    # is_neutron can return None to mean we have no idea what their
+    # class is.
+    _IS_NEUTRON = (nova.network.is_neutron() is True)
     return _IS_NEUTRON
 
 
@@ -1368,23 +1301,6 @@ def get_hash_str(base_str):
     if isinstance(base_str, six.text_type):
         base_str = base_str.encode('utf-8')
     return hashlib.md5(base_str).hexdigest()
-
-if hasattr(hmac, 'compare_digest'):
-    constant_time_compare = hmac.compare_digest
-else:
-    def constant_time_compare(first, second):
-        """Returns True if both string inputs are equal, otherwise False.
-
-        This function should take a constant amount of time regardless of
-        how many characters in the strings match.
-
-        """
-        if len(first) != len(second):
-            return False
-        result = 0
-        for x, y in zip(first, second):
-            result |= ord(x) ^ ord(y)
-        return result == 0
 
 
 def filter_and_format_resource_metadata(resource_type, resource_list,
@@ -1539,3 +1455,21 @@ def delete_cached_file(filename):
 
     if filename in _FILE_CACHE:
         del _FILE_CACHE[filename]
+
+
+def isotime(at=None):
+    """Current time as ISO string,
+    as timeutils.isotime() is deprecated
+
+    :returns: Current time in ISO format
+    """
+    if not at:
+        at = timeutils.utcnow()
+    date_string = at.strftime("%Y-%m-%dT%H:%M:%S")
+    tz = at.tzinfo.tzname(None) if at.tzinfo else 'UTC'
+    date_string += ('Z' if tz == 'UTC' else tz)
+    return date_string
+
+
+def strtime(at):
+    return at.strftime("%Y-%m-%dT%H:%M:%S.%f")

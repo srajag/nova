@@ -64,10 +64,10 @@ class TestConfFixture(testtools.TestCase):
     """
     def _test_override(self):
         self.assertEqual('api-paste.ini', CONF.api_paste_config)
-        self.assertEqual(False, CONF.fake_network)
+        self.assertFalse(CONF.fake_network)
         self.useFixture(conf_fixture.ConfFixture())
         CONF.set_default('api_paste_config', 'foo')
-        self.assertEqual(True, CONF.fake_network)
+        self.assertTrue(CONF.fake_network)
 
     def test_override1(self):
         self._test_override()
@@ -155,11 +155,14 @@ class TestTimeout(testtools.TestCase):
 
 
 class TestOSAPIFixture(testtools.TestCase):
-    def test_responds_to_version(self):
+    @mock.patch('nova.objects.Service.get_by_host_and_binary')
+    @mock.patch('nova.objects.Service.create')
+    def test_responds_to_version(self, mock_service_create, mock_get):
         """Ensure the OSAPI server responds to calls sensibly."""
         self.useFixture(fixtures.OutputStreamCapture())
         self.useFixture(fixtures.StandardLogging())
         self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.RPCFixture('nova.test'))
         api = self.useFixture(fixtures.OSAPIFixture()).api
 
         # request the API root, which provides us the versions of the API
@@ -281,6 +284,33 @@ class TestDatabaseFixture(testtools.TestCase):
         self.assertEqual("BEGIN TRANSACTION;COMMIT;", schema)
 
 
+class TestDatabaseAtVersionFixture(testtools.TestCase):
+    def test_fixture_schema_version(self):
+        self.useFixture(conf_fixture.ConfFixture())
+
+        # In/after 317 aggregates did have uuid
+        self.useFixture(fixtures.DatabaseAtVersion(318))
+        engine = session.get_engine()
+        engine.connect()
+        meta = sqlalchemy.MetaData(engine)
+        aggregate = sqlalchemy.Table('aggregates', meta, autoload=True)
+        self.assertTrue(hasattr(aggregate.c, 'uuid'))
+
+        # Before 317, aggregates had no uuid
+        self.useFixture(fixtures.DatabaseAtVersion(316))
+        engine = session.get_engine()
+        engine.connect()
+        meta = sqlalchemy.MetaData(engine)
+        aggregate = sqlalchemy.Table('aggregates', meta, autoload=True)
+        self.assertFalse(hasattr(aggregate.c, 'uuid'))
+        engine.dispose()
+
+    def test_fixture_after_database_fixture(self):
+        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.Database())
+        self.useFixture(fixtures.DatabaseAtVersion(318))
+
+
 class TestIndirectionAPIFixture(testtools.TestCase):
     def test_indirection_api(self):
         # Should initially be None
@@ -312,6 +342,46 @@ class TestSpawnIsSynchronousFixture(testtools.TestCase):
         utils.spawn_n(tester.function, 'foo', bar='bar')
         tester.function.assert_called_once_with('foo', bar='bar')
 
+    def test_spawn_return_has_wait(self):
+        self.useFixture(fixtures.SpawnIsSynchronousFixture())
+        gt = utils.spawn(lambda x: '%s' % x, 'foo')
+        foo = gt.wait()
+        self.assertEqual('foo', foo)
+
+    def test_spawn_n_return_has_wait(self):
+        self.useFixture(fixtures.SpawnIsSynchronousFixture())
+        gt = utils.spawn_n(lambda x: '%s' % x, 'foo')
+        foo = gt.wait()
+        self.assertEqual('foo', foo)
+
+    def test_spawn_has_link(self):
+        self.useFixture(fixtures.SpawnIsSynchronousFixture())
+        gt = utils.spawn(mock.MagicMock)
+        passed_arg = 'test'
+        call_count = []
+
+        def fake(thread, param):
+            self.assertEqual(gt, thread)
+            self.assertEqual(passed_arg, param)
+            call_count.append(1)
+
+        gt.link(fake, passed_arg)
+        self.assertEqual(1, len(call_count))
+
+    def test_spawn_n_has_link(self):
+        self.useFixture(fixtures.SpawnIsSynchronousFixture())
+        gt = utils.spawn_n(mock.MagicMock)
+        passed_arg = 'test'
+        call_count = []
+
+        def fake(thread, param):
+            self.assertEqual(gt, thread)
+            self.assertEqual(passed_arg, param)
+            call_count.append(1)
+
+        gt.link(fake, passed_arg)
+        self.assertEqual(1, len(call_count))
+
 
 class TestBannedDBSchemaOperations(testtools.TestCase):
     def test_column(self):
@@ -329,3 +399,17 @@ class TestBannedDBSchemaOperations(testtools.TestCase):
                               table.drop)
             self.assertRaises(exception.DBNotAllowed,
                               table.alter)
+
+
+class TestStableObjectJsonFixture(testtools.TestCase):
+    def test_changes_sort(self):
+        class TestObject(obj_base.NovaObject):
+            def obj_what_changed(self):
+                return ['z', 'a']
+
+        obj = TestObject()
+        self.assertEqual(['z', 'a'],
+                         obj.obj_to_primitive()['nova_object.changes'])
+        with fixtures.StableObjectJsonFixture():
+            self.assertEqual(['a', 'z'],
+                             obj.obj_to_primitive()['nova_object.changes'])

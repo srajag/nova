@@ -13,6 +13,7 @@
 import mock
 from mox3 import mox
 from oslo_config import cfg
+from oslo_utils import fixture as utils_fixture
 from oslo_utils import timeutils
 
 from nova.compute import claims
@@ -48,8 +49,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         instance = self._create_fake_instance_obj(params={'host': host})
         image_id = 'fake_image_id'
         host = 'fake-mini'
-        cur_time = timeutils.utcnow()
-        timeutils.set_time_override(cur_time)
+        self.useFixture(utils_fixture.TimeFixture())
         instance.task_state = task_states.SHELVING
         instance.save()
 
@@ -141,14 +141,14 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         instance = self._create_fake_instance_obj(params={'host': host})
         instance.task_state = task_states.SHELVING
         instance.save()
-        cur_time = timeutils.utcnow()
-        timeutils.set_time_override(cur_time)
+        self.useFixture(utils_fixture.TimeFixture())
 
         self.mox.StubOutWithMock(self.compute, '_notify_about_instance_usage')
         self.mox.StubOutWithMock(self.compute.driver, 'power_off')
         self.mox.StubOutWithMock(self.compute, '_get_power_state')
         self.mox.StubOutWithMock(self.compute.network_api,
                                  'cleanup_instance_network_on_host')
+        self.mox.StubOutWithMock(self.compute, '_update_resource_tracker')
 
         self.compute._notify_about_instance_usage(self.context, instance,
                 'shelve_offload.start')
@@ -162,6 +162,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
                 self.context, instance, instance.host)
         self.compute._get_power_state(self.context,
                 instance).AndReturn(123)
+        self.compute._update_resource_tracker(self.context, instance)
         self.compute._notify_about_instance_usage(self.context, instance,
                 'shelve_offload.end')
         self.mox.ReplayAll()
@@ -191,7 +192,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         # Adding shelved_* keys in system metadata to verify
         # whether those are deleted after unshelve call.
         sys_meta = dict(instance.system_metadata)
-        sys_meta['shelved_at'] = timeutils.strtime(at=cur_time)
+        sys_meta['shelved_at'] = cur_time.isoformat()
         sys_meta['shelved_image_id'] = image['id']
         sys_meta['shelved_host'] = host
         instance.system_metadata = sys_meta
@@ -233,7 +234,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
             else:
                 self.fail('Unexpected save!')
 
-        fake_image.stub_out_image_service(self.stubs)
+        fake_image.stub_out_image_service(self)
         self.stubs.Set(fake_image._FakeImageService, 'delete', fake_delete)
 
         self.compute._notify_about_instance_usage(self.context, instance,
@@ -242,7 +243,8 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
                 mox.IgnoreArg(), do_check_attach=False).AndReturn('fake_bdm')
         self.compute.network_api.setup_instance_network_on_host(
                 self.context, instance, self.compute.host)
-        self.compute.driver.spawn(self.context, instance, image,
+        self.compute.driver.spawn(self.context, instance,
+                mox.IsA(objects.ImageMeta),
                 injected_files=[], admin_password=None,
                 network_info=[],
                 block_device_info='fake_bdm')
@@ -318,7 +320,8 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         self.rt.instance_claim(self.context, instance, limits).AndReturn(
                 claims.Claim(self.context, instance, self.rt,
                              _fake_resources()))
-        self.compute.driver.spawn(self.context, instance, image_meta,
+        self.compute.driver.spawn(self.context, instance,
+                mox.IsA(objects.ImageMeta),
                 injected_files=[], admin_password=None,
                 network_info=[],
                 block_device_info='fake_bdm')
@@ -353,14 +356,14 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         mock_older.return_value = False
         self.flags(shelved_offload_time=1)
         shelved_time = timeutils.utcnow()
-        timeutils.set_time_override(shelved_time)
-        timeutils.advance_time_seconds(CONF.shelved_offload_time - 1)
+        time_fixture = self.useFixture(utils_fixture.TimeFixture(shelved_time))
+        time_fixture.advance_time_seconds(CONF.shelved_offload_time - 1)
         instance = self._create_fake_instance_obj()
         instance.vm_state = vm_states.SHELVED
         instance.task_state = None
         instance.host = self.compute.host
         sys_meta = instance.system_metadata
-        sys_meta['shelved_at'] = timeutils.strtime(at=shelved_time)
+        sys_meta['shelved_at'] = shelved_time.isoformat()
         instance.save()
 
         with mock.patch.object(self.compute, 'shelve_offload_instance') as soi:
@@ -371,14 +374,14 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
     def test_shelved_poll_timedout(self):
         self.flags(shelved_offload_time=1)
         shelved_time = timeutils.utcnow()
-        timeutils.set_time_override(shelved_time)
-        timeutils.advance_time_seconds(CONF.shelved_offload_time + 10)
+        time_fixture = self.useFixture(utils_fixture.TimeFixture(shelved_time))
+        time_fixture.advance_time_seconds(CONF.shelved_offload_time + 1)
         instance = self._create_fake_instance_obj()
         instance.vm_state = vm_states.SHELVED
         instance.task_state = None
         instance.host = self.compute.host
         sys_meta = instance.system_metadata
-        sys_meta['shelved_at'] = timeutils.strtime(at=shelved_time)
+        sys_meta['shelved_at'] = shelved_time.isoformat()
         instance.save()
 
         data = []
@@ -465,7 +468,7 @@ class ShelveComputeAPITestCase(test_compute.BaseTestCase):
             metadata['id'] = '8b24ed3f-ee57-43bc-bc2e-fb2e9482bc42'
             return metadata
 
-        fake_image.stub_out_image_service(self.stubs)
+        fake_image.stub_out_image_service(self)
         self.stubs.Set(fake_image._FakeImageService, '__init__', fake_init)
         self.stubs.Set(fake_image._FakeImageService, 'create', fake_create)
 
@@ -475,7 +478,8 @@ class ShelveComputeAPITestCase(test_compute.BaseTestCase):
 
         db.instance_destroy(self.context, instance['uuid'])
 
-    def test_unshelve(self):
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve(self, get_by_instance_uuid):
         # Ensure instance can be unshelved.
         instance = self._create_fake_instance_obj()
 
@@ -487,7 +491,14 @@ class ShelveComputeAPITestCase(test_compute.BaseTestCase):
         instance.vm_state = vm_states.SHELVED
         instance.save()
 
-        self.compute_api.unshelve(self.context, instance)
+        fake_spec = objects.RequestSpec()
+        get_by_instance_uuid.return_value = fake_spec
+        with mock.patch.object(self.compute_api.compute_task_api,
+                               'unshelve_instance') as unshelve:
+            self.compute_api.unshelve(self.context, instance)
+            get_by_instance_uuid.assert_called_once_with(self.context,
+                                                         instance.uuid)
+            unshelve.assert_called_once_with(self.context, instance, fake_spec)
 
         self.assertEqual(instance.task_state, task_states.UNSHELVING)
 

@@ -16,7 +16,7 @@ import datetime
 
 import mock
 from oslo_config import cfg
-from oslo_utils import timeutils
+from oslo_utils import fixture as utils_fixture
 from oslo_vmware.objects import datastore as ds_obj
 from oslo_vmware import vim_util as vutil
 
@@ -24,6 +24,7 @@ from nova import objects
 from nova import test
 from nova.tests.unit import fake_instance
 from nova.tests.unit.virt.vmwareapi import fake
+from nova.tests import uuidsentinel
 from nova.virt.vmwareapi import ds_util
 from nova.virt.vmwareapi import imagecache
 
@@ -54,8 +55,7 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
             if not self.exists:
                 return
             ts = '%s%s' % (imagecache.TIMESTAMP_PREFIX,
-                    timeutils.strtime(at=self._time,
-                                      fmt=imagecache.TIMESTAMP_FORMAT))
+                           self._time.strftime(imagecache.TIMESTAMP_FORMAT))
             return ts
 
         with test.nested(
@@ -100,7 +100,7 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
             self.assertIsNone(ts)
 
     def test_get_timestamp_filename(self):
-        timeutils.set_time_override(override_time=self._time)
+        self.useFixture(utils_fixture.TimeFixture(self._time))
         fn = self._imagecache._get_timestamp_filename()
         self.assertEqual(self._file_name, fn)
 
@@ -218,7 +218,7 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
                               fake_timestamp_cleanup),
         ) as (_get_ds_browser, _get_timestamp, _mkdir, _file_delete,
               _timestamp_cleanup):
-            timeutils.set_time_override(override_time=self._time)
+            self.useFixture(utils_fixture.TimeFixture(self._time))
             datastore = ds_obj.Datastore(name='ds', ref='fake-ds-ref')
             dc_info = ds_util.DcInfo(ref='dc_ref', name='name',
                                      vmFolder='vmFolder')
@@ -256,13 +256,13 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
             instances = [{'image_ref': '1',
                           'host': CONF.host,
                           'name': 'inst-1',
-                          'uuid': '123',
+                          'uuid': uuidsentinel.foo,
                           'vm_state': '',
                           'task_state': ''},
                          {'image_ref': '2',
                           'host': CONF.host,
                           'name': 'inst-2',
-                          'uuid': '456',
+                          'uuid': uuidsentinel.bar,
                           'vm_state': '',
                           'task_state': ''}]
             all_instances = [fake_instance.fake_instance_obj(None, **instance)

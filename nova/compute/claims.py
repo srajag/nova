@@ -117,7 +117,7 @@ class Claim(NopClaim):
         """Compute operation requiring claimed resources has failed or
         been aborted.
         """
-        LOG.debug("Aborting claim: %s" % self, instance=self.instance)
+        LOG.debug("Aborting claim: %s", self, instance=self.instance)
         self.tracker.abort_instance_claim(self.context, self.instance)
 
     def _claim_test(self, resources, limits=None):
@@ -140,11 +140,10 @@ class Claim(NopClaim):
         vcpus_limit = limits.get('vcpu')
         numa_topology_limit = limits.get('numa_topology')
 
-        msg = _("Attempting claim: memory %(memory_mb)d MB, "
-                "disk %(disk_gb)d GB, vcpus %(vcpus)d CPU")
-        params = {'memory_mb': self.memory_mb, 'disk_gb': self.disk_gb,
-                  'vcpus': self.vcpus}
-        LOG.info(msg % params, instance=self.instance)
+        LOG.info(_LI("Attempting claim: memory %(memory_mb)d MB, "
+                     "disk %(disk_gb)d GB, vcpus %(vcpus)d CPU"),
+                 {'memory_mb': self.memory_mb, 'disk_gb': self.disk_gb,
+                  'vcpus': self.vcpus}, instance=self.instance)
 
         reasons = [self._test_memory(resources, memory_mb_limit),
                    self._test_disk(resources, disk_gb_limit),
@@ -191,9 +190,8 @@ class Claim(NopClaim):
             self.context, self.instance.uuid)
 
         if pci_requests.requests:
-            devs = self.tracker.pci_tracker.claim_instance(self.context,
-                                                           self.instance)
-            if not devs:
+            stats = self.tracker.pci_tracker.stats
+            if not stats.support_requests(pci_requests.requests):
                 return _('Claim pci failed.')
 
     def _test_ext_resources(self, limits):
@@ -313,11 +311,10 @@ class MoveClaim(Claim):
         """Compute operation requiring claimed resources has failed or
         been aborted.
         """
-        LOG.debug("Aborting claim: %s" % self, instance=self.instance)
+        LOG.debug("Aborting claim: %s", self, instance=self.instance)
         self.tracker.drop_move_claim(
             self.context,
-            self.instance, instance_type=self.instance_type,
-            image_meta=self.image_meta)
+            self.instance, instance_type=self.instance_type)
 
     def create_migration_context(self):
         if not self.migration:

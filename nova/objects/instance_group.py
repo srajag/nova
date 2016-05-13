@@ -13,6 +13,7 @@
 #    under the License.
 
 from oslo_utils import uuidutils
+from oslo_utils import versionutils
 
 from nova.compute import utils as compute_utils
 from nova import db
@@ -20,7 +21,6 @@ from nova import exception
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
-from nova import utils
 
 
 LAZY_LOAD_FIELDS = ['hosts']
@@ -58,7 +58,7 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
         }
 
     def obj_make_compatible(self, primitive, target_version):
-        target_version = utils.convert_version_to_tuple(target_version)
+        target_version = versionutils.convert_version_to_tuple(target_version)
         if target_version < (1, 7):
             # NOTE(danms): Before 1.7, we had an always-empty
             # metadetails property
@@ -135,7 +135,7 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
         # InstanceGroup.add_members() method is called, which adds the mapping
         # table entries.
         # So, since the only way to have hosts in the updates is to set that
-        # field explicitely, we prefer to raise an Exception so the developer
+        # field explicitly, we prefer to raise an Exception so the developer
         # knows he has to call obj_reset_changes(['hosts']) right after setting
         # the field.
         if 'hosts' in updates:

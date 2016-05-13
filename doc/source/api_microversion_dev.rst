@@ -24,7 +24,7 @@ responses from the server.
 
 .. warning:: The ``latest`` value is mostly meant for integration testing and
   would be dangerous to rely on in client code since Nova microversions are not
-  following semver and therefore backward compability is not guaranteed.
+  following semver and therefore backward compatibility is not guaranteed.
   Clients, like python-novaclient, should always require a specific
   microversion but limit what is acceptable to the version range that it
   understands at the time.
@@ -88,10 +88,11 @@ changed. The user contract covers many kinds of information such as:
 
     Example: changing the return code of an API from 501 to 400.
 
-    .. note:: Fixing a bug so that a 400+ code is returned rather than a 500
-      does not require a microversion change. It's assumed that clients are not
-      expected to handle a 500 response and therefore should not need to opt-in
-      to microversion changes that fixes a 500 response from happening.
+    .. note:: Fixing a bug so that a 400+ code is returned rather than a 500 or
+      503 does not require a microversion change. It's assumed that clients are
+      not expected to handle a 500 or 503 response and therefore should not
+      need to opt-in to microversion changes that fixes a 500 or 503 response
+      from happening.
       According to the OpenStack API Working Group, a
       **500 Internal Server Error** should **not** be returned to the user for
       failures due to user error that can be fixed by changing the request on
@@ -177,6 +178,20 @@ we need a microversion".
   validation can fail with a 400 for invalid json request body. Request to
   url/resource that does not exist always fails with 404.
 
+When a microversion is not needed
+---------------------------------
+
+A microversion is not needed in the following situation:
+
+- the response
+
+  - Changing the error message without changing the response code
+    does not require a new microversion.
+
+  - Removing an inapplicable HTTP header, for example, suppose the Retry-After
+    HTTP header is being returned with a 4xx code. This header should only be
+    returned with a 503 or 3xx response, so it may be removed without bumping
+    the microversion.
 
 In Code
 -------
@@ -234,25 +249,6 @@ them will need ``# noqa`` to avoid failing flake8's ``F811`` rule. The
 two methods may be different in any kind of semantics (schema
 validation, return values, response codes, etc)
 
-A method with only small changes between versions
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-A method may have only small changes between microversions, in which
-case you can decorate a private method::
-
-    @api_version("2.1", "2.4")
-    def _version_specific_func(self, req, arg1):
-        pass
-
-    @api_version(min_version="2.5")  # noqa
-    def _version_specific_func(self, req, arg1):
-        pass
-
-    def show(self, req, id):
-        .... common stuff ....
-        self._version_specific_func(req, "foo")
-        .... common stuff ....
-
 A change in schema only
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -286,9 +282,14 @@ used to modify behavior based on its value::
         <common code>
 
         req_version = req.api_version_request
-        if req_version.matches("2.1", "2.5"):
+        req1_min = api_version_request.APIVersionRequest("2.1")
+        req1_max = api_version_request.APIVersionRequest("2.5")
+        req2_min = api_version_request.APIVersionRequest("2.6")
+        req2_max = api_version_request.APIVersionRequest("2.10")
+
+        if req_version.matches(req1_min, req1_max):
             ....stuff....
-        elif req_version.matches("2.6", "2.10"):
+        elif req_version.matches(req2min, req2_max):
             ....other stuff....
         elif req_version > api_version_request.APIVersionRequest("2.10"):
             ....more stuff.....
@@ -328,6 +329,9 @@ necessary to add changes to other places which describe your change:
 * Update the get versions api sample files:
   ``doc/api_samples/versions/versions-get-resp.json`` and
   ``nova/tests/functional/api_samples/versions/versions-get-resp.json.tpl``.
+
+* Make a new commit to python-novaclient and update corresponding
+  files to enable the newly added microversion API.
 
 Allocating a microversion
 -------------------------

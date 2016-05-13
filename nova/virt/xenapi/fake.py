@@ -77,12 +77,11 @@ LOG = logging.getLogger(__name__)
 def reset():
     for c in _CLASSES:
         _db_content[c] = {}
-    host = create_host('fake')
+    create_host('fake')
     create_vm('fake dom 0',
               'Running',
               is_a_template=False,
-              is_control_domain=True,
-              resident_on=host)
+              is_control_domain=True)
 
 
 def reset_table(table):
@@ -371,7 +370,7 @@ def _create_vlan(pif_ref, vlan_num, network_ref):
 
 
 def get_all(table):
-    return _db_content[table].keys()
+    return list(_db_content[table].keys())
 
 
 def get_all_records(table):
@@ -397,11 +396,11 @@ def _query_matches(record, query):
             matches = matches or _query_matches(record, clause)
         return matches
 
-    if query[:4] == 'not ':
+    if query.startswith('not '):
         return not _query_matches(record, query[4:])
 
     # Now it must be a single field - bad queries never match
-    if query[:5] != 'field':
+    if not query.startswith('field'):
         return False
     (field, value) = query[6:].split('=', 1)
 
@@ -482,7 +481,7 @@ class SessionBase(object):
         xenapi_session.apply_session_helpers(self)
 
     def pool_get_default_SR(self, _1, pool_ref):
-        return _db_content['pool'].values()[0]['default-SR']
+        return list(_db_content['pool'].values())[0]['default-SR']
 
     def VBD_insert(self, _1, vbd_ref, vdi_ref):
         vbd_rec = get_record('VBD', vbd_ref)
@@ -665,6 +664,7 @@ class SessionBase(object):
         return pickle.dumps(None)
 
     _plugin_glance_upload_vhd = _plugin_pickle_noop
+    _plugin_glance_upload_vhd2 = _plugin_pickle_noop
     _plugin_kernel_copy_vdi = _plugin_noop
     _plugin_kernel_create_kernel_ramdisk = _plugin_noop
     _plugin_kernel_remove_kernel_ramdisk = _plugin_noop
@@ -761,7 +761,7 @@ class SessionBase(object):
         return base64.b64encode(zlib.compress("dom_id: %s" % dom_id))
 
     def _plugin_nova_plugin_version_get_version(self, method, args):
-        return pickle.dumps("1.2")
+        return pickle.dumps("1.3")
 
     def _plugin_xenhost_query_gc(self, method, args):
         return pickle.dumps("False")
@@ -820,7 +820,7 @@ class SessionBase(object):
         pass
 
     def host_migrate_receive(self, session, destref, nwref, options):
-        return "fake_migrate_data"
+        return {"value": "fake_migrate_data"}
 
     def VM_assert_can_migrate(self, session, vmref, migrate_data, live,
                               vdi_map, vif_map, options):

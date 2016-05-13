@@ -14,6 +14,8 @@
 
 import copy
 
+from oslo_utils import versionutils
+
 from nova import exception
 from nova import objects
 from nova.objects import base
@@ -37,7 +39,8 @@ class ImageMeta(base.NovaObject):
     # Version 1.5: ImageMetaProps version 1.5
     # Version 1.6: ImageMetaProps version 1.6
     # Version 1.7: ImageMetaProps version 1.7
-    VERSION = '1.7'
+    # Version 1.8: ImageMetaProps version 1.8
+    VERSION = '1.8'
 
     # These are driven by what the image client API returns
     # to Nova from Glance. This is defined in the glance
@@ -123,6 +126,25 @@ class ImageMeta(base.NovaObject):
         image_meta = utils.get_image_from_system_metadata(sysmeta)
         return cls.from_dict(image_meta)
 
+    @classmethod
+    def from_image_ref(cls, context, image_api, image_ref):
+        """Create instance from glance image
+
+        :param context: the request context
+        :param image_api: the glance client API
+        :param image_ref: the glance image identifier
+
+        Creates a new object instance, initializing from the
+        properties associated with a glance image
+
+        :returns: an ImageMeta instance
+        """
+
+        image_meta = image_api.get(context, image_ref)
+        image = cls.from_dict(image_meta)
+        setattr(image, "id", image_ref)
+        return image
+
 
 @base.NovaObjectRegistry.register
 class ImageMetaProps(base.NovaObject):
@@ -134,12 +156,21 @@ class ImageMetaProps(base.NovaObject):
     # Version 1.5: added os_admin_user field
     # Version 1.6: Added 'lxc' and 'uml' enum types to DiskBusField
     # Version 1.7: added img_config_drive field
-    VERSION = '1.7'
+    # Version 1.8: Added 'lxd' to hypervisor types
+    # Version 1.9: added hw_cpu_thread_policy field
+    # Version 1.10: added hw_cpu_realtime_mask field
+    # Version 1.11: Added hw_firmware_type field
+    # Version 1.12: Added properties for image signature verification
+    VERSION = '1.12'
 
     def obj_make_compatible(self, primitive, target_version):
         super(ImageMetaProps, self).obj_make_compatible(primitive,
                                                         target_version)
-        target_version = utils.convert_version_to_tuple(target_version)
+        target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 11):
+            primitive.pop('hw_firmware_type', None)
+        if target_version < (1, 9):
+            primitive.pop('hw_cpu_thread_policy', None)
         if target_version < (1, 7):
             primitive.pop('img_config_drive', None)
         if target_version < (1, 5):
@@ -196,8 +227,16 @@ class ImageMetaProps(base.NovaObject):
         # maximum number of CPU threads per core
         'hw_cpu_max_threads': fields.IntegerField(),
 
-        # CPU thread allocation policy
+        # CPU allocation policy
         'hw_cpu_policy': fields.CPUAllocationPolicyField(),
+
+        # CPU thread allocation policy
+        'hw_cpu_thread_policy': fields.CPUThreadAllocationPolicyField(),
+
+        # CPU mask indicates which vCPUs will have realtime enable,
+        # example ^0-1 means that all vCPUs except 0 and 1 will have a
+        # realtime policy.
+        'hw_cpu_realtime_mask': fields.StringField(),
 
         # preferred number of CPU threads per core
         'hw_cpu_threads': fields.IntegerField(),
@@ -214,6 +253,9 @@ class ImageMetaProps(base.NovaObject):
 
         # name of the floppy disk bus to use eg fd, scsi, ide
         'hw_floppy_bus': fields.DiskBusField(),
+
+        # This indicates the guest needs UEFI firmware
+        'hw_firmware_type': fields.FirmwareTypeField(),
 
         # boolean - used to trigger code to inject networking when booting a CD
         # image with a network boot image
@@ -330,6 +372,19 @@ class ImageMetaProps(base.NovaObject):
         # integer value 1
         'img_version': fields.IntegerField(),
 
+        # base64 of encoding of image signature
+        'img_signature': fields.StringField(),
+
+        # string indicating hash method used to compute image signature
+        'img_signature_hash_method': fields.ImageSignatureHashTypeField(),
+
+        # string indicating Castellan uuid of certificate
+        # used to compute the image's signature
+        'img_signature_certificate_uuid': fields.UUIDField(),
+
+        # string indicating type of key used to compute image signature
+        'img_signature_key_type': fields.ImageSignatureKeyTypeField(),
+
         # string of username with admin privileges
         'os_admin_user': fields.StringField(),
 
@@ -386,6 +441,7 @@ class ImageMetaProps(base.NovaObject):
         'bdm_v2': 'img_bdm_v2',
         'root_device_name': 'img_root_device_name',
         'hypervisor_version_requires': 'img_hv_requested_version',
+        'hypervisor_type': 'img_hv_type',
     }
 
     # TODO(berrange): Need to run this from a data migration
