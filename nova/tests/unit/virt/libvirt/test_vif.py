@@ -1228,33 +1228,6 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         d.unplug_vhostuser(None, self.vif_vhostuser_fp)
         mock_delete_fp_dev.assert_has_calls([mock.call('tap-xxx-yyy-zzz')])
 
-    def test_vhostuser_ovs_plug(self):
-
-        calls = {
-            'create_ovs_vif_port': [
-                 mock.call(
-                     'br0', 'usv-xxx-yyy-zzz',
-                     'aaa-bbb-ccc', 'ca:fe:de:ad:be:ef',
-                     'f0000000-0000-0000-0000-000000000001', 9000,
-                     interface_type=network_model.OVS_VHOSTUSER_INTERFACE_TYPE
-                 )]
-        }
-        with mock.patch.object(linux_net,
-                               'create_ovs_vif_port') as create_ovs_vif_port:
-            d = vif.LibvirtGenericVIFDriver()
-            d.plug_vhostuser(self.instance, self.vif_vhostuser_ovs)
-            create_ovs_vif_port.assert_has_calls(calls['create_ovs_vif_port'])
-
-    def test_vhostuser_ovs_unplug(self):
-        calls = {
-            'delete_ovs_vif_port': [mock.call('br0', 'usv-xxx-yyy-zzz')]
-        }
-        with mock.patch.object(linux_net,
-                               'delete_ovs_vif_port') as delete_port:
-            d = vif.LibvirtGenericVIFDriver()
-            d.unplug_vhostuser(None, self.vif_vhostuser_ovs)
-            delete_port.assert_has_calls(calls['delete_ovs_vif_port'])
-
     def test_vhostuser_ovs_fp_plug(self):
         calls = {
             'create_fp_dev': [mock.call('tap-xxx-yyy-zzz',
