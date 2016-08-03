@@ -243,30 +243,38 @@ def _convert_vif_midonet(vif):
 
 # VIF_TYPE_VHOSTUSER = 'vhostuser'
 def _convert_vif_vhostuser(vif):
-    profile = objects.vif.VIFPortProfileOpenVSwitch(
-        interface_id=vif.get('ovs_interfaceid') or vif['id'])
+    obj = None
     if vif['details'].get(model.VIF_DETAILS_VHOSTUSER_OVS_PLUG, False):
+        profile = objects.vif.VIFPortProfileOpenVSwitch(
+            interface_id=vif.get('ovs_interfaceid') or vif['id'])
         obj = _get_vif_instance(vif, objects.vif.VIFVHostUser,
                                 port_profile=profile, plugin="ovs",
                                 vif_name=_get_vif_name(vif))
-        if vif["network"]["bridge"] is not None:
-            obj.bridge_name = vif["network"]["bridge"]
-        obj.mode = vif['details'].get(
-            model.VIF_DETAILS_VHOSTUSER_MODE, 'client')
-        obj.path = vif['details'].get(
-            model.VIF_DETAILS_VHOSTUSER_SOCKET)
-        obj.has_traffic_filtering = vif.is_neutron_filtering_enabled()
-        if obj.path is None:
-            raise exception.VifDetailsMissingVhostuserSockPath(
-                vif_id=vif['id'])
-        return obj
+    elif vif['details'].get(model.VIF_DETAILS_VHOSTUSER_VROUTER_PLUG, False):
+        obj = _get_vif_instance(vif, objects.vif.VIFVHostUser,
+                                plugin="vrouter", vif_name=_get_vif_name(vif))
     else:
         raise NotImplementedError()
+
+    if vif["network"]["bridge"] is not None:
+        obj.bridge_name = vif["network"]["bridge"]
+    obj.mode = vif['details'].get(
+        model.VIF_DETAILS_VHOSTUSER_MODE, 'client')
+    obj.path = vif['details'].get(
+        model.VIF_DETAILS_VHOSTUSER_SOCKET)
+    obj.has_traffic_filtering = vif.is_neutron_filtering_enabled()
+    if obj.path is None:
+        raise exception.VifDetailsMissingVhostuserSockPath(
+            vif_id=vif['id'])
+
+    return obj
 
 
 # VIF_TYPE_VROUTER = 'vrouter'
 def _convert_vif_vrouter(vif):
-    raise NotImplementedError()
+    obj = _get_vif_instance(vif, objects.vif.VIFGeneric, plugin="vrouter",
+                            vif_name=_get_vif_name(vif))
+    return obj
 
 
 # VIF_TYPE_TAP = 'tap'

@@ -410,7 +410,7 @@ class LibvirtGenericVIFDriver(object):
     def _set_config_VIFGeneric(self, instance, vif, conf):
         conf.net_type = "ethernet"
         conf.target_dev = vif.vif_name
-        conf.script = ""
+        conf.script = None
 
     def _set_config_VIFBridge(self, instance, vif, conf):
         conf.net_type = "bridge"

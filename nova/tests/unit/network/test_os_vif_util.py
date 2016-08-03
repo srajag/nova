@@ -437,3 +437,67 @@ class OSVIFUtilTestCase(test.NoDBTestCase):
         self.assertRaises(exception.NovaException,
                           os_vif_util.convert_vif,
                           vif)
+
+    def test_convert_vif_vhost_user_vrouter(self):
+        vif = model.VIF(
+            id="dc065497-3c8d-4f44-8fb4-e1d33c16a536",
+            type=model.VIF_TYPE_VHOSTUSER,
+            devname="tapdc065497-3c",
+            address="22:52:25:62:e2:aa",
+            network=model.Network(
+                id="b82c1929-051e-481d-8110-4669916c7915",
+                label="Demo Net",
+                subnets=[]),
+            details={
+                model.VIF_DETAILS_VHOSTUSER_MODE: 'server',
+                model.VIF_DETAILS_VHOSTUSER_VROUTER_PLUG: True,
+                model.VIF_DETAILS_VHOSTUSER_SOCKET: '/fake/socket',
+                model.VIF_DETAILS_PORT_FILTER: True
+            }
+        )
+
+        actual = os_vif_util.convert_vif(vif)
+
+        expect = osv_objects.vif.VIFVHostUser(
+            id="dc065497-3c8d-4f44-8fb4-e1d33c16a536",
+            address="22:52:25:62:e2:aa",
+            plugin="vrouter",
+            vif_name="tapdc065497-3c",
+            path='/fake/socket',
+            mode='server',
+            has_traffic_filtering=True,
+            network=osv_objects.network.Network(
+                id="b82c1929-051e-481d-8110-4669916c7915",
+                label="Demo Net",
+                subnets=osv_objects.subnet.SubnetList(
+                    objects=[])))
+
+        self.assertObjEqual(actual, expect)
+
+    def test_convert_vif_vrouter(self):
+        vif = model.VIF(
+            id="dc065497-3c8d-4f44-8fb4-e1d33c16a536",
+            type=model.VIF_TYPE_VROUTER,
+            devname="tapdc065497-3c",
+            address="22:52:25:62:e2:aa",
+            network=model.Network(
+                id="b82c1929-051e-481d-8110-4669916c7915",
+                label="Demo Net",
+                subnets=[]),
+        )
+
+        actual = os_vif_util.convert_vif(vif)
+
+        expect = osv_objects.vif.VIFGeneric(
+            id="dc065497-3c8d-4f44-8fb4-e1d33c16a536",
+            address="22:52:25:62:e2:aa",
+            plugin="vrouter",
+            vif_name="tapdc065497-3c",
+            has_traffic_filtering=False,
+            network=osv_objects.network.Network(
+                id="b82c1929-051e-481d-8110-4669916c7915",
+                label="Demo Net",
+                subnets=osv_objects.subnet.SubnetList(
+                    objects=[])))
+
+        self.assertObjEqual(actual, expect)
